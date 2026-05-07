@@ -157,7 +157,14 @@ func (c *Client) PollDeviceAuth(ctx context.Context, deviceCode string) (*tokens
 		if parseErr != nil {
 			return nil, fmt.Errorf("poll device auth: %w", parseErr)
 		}
-		return nil, errCodeToSentinel(apiErr.Error)
+		err := errCodeToSentinel(apiErr.Error)
+		if apiErr.ErrorDescription != "" {
+			// Wrap so callers using errors.Is(err, ErrInvalidGrant) keep
+			// working while the description is still surfaced via
+			// err.Error(). Format: "<code>: <description>".
+			err = fmt.Errorf("%w: %s", err, apiErr.ErrorDescription)
+		}
+		return nil, err
 	}
 
 	var raw struct {
@@ -234,7 +241,8 @@ func resolveURL(baseURL, path string) (string, error) {
 }
 
 type errorResponse struct {
-	Error string `json:"error"`
+	Error            string `json:"error"`
+	ErrorDescription string `json:"error_description"`
 }
 
 func readAPIErrorResponse(resp *http.Response) (*errorResponse, error) {

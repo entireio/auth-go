@@ -213,6 +213,40 @@ func TestPollDeviceAuth_ErrorCodes(t *testing.T) {
 	}
 }
 
+func TestPollDeviceAuth_ErrorDescription_AppendedToSentinel(t *testing.T) {
+	t.Parallel()
+
+	c, _ := newTestClient(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = io.WriteString(w, `{"error":"invalid_grant","error_description":"device_code unknown"}`)
+	})
+
+	_, err := c.PollDeviceAuth(context.Background(), "dev-1")
+	if !errors.Is(err, ErrInvalidGrant) {
+		t.Fatalf("PollDeviceAuth() error = %v, want ErrInvalidGrant chain", err)
+	}
+	if !strings.Contains(err.Error(), "device_code unknown") {
+		t.Fatalf("error = %q, want it to include the description", err)
+	}
+}
+
+func TestPollDeviceAuth_NoDescription_NoTrailingColon(t *testing.T) {
+	t.Parallel()
+
+	c, _ := newTestClient(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = io.WriteString(w, `{"error":"invalid_grant"}`)
+	})
+
+	_, err := c.PollDeviceAuth(context.Background(), "dev-1")
+	if !errors.Is(err, ErrInvalidGrant) {
+		t.Fatalf("error = %v", err)
+	}
+	if strings.HasSuffix(err.Error(), ": ") {
+		t.Fatalf("error trailing colon-space: %q", err)
+	}
+}
+
 func TestPollDeviceAuth_UnknownErrorCode(t *testing.T) {
 	t.Parallel()
 
