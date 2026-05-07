@@ -11,6 +11,17 @@ import (
 	"time"
 )
 
+
+// writeBody writes body to w from a test handler. Wraps io.WriteString
+// with a t.Fatal on error so test fixtures stay readable without
+// per-callsite nolint comments.
+func writeBody(t *testing.T, w io.Writer, body string) {
+	t.Helper()
+	if _, err := io.WriteString(w, body); err != nil {
+		t.Fatalf("write body: %v", err)
+	}
+}
+
 const testTokenPath = "/sts/token"
 
 func freezeClock(t *testing.T, at time.Time) {
@@ -20,7 +31,7 @@ func freezeClock(t *testing.T, at time.Time) {
 	t.Cleanup(func() { nowFunc = prev })
 }
 
-func newTestClient(t *testing.T, h http.HandlerFunc) (*Client, *httptest.Server) {
+func newTestClient(t *testing.T, h http.HandlerFunc) *Client {
 	t.Helper()
 	srv := httptest.NewServer(h)
 	t.Cleanup(srv.Close)
@@ -29,7 +40,7 @@ func newTestClient(t *testing.T, h http.HandlerFunc) (*Client, *httptest.Server)
 		HTTP:    srv.Client(),
 		BaseURL: srv.URL,
 		Path:    testTokenPath,
-	}, srv
+	}
 }
 
 func mustReadForm(t *testing.T, r *http.Request) {
@@ -44,7 +55,7 @@ func TestExchange_Success(t *testing.T) {
 
 	freezeClock(t, time.Date(2026, 5, 6, 12, 0, 0, 0, time.UTC))
 
-	c, _ := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+	c := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
 		mustReadForm(t, r)
 		if got := r.PostForm.Get("grant_type"); got != GrantTypeTokenExchange {
 			t.Errorf("grant_type = %q", got)
@@ -68,7 +79,7 @@ func TestExchange_Success(t *testing.T) {
 			t.Errorf("scope = %q", got)
 		}
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = io.WriteString(w, `{
+		writeBody(t, w, `{
 			"access_token":"acc",
 			"issued_token_type":"urn:example:token-type:thing",
 			"token_type":"Bearer",
@@ -102,14 +113,14 @@ func TestExchange_Success(t *testing.T) {
 func TestExchange_OmitsOptionalFieldsWhenEmpty(t *testing.T) {
 	t.Parallel()
 
-	c, _ := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+	c := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
 		mustReadForm(t, r)
 		for _, k := range []string{"audience", "resource", "scope"} {
 			if r.PostForm.Has(k) {
 				t.Errorf("optional field %q should not be sent when empty", k)
 			}
 		}
-		_, _ = io.WriteString(w, `{"access_token":"acc"}`)
+		writeBody(t, w, `{"access_token":"acc"}`)
 	})
 
 	if _, err := c.Exchange(context.Background(), ExchangeRequest{
@@ -124,12 +135,12 @@ func TestExchange_OmitsOptionalFieldsWhenEmpty(t *testing.T) {
 func TestExchange_ExtraFieldsForwarded(t *testing.T) {
 	t.Parallel()
 
-	c, _ := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+	c := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
 		mustReadForm(t, r)
 		if got := r.PostForm.Get("custom_field"); got != "custom-value" {
 			t.Errorf("custom_field = %q", got)
 		}
-		_, _ = io.WriteString(w, `{"access_token":"acc"}`)
+		writeBody(t, w, `{"access_token":"acc"}`)
 	})
 
 	if _, err := c.Exchange(context.Background(), ExchangeRequest{
@@ -145,13 +156,13 @@ func TestExchange_ExtraFieldsForwarded(t *testing.T) {
 func TestExchange_StandardFieldsOverrideExtra(t *testing.T) {
 	t.Parallel()
 
-	c, _ := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+	c := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
 		mustReadForm(t, r)
 		// Caller tried to set grant_type via Extra; standard wins.
 		if got := r.PostForm.Get("grant_type"); got != GrantTypeTokenExchange {
 			t.Errorf("Extra should not override standard grant_type; got %q", got)
 		}
-		_, _ = io.WriteString(w, `{"access_token":"acc"}`)
+		writeBody(t, w, `{"access_token":"acc"}`)
 	})
 
 	if _, err := c.Exchange(context.Background(), ExchangeRequest{
@@ -191,9 +202,9 @@ func TestExchange_RejectsMissingRequiredFields(t *testing.T) {
 func TestExchange_ServerError(t *testing.T) {
 	t.Parallel()
 
-	c, _ := newTestClient(t, func(w http.ResponseWriter, _ *http.Request) {
+	c := newTestClient(t, func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusBadRequest)
-		_, _ = io.WriteString(w, `{"error":"invalid_request","error_description":"bad subject"}`)
+		writeBody(t, w, `{"error":"invalid_request","error_description":"bad subject"}`)
 	})
 
 	_, err := c.Exchange(context.Background(), ExchangeRequest{
@@ -212,9 +223,9 @@ func TestExchange_ServerError(t *testing.T) {
 func TestExchange_ServerErrorWithoutJSON(t *testing.T) {
 	t.Parallel()
 
-	c, _ := newTestClient(t, func(w http.ResponseWriter, _ *http.Request) {
+	c := newTestClient(t, func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusInternalServerError)
-		_, _ = io.WriteString(w, `something broke`)
+		writeBody(t, w, `something broke`)
 	})
 
 	_, err := c.Exchange(context.Background(), ExchangeRequest{
@@ -230,8 +241,8 @@ func TestExchange_ServerErrorWithoutJSON(t *testing.T) {
 func TestExchange_MissingAccessToken(t *testing.T) {
 	t.Parallel()
 
-	c, _ := newTestClient(t, func(w http.ResponseWriter, _ *http.Request) {
-		_, _ = io.WriteString(w, `{"token_type":"Bearer"}`)
+	c := newTestClient(t, func(w http.ResponseWriter, _ *http.Request) {
+		writeBody(t, w, `{"token_type":"Bearer"}`)
 	})
 
 	_, err := c.Exchange(context.Background(), ExchangeRequest{
@@ -247,9 +258,9 @@ func TestExchange_MissingAccessToken(t *testing.T) {
 func TestExchange_HTMLBodySurfacesFriendlyError(t *testing.T) {
 	t.Parallel()
 
-	c, _ := newTestClient(t, func(w http.ResponseWriter, _ *http.Request) {
+	c := newTestClient(t, func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "text/html")
-		_, _ = io.WriteString(w, `<html>Blocked by firewall</html>`)
+		writeBody(t, w, `<html>Blocked by firewall</html>`)
 	})
 
 	_, err := c.Exchange(context.Background(), ExchangeRequest{
@@ -271,8 +282,8 @@ func TestExchange_HTMLBodySurfacesFriendlyError(t *testing.T) {
 func TestExchange_NoExpiry(t *testing.T) {
 	t.Parallel()
 
-	c, _ := newTestClient(t, func(w http.ResponseWriter, _ *http.Request) {
-		_, _ = io.WriteString(w, `{"access_token":"acc","token_type":"Bearer"}`)
+	c := newTestClient(t, func(w http.ResponseWriter, _ *http.Request) {
+		writeBody(t, w, `{"access_token":"acc","token_type":"Bearer"}`)
 	})
 
 	got, err := c.Exchange(context.Background(), ExchangeRequest{

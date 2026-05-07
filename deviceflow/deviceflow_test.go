@@ -12,6 +12,17 @@ import (
 	"time"
 )
 
+
+// writeBody writes body to w from a test handler. Wraps io.WriteString
+// with a t.Fatal on error so test fixtures stay readable without
+// per-callsite nolint comments.
+func writeBody(t *testing.T, w io.Writer, body string) {
+	t.Helper()
+	if _, err := io.WriteString(w, body); err != nil {
+		t.Fatalf("write body: %v", err)
+	}
+}
+
 const (
 	testClientID       = "cli"
 	testDeviceCodePath = "/oauth/device/code"
@@ -26,7 +37,7 @@ func freezeClock(t *testing.T, at time.Time) {
 	t.Cleanup(func() { nowFunc = prev })
 }
 
-func newTestClient(t *testing.T, h http.HandlerFunc) (*Client, *httptest.Server) {
+func newTestClient(t *testing.T, h http.HandlerFunc) *Client {
 	t.Helper()
 	srv := httptest.NewServer(h)
 	t.Cleanup(srv.Close)
@@ -39,7 +50,7 @@ func newTestClient(t *testing.T, h http.HandlerFunc) (*Client, *httptest.Server)
 		DeviceCodePath: testDeviceCodePath,
 		TokenPath:      testTokenPath,
 	}
-	return c, srv
+	return c
 }
 
 func mustReadForm(t *testing.T, r *http.Request) {
@@ -52,7 +63,7 @@ func mustReadForm(t *testing.T, r *http.Request) {
 func TestStartDeviceAuth_Success(t *testing.T) {
 	t.Parallel()
 
-	c, _ := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+	c := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != testDeviceCodePath {
 			t.Errorf("path = %q", r.URL.Path)
 		}
@@ -64,7 +75,7 @@ func TestStartDeviceAuth_Success(t *testing.T) {
 			t.Errorf("scope = %q", got)
 		}
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = io.WriteString(w, `{
+		writeBody(t, w, `{
 			"device_code": "dev-1",
 			"user_code": "ABCD-EFGH",
 			"verification_uri": "https://example.com/cli/auth",
@@ -86,13 +97,13 @@ func TestStartDeviceAuth_Success(t *testing.T) {
 func TestStartDeviceAuth_OmitsScopeWhenEmpty(t *testing.T) {
 	t.Parallel()
 
-	c, _ := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+	c := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
 		mustReadForm(t, r)
 		if r.PostForm.Has("scope") {
 			t.Errorf("scope should not be sent when Client.Scope is empty")
 		}
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = io.WriteString(w, `{"device_code":"d","user_code":"u","verification_uri":"x","expires_in":1,"interval":1}`)
+		writeBody(t, w, `{"device_code":"d","user_code":"u","verification_uri":"x","expires_in":1,"interval":1}`)
 	})
 	c.Scope = ""
 
@@ -104,8 +115,8 @@ func TestStartDeviceAuth_OmitsScopeWhenEmpty(t *testing.T) {
 func TestStartDeviceAuth_RejectsUnknownFields(t *testing.T) {
 	t.Parallel()
 
-	c, _ := newTestClient(t, func(w http.ResponseWriter, _ *http.Request) {
-		_, _ = io.WriteString(w, `{
+	c := newTestClient(t, func(w http.ResponseWriter, _ *http.Request) {
+		writeBody(t, w, `{
 			"device_code":"d","user_code":"u","verification_uri":"x","expires_in":1,"interval":1,
 			"surprise":"field"
 		}`)
@@ -119,9 +130,9 @@ func TestStartDeviceAuth_RejectsUnknownFields(t *testing.T) {
 func TestStartDeviceAuth_NonOK(t *testing.T) {
 	t.Parallel()
 
-	c, _ := newTestClient(t, func(w http.ResponseWriter, _ *http.Request) {
+	c := newTestClient(t, func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusBadRequest)
-		_, _ = io.WriteString(w, `{"error":"invalid_client"}`)
+		writeBody(t, w, `{"error":"invalid_client"}`)
 	})
 
 	if _, err := c.StartDeviceAuth(context.Background()); err == nil ||
@@ -135,7 +146,7 @@ func TestPollDeviceAuth_Success(t *testing.T) {
 
 	freezeClock(t, time.Date(2026, 5, 6, 12, 0, 0, 0, time.UTC))
 
-	c, _ := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+	c := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
 		mustReadForm(t, r)
 		if got := r.PostForm.Get("grant_type"); got != deviceCodeGrantType {
 			t.Errorf("grant_type = %q", got)
@@ -144,7 +155,7 @@ func TestPollDeviceAuth_Success(t *testing.T) {
 			t.Errorf("device_code = %q", got)
 		}
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = io.WriteString(w, `{
+		writeBody(t, w, `{
 			"access_token":"acc",
 			"refresh_token":"ref",
 			"token_type":"Bearer",
@@ -170,8 +181,8 @@ func TestPollDeviceAuth_Success(t *testing.T) {
 func TestPollDeviceAuth_TolerantToUnknownFields(t *testing.T) {
 	t.Parallel()
 
-	c, _ := newTestClient(t, func(w http.ResponseWriter, _ *http.Request) {
-		_, _ = io.WriteString(w, `{"access_token":"acc","extra":"ignored"}`)
+	c := newTestClient(t, func(w http.ResponseWriter, _ *http.Request) {
+		writeBody(t, w, `{"access_token":"acc","extra":"ignored"}`)
 	})
 
 	got, err := c.PollDeviceAuth(context.Background(), "dev-1")
@@ -200,7 +211,7 @@ func TestPollDeviceAuth_ErrorCodes(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.code, func(t *testing.T) {
 			t.Parallel()
-			c, _ := newTestClient(t, func(w http.ResponseWriter, _ *http.Request) {
+			c := newTestClient(t, func(w http.ResponseWriter, _ *http.Request) {
 				w.WriteHeader(http.StatusBadRequest)
 				_, _ = fmt.Fprintf(w, `{"error":%q}`, tt.code)
 			})
@@ -216,9 +227,9 @@ func TestPollDeviceAuth_ErrorCodes(t *testing.T) {
 func TestPollDeviceAuth_ErrorDescription_AppendedToSentinel(t *testing.T) {
 	t.Parallel()
 
-	c, _ := newTestClient(t, func(w http.ResponseWriter, _ *http.Request) {
+	c := newTestClient(t, func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusBadRequest)
-		_, _ = io.WriteString(w, `{"error":"invalid_grant","error_description":"device_code unknown"}`)
+		writeBody(t, w, `{"error":"invalid_grant","error_description":"device_code unknown"}`)
 	})
 
 	_, err := c.PollDeviceAuth(context.Background(), "dev-1")
@@ -233,9 +244,9 @@ func TestPollDeviceAuth_ErrorDescription_AppendedToSentinel(t *testing.T) {
 func TestPollDeviceAuth_NoDescription_NoTrailingColon(t *testing.T) {
 	t.Parallel()
 
-	c, _ := newTestClient(t, func(w http.ResponseWriter, _ *http.Request) {
+	c := newTestClient(t, func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusBadRequest)
-		_, _ = io.WriteString(w, `{"error":"invalid_grant"}`)
+		writeBody(t, w, `{"error":"invalid_grant"}`)
 	})
 
 	_, err := c.PollDeviceAuth(context.Background(), "dev-1")
@@ -250,9 +261,9 @@ func TestPollDeviceAuth_NoDescription_NoTrailingColon(t *testing.T) {
 func TestPollDeviceAuth_UnknownErrorCode(t *testing.T) {
 	t.Parallel()
 
-	c, _ := newTestClient(t, func(w http.ResponseWriter, _ *http.Request) {
+	c := newTestClient(t, func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusBadRequest)
-		_, _ = io.WriteString(w, `{"error":"weird_thing"}`)
+		writeBody(t, w, `{"error":"weird_thing"}`)
 	})
 
 	_, err := c.PollDeviceAuth(context.Background(), "dev-1")
@@ -269,8 +280,8 @@ func TestPollDeviceAuth_UnknownErrorCode(t *testing.T) {
 func TestPollDeviceAuth_200WithNoAccessToken(t *testing.T) {
 	t.Parallel()
 
-	c, _ := newTestClient(t, func(w http.ResponseWriter, _ *http.Request) {
-		_, _ = io.WriteString(w, `{}`)
+	c := newTestClient(t, func(w http.ResponseWriter, _ *http.Request) {
+		writeBody(t, w, `{}`)
 	})
 
 	if _, err := c.PollDeviceAuth(context.Background(), "dev-1"); err == nil {
@@ -284,9 +295,9 @@ func TestStartDeviceAuth_HTMLBodySurfacesFriendlyError(t *testing.T) {
 	// Captive portal / firewall (Cloudflare WARP, corp proxy) returns
 	// 200 OK with an HTML error page. Surface a network-actionable
 	// message instead of the opaque JSON-decode complaint.
-	c, _ := newTestClient(t, func(w http.ResponseWriter, _ *http.Request) {
+	c := newTestClient(t, func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "text/html")
-		_, _ = io.WriteString(w, `<!DOCTYPE html><html><body>Access blocked</body></html>`)
+		writeBody(t, w, `<!DOCTYPE html><html><body>Access blocked</body></html>`)
 	})
 
 	_, err := c.StartDeviceAuth(context.Background())
@@ -306,9 +317,9 @@ func TestStartDeviceAuth_HTMLBodySurfacesFriendlyError(t *testing.T) {
 func TestPollDeviceAuth_HTMLBodySurfacesFriendlyError(t *testing.T) {
 	t.Parallel()
 
-	c, _ := newTestClient(t, func(w http.ResponseWriter, _ *http.Request) {
+	c := newTestClient(t, func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "text/html")
-		_, _ = io.WriteString(w, `<html>Access blocked by WARP</html>`)
+		writeBody(t, w, `<html>Access blocked by WARP</html>`)
 	})
 
 	_, err := c.PollDeviceAuth(context.Background(), "dev-1")

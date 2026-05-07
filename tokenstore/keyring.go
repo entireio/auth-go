@@ -80,6 +80,9 @@ func (k *Keyring) DeleteTokens(profile string) error {
 // keyringTokenSet is the on-keyring JSON shape. Time fields are
 // serialised as RFC 3339 strings so the wire form survives keyring
 // implementations that don't preserve byte-for-byte equality.
+// keyringTokenSet is the wire shape; access_token is intentionally
+// serialised so the OS keyring (encrypted at rest) holds the full
+// TokenSet for round-tripping. The G117 lint flag is suppressed below.
 type keyringTokenSet struct {
 	AccessToken  string `json:"access_token"`
 	RefreshToken string `json:"refresh_token,omitempty"`
@@ -99,7 +102,7 @@ func encodeTokenSet(t tokens.TokenSet) (string, error) {
 		wire.ExpiresAt = t.ExpiresAt.UTC().Format(time.RFC3339)
 	}
 
-	b, err := json.Marshal(wire)
+	b, err := json.Marshal(wire) //nolint:gosec // intentional: serialise the access token for OS-keyring storage (encrypted at rest)
 	if err != nil {
 		return "", fmt.Errorf("marshal TokenSet: %w", err)
 	}

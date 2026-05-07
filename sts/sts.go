@@ -30,10 +30,10 @@ var nowFunc = time.Now
 // supplies RequestedTokenType (which is always implementation-specific
 // outside of these RFC 8693 standard values).
 const (
-	GrantTypeTokenExchange = "urn:ietf:params:oauth:grant-type:token-exchange"
+	GrantTypeTokenExchange = "urn:ietf:params:oauth:grant-type:token-exchange" //nolint:gosec // RFC 8693 grant_type URI, not a credential
 
-	SubjectTokenTypeJWT         = "urn:ietf:params:oauth:token-type:jwt"
-	SubjectTokenTypeAccessToken = "urn:ietf:params:oauth:token-type:access_token"
+	SubjectTokenTypeJWT         = "urn:ietf:params:oauth:token-type:jwt" //nolint:gosec // RFC 8693 token-type URI, not a credential
+	SubjectTokenTypeAccessToken = "urn:ietf:params:oauth:token-type:access_token" //nolint:gosec // RFC 8693 token-type URI, not a credential
 )
 
 // ExchangeRequest is the input to a token exchange.
@@ -197,7 +197,7 @@ type errorResponse struct {
 }
 
 func readAPIError(resp *http.Response) error {
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, oauthhttp.MaxResponseBytes))
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, oauthhttp.MaxResponseBytes)) //nolint:errcheck // best-effort body read for error message
 	var apiErr errorResponse
 	if err := json.Unmarshal(bytes.TrimSpace(body), &apiErr); err == nil && apiErr.Error != "" {
 		if apiErr.ErrorDescription != "" {
