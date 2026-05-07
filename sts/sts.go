@@ -19,14 +19,12 @@ import (
 	"strings"
 	"time"
 
+	"github.com/entireio/cli/auth/internal/oauthhttp"
 	"github.com/entireio/cli/auth/tokens"
 )
 
 // nowFunc is the package's clock. Override in tests.
 var nowFunc = time.Now
-
-// maxResponseBytes caps how much of an OAuth response body we read.
-const maxResponseBytes = 1 << 20
 
 // RFC 8693 grant_type and standard subject-token type URIs. Caller
 // supplies RequestedTokenType (which is always implementation-specific
@@ -126,19 +124,15 @@ func (c *Client) Exchange(ctx context.Context, req ExchangeRequest) (*tokens.Tok
 	}
 
 	var raw struct {
-		AccessToken      string `json:"access_token"`
-		IssuedTokenType  string `json:"issued_token_type"`
-		TokenType        string `json:"token_type"`
-		ExpiresIn        int    `json:"expires_in"`
-		RefreshToken     string `json:"refresh_token"`
-		Scope            string `json:"scope"`
+		AccessToken     string `json:"access_token"`
+		IssuedTokenType string `json:"issued_token_type"`
+		TokenType       string `json:"token_type"`
+		ExpiresIn       int    `json:"expires_in"`
+		RefreshToken    string `json:"refresh_token"`
+		Scope           string `json:"scope"`
 	}
-	body, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes))
-	if err != nil {
-		return nil, fmt.Errorf("token exchange: read response: %w", err)
-	}
-	if err := json.Unmarshal(body, &raw); err != nil {
-		return nil, fmt.Errorf("token exchange: decode response: %w", err)
+	if err := oauthhttp.ReadAndDecodeJSON(resp.Body, &raw, false); err != nil {
+		return nil, fmt.Errorf("token exchange: %w", err)
 	}
 	if raw.AccessToken == "" {
 		return nil, errors.New("token exchange: response missing access_token")
@@ -203,7 +197,7 @@ type errorResponse struct {
 }
 
 func readAPIError(resp *http.Response) error {
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes))
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, oauthhttp.MaxResponseBytes))
 	var apiErr errorResponse
 	if err := json.Unmarshal(bytes.TrimSpace(body), &apiErr); err == nil && apiErr.Error != "" {
 		if apiErr.ErrorDescription != "" {

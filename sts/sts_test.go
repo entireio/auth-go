@@ -244,6 +244,30 @@ func TestExchange_MissingAccessToken(t *testing.T) {
 	}
 }
 
+func TestExchange_HTMLBodySurfacesFriendlyError(t *testing.T) {
+	t.Parallel()
+
+	c, _ := newTestClient(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		_, _ = io.WriteString(w, `<html>Blocked by firewall</html>`)
+	})
+
+	_, err := c.Exchange(context.Background(), ExchangeRequest{
+		SubjectToken:       "sub",
+		SubjectTokenType:   SubjectTokenTypeJWT,
+		RequestedTokenType: "urn:example:t",
+	})
+	if err == nil {
+		t.Fatal("Exchange() with HTML body should error")
+	}
+	if !strings.Contains(err.Error(), "non-JSON") {
+		t.Errorf("error missing non-JSON hint: %s", err)
+	}
+	if strings.Contains(err.Error(), "invalid character") {
+		t.Errorf("raw JSON-decoder error leaked through: %s", err)
+	}
+}
+
 func TestExchange_NoExpiry(t *testing.T) {
 	t.Parallel()
 

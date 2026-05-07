@@ -13,7 +13,6 @@
 package deviceflow
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -24,17 +23,13 @@ import (
 	"strings"
 	"time"
 
+	"github.com/entireio/cli/auth/internal/oauthhttp"
 	"github.com/entireio/cli/auth/tokens"
 )
 
 // nowFunc is the package's clock. Tests override it; production uses
 // time.Now.
 var nowFunc = time.Now
-
-// maxResponseBytes caps how much of an OAuth response body we read.
-// Both endpoints return small JSON documents; larger bodies indicate
-// either a misconfigured proxy or an attempt to exhaust client memory.
-const maxResponseBytes = 1 << 20
 
 // deviceCodeGrantType is the RFC 8628 token-endpoint grant_type for
 // polling device-flow authorization.
@@ -132,8 +127,8 @@ func (c *Client) StartDeviceAuth(ctx context.Context) (*DeviceCode, error) {
 	}
 
 	var result DeviceCode
-	if err := decodeJSON(resp.Body, &result, true); err != nil {
-		return nil, fmt.Errorf("decode device auth start response: %w", err)
+	if err := oauthhttp.ReadAndDecodeJSON(resp.Body, &result, true); err != nil {
+		return nil, fmt.Errorf("start device auth: %w", err)
 	}
 	return &result, nil
 }
@@ -172,8 +167,8 @@ func (c *Client) PollDeviceAuth(ctx context.Context, deviceCode string) (*tokens
 		RefreshToken string `json:"refresh_token"`
 		Scope        string `json:"scope"`
 	}
-	if err := decodeJSON(resp.Body, &raw, false); err != nil {
-		return nil, fmt.Errorf("decode device auth poll response: %w", err)
+	if err := oauthhttp.ReadAndDecodeJSON(resp.Body, &raw, false); err != nil {
+		return nil, fmt.Errorf("poll device auth: %w", err)
 	}
 
 	if raw.AccessToken == "" {
@@ -243,7 +238,7 @@ type errorResponse struct {
 }
 
 func readAPIErrorResponse(resp *http.Response) (*errorResponse, error) {
-	body, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes))
+	body, err := io.ReadAll(io.LimitReader(resp.Body, oauthhttp.MaxResponseBytes))
 	if err != nil {
 		return nil, fmt.Errorf("status %d", resp.StatusCode)
 	}
@@ -266,20 +261,4 @@ func readAPIError(resp *http.Response, action string) error {
 		return fmt.Errorf("%s: %s", action, apiErr.Error)
 	}
 	return fmt.Errorf("%s: %w", action, err)
-}
-
-func decodeJSON(r io.Reader, dest any, strict bool) error {
-	body, err := io.ReadAll(io.LimitReader(r, maxResponseBytes))
-	if err != nil {
-		return fmt.Errorf("read JSON response: %w", err)
-	}
-
-	dec := json.NewDecoder(bytes.NewReader(body))
-	if strict {
-		dec.DisallowUnknownFields()
-	}
-	if err := dec.Decode(dest); err != nil {
-		return fmt.Errorf("decode JSON response: %w", err)
-	}
-	return nil
 }

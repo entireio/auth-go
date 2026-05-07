@@ -244,6 +244,48 @@ func TestPollDeviceAuth_200WithNoAccessToken(t *testing.T) {
 	}
 }
 
+func TestStartDeviceAuth_HTMLBodySurfacesFriendlyError(t *testing.T) {
+	t.Parallel()
+
+	// Captive portal / firewall (Cloudflare WARP, corp proxy) returns
+	// 200 OK with an HTML error page. Surface a network-actionable
+	// message instead of the opaque JSON-decode complaint.
+	c, _ := newTestClient(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		_, _ = io.WriteString(w, `<!DOCTYPE html><html><body>Access blocked</body></html>`)
+	})
+
+	_, err := c.StartDeviceAuth(context.Background())
+	if err == nil {
+		t.Fatal("StartDeviceAuth() with HTML body should error")
+	}
+	for _, want := range []string{"non-JSON", "VPN", "proxy", "firewall"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error missing %q hint: %s", want, err)
+		}
+	}
+	if strings.Contains(err.Error(), "invalid character") {
+		t.Errorf("raw JSON-decoder error leaked through: %s", err)
+	}
+}
+
+func TestPollDeviceAuth_HTMLBodySurfacesFriendlyError(t *testing.T) {
+	t.Parallel()
+
+	c, _ := newTestClient(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		_, _ = io.WriteString(w, `<html>Access blocked by WARP</html>`)
+	})
+
+	_, err := c.PollDeviceAuth(context.Background(), "dev-1")
+	if err == nil {
+		t.Fatal("PollDeviceAuth() with HTML body should error")
+	}
+	if strings.Contains(err.Error(), "invalid character") {
+		t.Errorf("raw JSON-decoder error leaked through: %s", err)
+	}
+}
+
 func TestResolveURL(t *testing.T) {
 	t.Parallel()
 
