@@ -32,7 +32,7 @@ var nowFunc = time.Now
 const (
 	GrantTypeTokenExchange = "urn:ietf:params:oauth:grant-type:token-exchange" //nolint:gosec // RFC 8693 grant_type URI, not a credential
 
-	SubjectTokenTypeJWT         = "urn:ietf:params:oauth:token-type:jwt" //nolint:gosec // RFC 8693 token-type URI, not a credential
+	SubjectTokenTypeJWT         = "urn:ietf:params:oauth:token-type:jwt"          //nolint:gosec // RFC 8693 token-type URI, not a credential
 	SubjectTokenTypeAccessToken = "urn:ietf:params:oauth:token-type:access_token" //nolint:gosec // RFC 8693 token-type URI, not a credential
 )
 

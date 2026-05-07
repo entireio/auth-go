@@ -179,7 +179,7 @@ func (c *Client) PollDeviceAuth(ctx context.Context, deviceCode string) (*tokens
 	}
 
 	if raw.AccessToken == "" {
-		return nil, fmt.Errorf("poll device auth: server returned 200 with no access token")
+		return nil, errors.New("poll device auth: server returned 200 with no access token")
 	}
 
 	t := &tokens.TokenSet{

@@ -141,5 +141,5 @@ func decodeAudience(raw json.RawMessage) ([]string, error) {
 		return multi, nil
 	}
 
-	return nil, fmt.Errorf("decode JWT aud claim: not a string or array")
+	return nil, errors.New("decode JWT aud claim: not a string or array")
 }

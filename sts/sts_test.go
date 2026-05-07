@@ -11,7 +11,6 @@ import (
 	"time"
 )
 
-
 // writeBody writes body to w from a test handler. Wraps io.WriteString
 // with a t.Fatal on error so test fixtures stay readable without
 // per-callsite nolint comments.
