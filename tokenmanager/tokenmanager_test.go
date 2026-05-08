@@ -82,7 +82,6 @@ func TestNew_RequiresFields(t *testing.T) {
 	}{
 		{"missing issuer", Config{ClientID: "x", STSPath: "/p", Store: newMemStore()}},
 		{"missing clientID", Config{Issuer: "https://x", STSPath: "/p", Store: newMemStore()}},
-		{"missing STSPath", Config{Issuer: "https://x", ClientID: "x", Store: newMemStore()}},
 		{"missing Store", Config{Issuer: "https://x", ClientID: "x", STSPath: "/p"}},
 	}
 	for _, tc := range cases {
@@ -92,6 +91,45 @@ func TestNew_RequiresFields(t *testing.T) {
 				t.Fatal("expected error")
 			}
 		})
+	}
+}
+
+// TestNew_AllowsEmptySTSPath documents that single-host configs can
+// omit STSPath because the same-host shortcut always wins. The error
+// surfaces only if an exchange is actually attempted.
+func TestNew_AllowsEmptySTSPath(t *testing.T) {
+	t.Parallel()
+	if _, err := New(Config{
+		Issuer:   testIssuer,
+		ClientID: testClientID,
+		Store:    newMemStore(),
+	}); err != nil {
+		t.Fatalf("New: %v", err)
+	}
+}
+
+// TestExchange_FailsWithoutSTSPath checks that triggering an exchange
+// against a manager configured without an STS path returns ErrNoSTSPath
+// (rather than POSTing to a bogus URL).
+func TestExchange_FailsWithoutSTSPath(t *testing.T) {
+	t.Parallel()
+	core := makeJWTWithAudience(t, []string{testIssuer})
+	store := newMemStore()
+	store.data[testIssuer] = tokens.TokenSet{AccessToken: core}
+
+	m, err := New(Config{
+		Issuer:   testIssuer,
+		ClientID: testClientID,
+		Store:    store,
+		// STSPath intentionally empty
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	_, err = m.TokenForResource(context.Background(), testResource)
+	if !errors.Is(err, ErrNoSTSPath) {
+		t.Fatalf("err = %v, want ErrNoSTSPath", err)
 	}
 }
 

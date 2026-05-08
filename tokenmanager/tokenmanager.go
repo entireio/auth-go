@@ -46,6 +46,11 @@ const exchangeSkew = 30 * time.Second
 // "run <login>" message.
 var ErrNotLoggedIn = errors.New("not logged in")
 
+// ErrNoSTSPath is returned when an exchange is needed but Config.STSPath
+// is empty. Single-host deployments hit the same-host shortcut and never
+// reach this; split-host deployments must configure STSPath.
+var ErrNoSTSPath = errors.New("token exchange required but Config.STSPath is empty")
+
 // Config configures a Manager.
 type Config struct {
 	// Issuer is the auth host base URL where the device-flow login
@@ -59,8 +64,10 @@ type Config struct {
 	ClientID string
 
 	// STSPath is the path on Issuer where token-exchange requests are
-	// POSTed. Typically the OAuth token endpoint (RFC 8693 convention).
-	// Required.
+	// POSTed. Optional: single-host deployments never trigger an
+	// exchange (the same-host shortcut wins) so they can leave it
+	// empty. When empty and an exchange is attempted, runExchange
+	// returns ErrNoSTSPath rather than POSTing to a bogus URL.
 	STSPath string
 
 	// Store persists the core token. Required. Use any tokenstore.Store
@@ -95,8 +102,6 @@ func (c Config) validate() error {
 		return errors.New("Config.Issuer is required")
 	case strings.TrimSpace(c.ClientID) == "":
 		return errors.New("Config.ClientID is required")
-	case strings.TrimSpace(c.STSPath) == "":
-		return errors.New("Config.STSPath is required")
 	case c.Store == nil:
 		return errors.New("Config.Store is required")
 	}
@@ -320,6 +325,10 @@ func (m *Manager) runExchange(ctx context.Context, coreToken string, req TokenRe
 
 	if m.cfg.Exchange != nil {
 		return m.cfg.Exchange(ctx, stsReq)
+	}
+
+	if strings.TrimSpace(m.cfg.STSPath) == "" {
+		return nil, ErrNoSTSPath
 	}
 
 	stsClient := &sts.Client{
