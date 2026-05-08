@@ -155,13 +155,22 @@ func (m *Manager) LookupCoreToken() (string, error) {
 	return t.AccessToken, nil
 }
 
-// DeleteCoreToken removes the stored core token (and any cached
-// exchanges derived from it).
+// DeleteCoreToken removes the stored core token and any cached
+// exchanges derived from it.
+//
+// Order matters: the keyring delete runs first, then the in-memory
+// cache is cleared. If the keyring delete fails the cache is left
+// alone — clearing it pre-emptively would create a window where the
+// CLI thinks it's logged out (no cache entries) but the keyring
+// still hands out the core token to the next process.
 func (m *Manager) DeleteCoreToken() error {
+	if err := m.cfg.Store.DeleteTokens(m.cfg.Issuer); err != nil {
+		return fmt.Errorf("delete core token: %w", err)
+	}
 	m.mu.Lock()
 	m.cache = map[string]cachedToken{}
 	m.mu.Unlock()
-	return m.cfg.Store.DeleteTokens(m.cfg.Issuer) //nolint:wrapcheck // backend error already names the operation
+	return nil
 }
 
 // TokenRequest customises one Token call. Empty fields fall back to

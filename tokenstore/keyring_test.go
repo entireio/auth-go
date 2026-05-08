@@ -134,3 +134,64 @@ func TestKeyring_RoundTrip_NoExpiry(t *testing.T) {
 		t.Fatalf("ExpiresAt = %v, want zero", got.ExpiresAt)
 	}
 }
+
+// TestKeyring_LoadTokens_MalformedJSONReturnsErrMalformed pins the
+// contract that decode failures surface as ErrMalformed (wrapped), not
+// ErrNotFound. Callers (e.g. cmd/entire/cli/auth.Store) use this to
+// distinguish "no entry" from "entry exists but can't be parsed",
+// which is the hook for the legacy bare-string upgrade fallback.
+func TestKeyring_LoadTokens_MalformedJSONReturnsErrMalformed(t *testing.T) {
+	const service = "test-malformed"
+	const profile = "https://example.com"
+
+	if err := keyring.Set(service, profile, "{not-valid-json"); err != nil {
+		t.Fatalf("seed keyring: %v", err)
+	}
+
+	_, err := NewKeyring(service).LoadTokens(profile)
+	if err == nil {
+		t.Fatal("expected error for malformed JSON")
+	}
+	if errors.Is(err, ErrNotFound) {
+		t.Fatalf("err = %v, must NOT be ErrNotFound (entry exists, just malformed)", err)
+	}
+	if !errors.Is(err, ErrMalformed) {
+		t.Fatalf("err = %v, want ErrMalformed sentinel for callers to detect legacy entries", err)
+	}
+}
+
+// TestKeyring_LoadTokens_BareStringReturnsErrMalformed is the contract
+// the cmd-side legacy fallback depends on: a pre-shim raw access-token
+// entry must surface as ErrMalformed so the shim knows to fall through
+// to a bare-string read.
+func TestKeyring_LoadTokens_BareStringReturnsErrMalformed(t *testing.T) {
+	const service = "test-barestring"
+	const profile = "https://example.com"
+
+	if err := keyring.Set(service, profile, "ent_pre_shim_raw_token"); err != nil {
+		t.Fatalf("seed keyring: %v", err)
+	}
+
+	_, err := NewKeyring(service).LoadTokens(profile)
+	if !errors.Is(err, ErrMalformed) {
+		t.Fatalf("err = %v, want ErrMalformed", err)
+	}
+}
+
+// TestKeyring_LoadTokens_BadExpiresAtReturnsErrMalformed covers the
+// other branch in decodeTokenSet: well-formed JSON with a malformed
+// expires_at also surfaces as ErrMalformed so the same fallback
+// machinery applies.
+func TestKeyring_LoadTokens_BadExpiresAtReturnsErrMalformed(t *testing.T) {
+	const service = "test-bad-expires"
+	const profile = "https://example.com"
+
+	if err := keyring.Set(service, profile, `{"access_token":"a","expires_at":"not-a-date"}`); err != nil {
+		t.Fatalf("seed keyring: %v", err)
+	}
+
+	_, err := NewKeyring(service).LoadTokens(profile)
+	if !errors.Is(err, ErrMalformed) {
+		t.Fatalf("err = %v, want ErrMalformed", err)
+	}
+}

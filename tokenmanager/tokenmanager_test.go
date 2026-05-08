@@ -401,3 +401,219 @@ func TestSaveLookupDeleteCoreToken(t *testing.T) {
 		t.Fatalf("after delete: got=%q err=%v", got, err)
 	}
 }
+
+// TestDeleteCoreToken_ClearsExchangeCache exercises the cache-clear
+// side of DeleteCoreToken. Without it, a subsequent Token() call after
+// re-login could return a stale exchanged token derived from the old
+// core token (currently safe because cacheKey includes the core token,
+// but the manager promises a clean slate on delete and tests should
+// pin that).
+func TestDeleteCoreToken_ClearsExchangeCache(t *testing.T) {
+	t.Parallel()
+	core := makeJWTWithAudience(t, []string{testIssuer})
+	store := newMemStore()
+	store.data[testIssuer] = tokens.TokenSet{AccessToken: core}
+
+	var exchangeCalls int
+	m := newTestManager(t, store, func(_ context.Context, _ sts.ExchangeRequest) (*tokens.TokenSet, error) {
+		exchangeCalls++
+		return &tokens.TokenSet{AccessToken: "exchanged-old", ExpiresAt: time.Now().Add(time.Hour)}, nil
+	})
+
+	// Prime the cache.
+	if _, err := m.TokenForResource(context.Background(), testResource); err != nil {
+		t.Fatalf("prime: %v", err)
+	}
+	if exchangeCalls != 1 {
+		t.Fatalf("prime exchanges = %d, want 1", exchangeCalls)
+	}
+
+	if err := m.DeleteCoreToken(); err != nil {
+		t.Fatalf("DeleteCoreToken: %v", err)
+	}
+
+	// Re-login with a fresh core token; the next Token() must not
+	// surface the stale cached entry.
+	freshCore := makeJWTWithAudience(t, []string{testIssuer})
+	if err := m.SaveCoreToken(freshCore); err != nil {
+		t.Fatalf("SaveCoreToken: %v", err)
+	}
+	if _, err := m.TokenForResource(context.Background(), testResource); err != nil {
+		t.Fatalf("post-relogin: %v", err)
+	}
+	if exchangeCalls != 2 {
+		t.Fatalf("post-relogin exchanges = %d, want 2 (cache must miss after delete)", exchangeCalls)
+	}
+}
+
+// TestDeleteCoreToken_PreservesCacheOnStoreFailure pins the order-of-
+// operations: if Store.DeleteTokens fails, the in-memory cache must
+// stay populated. Clearing pre-emptively would create a window where
+// the CLI thinks it's logged out but the keyring still hands out the
+// core token to the next process.
+func TestDeleteCoreToken_PreservesCacheOnStoreFailure(t *testing.T) {
+	t.Parallel()
+	core := makeJWTWithAudience(t, []string{testIssuer})
+	store := &erroringStore{inner: newMemStore(), deleteErr: errors.New("keyring locked")}
+	store.inner.data[testIssuer] = tokens.TokenSet{AccessToken: core}
+
+	var exchangeCalls int
+	m := newTestManager(t, store, func(_ context.Context, _ sts.ExchangeRequest) (*tokens.TokenSet, error) {
+		exchangeCalls++
+		return &tokens.TokenSet{AccessToken: "exchanged-1", ExpiresAt: time.Now().Add(time.Hour)}, nil
+	})
+
+	if _, err := m.TokenForResource(context.Background(), testResource); err != nil {
+		t.Fatalf("prime: %v", err)
+	}
+	if exchangeCalls != 1 {
+		t.Fatalf("prime exchanges = %d, want 1", exchangeCalls)
+	}
+
+	if err := m.DeleteCoreToken(); err == nil {
+		t.Fatal("DeleteCoreToken must surface store error")
+	}
+
+	// Cache must still hand out the previously exchanged token —
+	// no exchange call should fire on the second Token().
+	if _, err := m.TokenForResource(context.Background(), testResource); err != nil {
+		t.Fatalf("post-failed-delete: %v", err)
+	}
+	if exchangeCalls != 1 {
+		t.Fatalf("post-failed-delete exchanges = %d, want 1 (cache must survive failed delete)", exchangeCalls)
+	}
+}
+
+// erroringStore wraps memStore and lets a test force a specific store
+// op to fail, so we can exercise failure paths without a flaky real
+// keyring.
+type erroringStore struct {
+	inner     *memStore
+	loadErr   error
+	deleteErr error
+}
+
+func (s *erroringStore) SaveTokens(profile string, t tokens.TokenSet) error {
+	return s.inner.SaveTokens(profile, t)
+}
+
+func (s *erroringStore) LoadTokens(profile string) (tokens.TokenSet, error) {
+	if s.loadErr != nil {
+		return tokens.TokenSet{}, s.loadErr
+	}
+	return s.inner.LoadTokens(profile)
+}
+
+func (s *erroringStore) DeleteTokens(profile string) error {
+	if s.deleteErr != nil {
+		return s.deleteErr
+	}
+	return s.inner.DeleteTokens(profile)
+}
+
+// TestToken_CacheKeyDistinguishesRequestedTokenType complements the
+// existing audience-independence test: different requested_token_type
+// URIs must not shadow each other in the cache.
+func TestToken_CacheKeyDistinguishesRequestedTokenType(t *testing.T) {
+	t.Parallel()
+	core := makeJWTWithAudience(t, []string{testIssuer})
+	store := newMemStore()
+	store.data[testIssuer] = tokens.TokenSet{AccessToken: core}
+
+	var calls int
+	m := newTestManager(t, store, func(_ context.Context, req sts.ExchangeRequest) (*tokens.TokenSet, error) {
+		calls++
+		return &tokens.TokenSet{AccessToken: "tok-" + req.RequestedTokenType}, nil
+	})
+
+	const otherType = "urn:ietf:params:oauth:token-type:jwt"
+	a, err := m.Token(context.Background(), TokenRequest{Resource: testResource})
+	if err != nil {
+		t.Fatalf("Token(default type): %v", err)
+	}
+	b, err := m.Token(context.Background(), TokenRequest{Resource: testResource, RequestedTokenType: otherType})
+	if err != nil {
+		t.Fatalf("Token(otherType): %v", err)
+	}
+	if a == b || calls != 2 {
+		t.Fatalf("expected separate cache entries per requested_token_type, got a=%q b=%q calls=%d", a, b, calls)
+	}
+}
+
+// TestToken_CacheKeyDistinguishesScope same shape, locks scope into
+// the cache key.
+func TestToken_CacheKeyDistinguishesScope(t *testing.T) {
+	t.Parallel()
+	core := makeJWTWithAudience(t, []string{testIssuer})
+	store := newMemStore()
+	store.data[testIssuer] = tokens.TokenSet{AccessToken: core}
+
+	var calls int
+	m := newTestManager(t, store, func(_ context.Context, req sts.ExchangeRequest) (*tokens.TokenSet, error) {
+		calls++
+		return &tokens.TokenSet{AccessToken: "tok-" + req.Scope}, nil
+	})
+
+	a, err := m.Token(context.Background(), TokenRequest{Resource: testResource, Scope: "scope-a"})
+	if err != nil {
+		t.Fatalf("Token(scope-a): %v", err)
+	}
+	b, err := m.Token(context.Background(), TokenRequest{Resource: testResource, Scope: "scope-b"})
+	if err != nil {
+		t.Fatalf("Token(scope-b): %v", err)
+	}
+	if a == b || calls != 2 {
+		t.Fatalf("expected separate cache entries per scope, got a=%q b=%q calls=%d", a, b, calls)
+	}
+}
+
+// TestCoreTokenAudienceShortcut_FallsThroughOnMalformedJWT pins a
+// security-sensitive contract: a non-JWT (or malformed JWT) core token
+// must NOT be silently treated as audience-matching the resource.
+// Otherwise a corrupt/forged-but-undecodeable token could bypass the
+// exchange path. The "fallthrough to exchange" behaviour is what makes
+// signature-skipping ParseClaims safe here.
+func TestCoreTokenAudienceShortcut_FallsThroughOnMalformedJWT(t *testing.T) {
+	t.Parallel()
+	store := newMemStore()
+	store.data[testIssuer] = tokens.TokenSet{AccessToken: "not-a-jwt"}
+
+	var exchangeCalls int
+	m := newTestManager(t, store, func(_ context.Context, _ sts.ExchangeRequest) (*tokens.TokenSet, error) {
+		exchangeCalls++
+		return &tokens.TokenSet{AccessToken: "exchanged"}, nil
+	})
+
+	got, err := m.TokenForResource(context.Background(), testResource)
+	if err != nil {
+		t.Fatalf("TokenForResource: %v", err)
+	}
+	if got == "not-a-jwt" {
+		t.Fatal("malformed core token must not be returned verbatim — exchange path must fire")
+	}
+	if exchangeCalls != 1 {
+		t.Fatalf("exchanges = %d, want 1 (exchange must run on unparseable JWT)", exchangeCalls)
+	}
+}
+
+// TestToken_StoreErrorSurfacesNotAsErrNotLoggedIn pins the contract
+// that a non-ErrNotFound store error is *not* collapsed to
+// ErrNotLoggedIn. Doing so would mask real keyring failures behind a
+// "run entire login" message that does nothing.
+func TestToken_StoreErrorSurfacesNotAsErrNotLoggedIn(t *testing.T) {
+	t.Parallel()
+	store := &erroringStore{inner: newMemStore(), loadErr: errors.New("keyring permission denied")}
+
+	m := newTestManager(t, store, nil)
+
+	_, err := m.TokenForResource(context.Background(), testResource)
+	if err == nil {
+		t.Fatal("expected store error to surface")
+	}
+	if errors.Is(err, ErrNotLoggedIn) {
+		t.Fatalf("err = %v, must NOT be ErrNotLoggedIn (real failures must not be silenced)", err)
+	}
+	if !strings.Contains(err.Error(), "keyring permission denied") {
+		t.Fatalf("err = %v, want underlying store error", err)
+	}
+}
