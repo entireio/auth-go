@@ -204,6 +204,34 @@ func TestToken_AudienceShortcut(t *testing.T) {
 	}
 }
 
+func TestToken_ExplicitAudienceBypassesAudienceShortcut(t *testing.T) {
+	t.Parallel()
+	core := makeJWTWithAudience(t, []string{testIssuer, testResource})
+	store := newMemStore()
+	store.data[testIssuer] = tokens.TokenSet{AccessToken: core}
+
+	const requestedAudience = "https://tokens.example.com"
+	var got sts.ExchangeRequest
+	var calls int
+	m := newTestManager(t, store, func(_ context.Context, req sts.ExchangeRequest) (*tokens.TokenSet, error) {
+		calls++
+		got = req
+		return &tokens.TokenSet{AccessToken: "exchanged"}, nil
+	})
+
+	token, err := m.Token(context.Background(), TokenRequest{Resource: testResource, Audience: requestedAudience})
+	if err != nil {
+		t.Fatalf("Token: %v", err)
+	}
+
+	if token != "exchanged" || calls != 1 {
+		t.Fatalf("Token returned %q with %d exchange calls, want exchanged token from one exchange", token, calls)
+	}
+	if got.Audience != requestedAudience {
+		t.Fatalf("exchange Audience = %q, want %q", got.Audience, requestedAudience)
+	}
+}
+
 func TestToken_ExchangesAndCaches(t *testing.T) {
 	t.Parallel()
 	core := makeJWTWithAudience(t, []string{testIssuer})
@@ -248,6 +276,27 @@ func TestToken_ExchangesAndCaches(t *testing.T) {
 	}
 	if got := lastReq.Extra.Get("client_id"); got != testClientID {
 		t.Errorf("client_id = %q", got)
+	}
+}
+
+func TestToken_ExchangeIncludesResource(t *testing.T) {
+	t.Parallel()
+	core := makeJWTWithAudience(t, []string{testIssuer})
+	store := newMemStore()
+	store.data[testIssuer] = tokens.TokenSet{AccessToken: core}
+
+	var got sts.ExchangeRequest
+	m := newTestManager(t, store, func(_ context.Context, req sts.ExchangeRequest) (*tokens.TokenSet, error) {
+		got = req
+		return &tokens.TokenSet{AccessToken: "exchanged"}, nil
+	})
+
+	if _, err := m.TokenForResource(context.Background(), testResource); err != nil {
+		t.Fatalf("TokenForResource: %v", err)
+	}
+
+	if got.Resource != testResource {
+		t.Fatalf("exchange Resource = %q, want %q", got.Resource, testResource)
 	}
 }
 

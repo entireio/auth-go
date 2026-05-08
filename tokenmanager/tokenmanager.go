@@ -229,7 +229,7 @@ func (m *Manager) Token(ctx context.Context, req TokenRequest) (string, error) {
 	if req.Audience == "" && m.cfg.Issuer == req.Resource {
 		return core, nil
 	}
-	if coreTokenAudienceIncludes(core, req.Resource) {
+	if req.Audience == "" && coreTokenAudienceIncludes(core, req.Resource) {
 		return core, nil
 	}
 
@@ -326,6 +326,7 @@ func (m *Manager) runExchange(ctx context.Context, coreToken string, req TokenRe
 		SubjectTokenType:   sts.SubjectTokenTypeJWT,
 		RequestedTokenType: req.RequestedTokenType,
 		Audience:           req.Audience,
+		Resource:           req.Resource,
 		Scope:              req.Scope,
 		// Public-client identification per RFC 6749 §2.3.1 / §3.2.1.
 		// Carried via Extra because the sts package is provider-agnostic.
