@@ -297,3 +297,62 @@ func TestExchange_NoExpiry(t *testing.T) {
 		t.Fatalf("ExpiresAt = %v, want zero", got.ExpiresAt)
 	}
 }
+
+// TestExchange_RequestTimeoutFires pins the slow-loris defence: a
+// handler that never writes a response body must surface as a context
+// deadline error rather than blocking the caller indefinitely.
+//
+// Cleanup order matters: t.Cleanup is LIFO, and httptest.Server.Close
+// waits for in-flight handler goroutines to return. We register
+// `close(hung)` AFTER newTestClient so it fires first and lets the
+// handler exit before srv.Close runs.
+func TestExchange_RequestTimeoutFires(t *testing.T) {
+	t.Parallel()
+	hung := make(chan struct{})
+
+	c := newTestClient(t, func(_ http.ResponseWriter, r *http.Request) {
+		select {
+		case <-hung:
+		case <-r.Context().Done():
+		}
+	})
+	t.Cleanup(func() { close(hung) })
+	c.RequestTimeout = 50 * time.Millisecond
+
+	_, err := c.Exchange(context.Background(), ExchangeRequest{
+		SubjectToken:       "sub",
+		SubjectTokenType:   SubjectTokenTypeJWT,
+		RequestedTokenType: "urn:example:t",
+	})
+	if err == nil {
+		t.Fatal("expected timeout error, got nil")
+	}
+	if !strings.Contains(err.Error(), "context deadline exceeded") {
+		t.Fatalf("err = %v, want context deadline exceeded", err)
+	}
+}
+
+// TestRequestTimeout_DefaultAndOverride exercises the timeout policy
+// without doing IO — pure resolution of the (zero / negative /
+// positive) input contract.
+func TestRequestTimeout_DefaultAndOverride(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name string
+		in   time.Duration
+		want time.Duration
+	}{
+		{"zero -> default", 0, DefaultRequestTimeout},
+		{"negative -> disabled", -1, 0},
+		{"positive -> verbatim", 5 * time.Second, 5 * time.Second},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			c := &Client{RequestTimeout: tc.in}
+			if got := c.requestTimeout(); got != tc.want {
+				t.Fatalf("requestTimeout() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}

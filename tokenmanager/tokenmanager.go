@@ -18,7 +18,6 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
-	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -137,8 +136,20 @@ func (m *Manager) Issuer() string { return m.cfg.Issuer }
 
 // SaveCoreToken persists the device-flow access token under the
 // configured Issuer.
+//
+// On successful save the in-memory exchange cache is cleared so a
+// re-login under a different identity can't return the previous user's
+// exchanged tokens. The cacheKey already binds entries to CoreToken so
+// this is defence-in-depth against a future refactor that drops the
+// core token from the cache key — see TestSaveCoreToken_ClearsExchangeCache.
 func (m *Manager) SaveCoreToken(accessToken string) error {
-	return m.cfg.Store.SaveTokens(m.cfg.Issuer, tokens.TokenSet{AccessToken: accessToken}) //nolint:wrapcheck // backend error already names the operation
+	if err := m.cfg.Store.SaveTokens(m.cfg.Issuer, tokens.TokenSet{AccessToken: accessToken}); err != nil {
+		return fmt.Errorf("save core token: %w", err)
+	}
+	m.mu.Lock()
+	m.cache = map[cacheKey]cachedToken{}
+	m.mu.Unlock()
+	return nil
 }
 
 // LookupCoreToken returns the stored core token, or "" if none is
@@ -225,16 +236,26 @@ func (m *Manager) Token(ctx context.Context, req TokenRequest) (string, error) {
 	if core == "" {
 		return "", ErrNotLoggedIn
 	}
+	// Preflight expiry: a long-stored core token would otherwise hit the
+	// resource (or STS) and surface as a confusing "invalid_grant" /
+	// "401". Parse-failure is intentionally not treated as expired —
+	// opaque (non-JWT) access tokens have no client-visible expiry, so
+	// we let them flow and trust the server to reject if necessary.
+	if coreTokenExpired(core, m.cfg.Now()) {
+		return "", ErrNotLoggedIn
+	}
 
-	if req.Audience == "" && m.cfg.Issuer == req.Resource {
+	normResource := normalizeOriginURL(req.Resource)
+
+	if req.Audience == "" && normalizeOriginURL(m.cfg.Issuer) == normResource {
 		return core, nil
 	}
-	if req.Audience == "" && coreTokenAudienceIncludes(core, req.Resource) {
+	if req.Audience == "" && coreTokenAudienceIncludes(core, normResource) {
 		return core, nil
 	}
 
 	resolved := m.resolve(req)
-	key := makeCacheKey(core, resolved)
+	key := makeCacheKey(core, resolved, normResource)
 	if hit, ok := m.cacheLookup(key); ok {
 		return hit, nil
 	}
@@ -258,12 +279,73 @@ func (m *Manager) resolve(req TokenRequest) TokenRequest {
 	return req
 }
 
+// coreTokenExpired reports whether the core token has an `exp` claim
+// in the past at now. JWT parse failures (and tokens without an `exp`
+// claim) are reported as not-expired so opaque access tokens flow
+// through the rest of the resolution rules unchanged.
+func coreTokenExpired(coreJWT string, now time.Time) bool {
+	claims, err := tokens.ParseClaims(coreJWT)
+	if err != nil {
+		return false
+	}
+	if claims.ExpiresAt.IsZero() {
+		return false
+	}
+	return !now.Before(claims.ExpiresAt)
+}
+
+// coreTokenAudienceIncludes reports whether the core JWT's `aud` claim
+// covers target. target is expected to already be in normalised form
+// (see normalizeOriginURL); aud entries are normalised here so a
+// trailing-slash / case difference between the AS and the caller
+// doesn't force a needless STS exchange.
 func coreTokenAudienceIncludes(coreJWT, target string) bool {
 	claims, err := tokens.ParseClaims(coreJWT)
 	if err != nil {
 		return false
 	}
-	return slices.Contains(claims.Audience, target)
+	for _, aud := range claims.Audience {
+		if normalizeOriginURL(aud) == target {
+			return true
+		}
+	}
+	return false
+}
+
+// normalizeOriginURL canonicalises an origin URL for equality
+// comparisons. RFC 3986 §6.2.2.1 makes scheme and host case-insensitive
+// and §6.2.3 makes the empty path equivalent to "/" — we collapse to
+// no-trailing-slash. Default ports (80/http, 443/https) are stripped.
+//
+// On parse failure (or when the input lacks a scheme or host — common
+// for non-URL audiences) the input is returned unchanged so callers
+// fall back to byte-exact comparison.
+func normalizeOriginURL(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil || u.Scheme == "" || u.Host == "" {
+		return raw
+	}
+	u.Scheme = strings.ToLower(u.Scheme)
+
+	hostname := strings.ToLower(u.Hostname())
+	port := u.Port()
+	dropPort := (u.Scheme == "http" && port == "80") ||
+		(u.Scheme == "https" && port == "443") ||
+		port == ""
+
+	switch {
+	case dropPort && strings.Contains(hostname, ":"): // IPv6 without port
+		u.Host = "[" + hostname + "]"
+	case dropPort:
+		u.Host = hostname
+	case strings.Contains(hostname, ":"): // IPv6 with non-default port
+		u.Host = "[" + hostname + "]:" + port
+	default:
+		u.Host = hostname + ":" + port
+	}
+
+	u.Path = strings.TrimRight(u.Path, "/")
+	return u.String()
 }
 
 // cachedToken is one entry in the per-process exchange cache.
@@ -297,11 +379,13 @@ type cacheKey struct {
 
 // makeCacheKey builds a cacheKey from the (resolved) request. Includes
 // every wire-affecting field so different combinations don't shadow
-// each other.
-func makeCacheKey(coreToken string, req TokenRequest) cacheKey {
+// each other. normalizedResource is the caller-supplied Resource after
+// passing through normalizeOriginURL, so https://api.example.com and
+// https://api.example.com/ share a single cache entry.
+func makeCacheKey(coreToken string, req TokenRequest, normalizedResource string) cacheKey {
 	return cacheKey{
 		CoreToken:          coreToken,
-		Resource:           req.Resource,
+		Resource:           normalizedResource,
 		Audience:           req.Audience,
 		RequestedTokenType: req.RequestedTokenType,
 		Scope:              req.Scope,

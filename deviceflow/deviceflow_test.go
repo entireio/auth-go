@@ -360,3 +360,83 @@ func TestResolveURL(t *testing.T) {
 		})
 	}
 }
+
+// TestPollDeviceAuth_RequestTimeoutFires pins the slow-loris defence:
+// a handler that never finishes writing a response must surface as a
+// context deadline error rather than blocking the polling loop forever.
+func TestPollDeviceAuth_RequestTimeoutFires(t *testing.T) {
+	t.Parallel()
+	// Cleanup is LIFO and httptest.Server.Close waits for active
+	// handler goroutines, so close(hung) is registered AFTER
+	// newTestClient to fire first and let the handler exit before
+	// srv.Close runs.
+	hung := make(chan struct{})
+	c := newTestClient(t, func(_ http.ResponseWriter, r *http.Request) {
+		select {
+		case <-hung:
+		case <-r.Context().Done():
+		}
+	})
+	t.Cleanup(func() { close(hung) })
+	c.RequestTimeout = 50 * time.Millisecond
+
+	_, err := c.PollDeviceAuth(context.Background(), "dev-1")
+	if err == nil {
+		t.Fatal("expected timeout error, got nil")
+	}
+	if !strings.Contains(err.Error(), "context deadline exceeded") {
+		t.Fatalf("err = %v, want context deadline exceeded", err)
+	}
+}
+
+// TestStartDeviceAuth_RequestTimeoutFires mirrors the poll-side test
+// for the device-code endpoint.
+func TestStartDeviceAuth_RequestTimeoutFires(t *testing.T) {
+	t.Parallel()
+	// Cleanup is LIFO and httptest.Server.Close waits for active
+	// handler goroutines, so close(hung) is registered AFTER
+	// newTestClient to fire first and let the handler exit before
+	// srv.Close runs.
+	hung := make(chan struct{})
+	c := newTestClient(t, func(_ http.ResponseWriter, r *http.Request) {
+		select {
+		case <-hung:
+		case <-r.Context().Done():
+		}
+	})
+	t.Cleanup(func() { close(hung) })
+	c.RequestTimeout = 50 * time.Millisecond
+
+	_, err := c.StartDeviceAuth(context.Background())
+	if err == nil {
+		t.Fatal("expected timeout error, got nil")
+	}
+	if !strings.Contains(err.Error(), "context deadline exceeded") {
+		t.Fatalf("err = %v, want context deadline exceeded", err)
+	}
+}
+
+// TestRequestTimeout_DefaultAndOverride exercises the timeout policy
+// without doing IO — pure resolution of the (zero / negative /
+// positive) input contract.
+func TestRequestTimeout_DefaultAndOverride(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name string
+		in   time.Duration
+		want time.Duration
+	}{
+		{"zero -> default", 0, DefaultRequestTimeout},
+		{"negative -> disabled", -1, 0},
+		{"positive -> verbatim", 5 * time.Second, 5 * time.Second},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			c := &Client{RequestTimeout: tc.in}
+			if got := c.requestTimeout(); got != tc.want {
+				t.Fatalf("requestTimeout() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}

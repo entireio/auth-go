@@ -195,3 +195,34 @@ func TestKeyring_LoadTokens_BadExpiresAtReturnsErrMalformed(t *testing.T) {
 		t.Fatalf("err = %v, want ErrMalformed", err)
 	}
 }
+
+// TestKeyring_LoadTokens_EmptyAccessTokenReturnsErrMalformed pins the
+// guard against well-formed JSON that decodes to a zero TokenSet. An
+// unrelated CLI's blob keyed against the same service/profile, or a
+// "{}" entry from a buggy save, would otherwise produce a TokenSet
+// with empty AccessToken indistinguishable from a successful load —
+// and the shim would then ship "Authorization: Bearer " on the wire.
+func TestKeyring_LoadTokens_EmptyAccessTokenReturnsErrMalformed(t *testing.T) {
+	cases := []struct {
+		name string
+		body string
+	}{
+		{"empty object", `{}`},
+		{"unrelated fields only", `{"foo":"bar","count":3}`},
+		{"explicit empty access_token", `{"access_token":""}`},
+		{"whitespace access_token", `{"access_token":"   "}`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			service := "test-empty-" + tc.name
+			const profile = "https://example.com"
+			if err := keyring.Set(service, profile, tc.body); err != nil {
+				t.Fatalf("seed keyring: %v", err)
+			}
+			_, err := NewKeyring(service).LoadTokens(profile)
+			if !errors.Is(err, ErrMalformed) {
+				t.Fatalf("err = %v, want ErrMalformed", err)
+			}
+		})
+	}
+}

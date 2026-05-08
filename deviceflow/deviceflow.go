@@ -47,6 +47,15 @@ type DeviceCode struct {
 	Interval                int    `json:"interval"`
 }
 
+// DefaultRequestTimeout caps a single device-flow HTTP round-trip
+// (StartDeviceAuth or one PollDeviceAuth call). Set conservatively:
+// healthy device-flow endpoints respond in sub-seconds, so the cap
+// mainly defends against slow-loris responses dripping bytes within
+// MaxResponseBytes — see Client.RequestTimeout for the per-Client
+// override. The polling-loop interval is the caller's concern; this
+// timeout governs only the individual HTTP request.
+const DefaultRequestTimeout = 30 * time.Second
+
 // Client polls an RFC 8628 device authorization grant.
 //
 // All configuration is explicit; the package has no global state and
@@ -60,6 +69,26 @@ type Client struct {
 	UserAgent      string
 	DeviceCodePath string
 	TokenPath      string
+
+	// RequestTimeout is the per-request deadline applied via
+	// context.WithTimeout on top of the caller's context. Zero falls
+	// back to DefaultRequestTimeout. Negative disables the cap (useful
+	// for tests that want to drive timing via the caller's ctx alone).
+	RequestTimeout time.Duration
+}
+
+// requestTimeout resolves the effective per-request timeout: the
+// configured RequestTimeout if positive, the package default if zero,
+// or zero (no cap) if negative.
+func (c *Client) requestTimeout() time.Duration {
+	switch {
+	case c.RequestTimeout < 0:
+		return 0
+	case c.RequestTimeout == 0:
+		return DefaultRequestTimeout
+	default:
+		return c.RequestTimeout
+	}
 }
 
 // Sentinel errors returned by PollDeviceAuth when the token endpoint
@@ -110,6 +139,12 @@ func errCodeToSentinel(code string) error {
 // server. The returned DeviceCode is opaque to the client; pass it
 // back unmodified on every PollDeviceAuth.
 func (c *Client) StartDeviceAuth(ctx context.Context) (*DeviceCode, error) {
+	if timeout := c.requestTimeout(); timeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, timeout)
+		defer cancel()
+	}
+
 	body := url.Values{}
 	body.Set("client_id", c.ClientID)
 	if c.Scope != "" {
@@ -141,6 +176,12 @@ func (c *Client) StartDeviceAuth(ctx context.Context) (*DeviceCode, error) {
 // the matching sentinel error from this package. Other failures
 // (network, malformed responses) are wrapped with context.
 func (c *Client) PollDeviceAuth(ctx context.Context, deviceCode string) (*tokens.TokenSet, error) {
+	if timeout := c.requestTimeout(); timeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, timeout)
+		defer cancel()
+	}
+
 	body := url.Values{}
 	body.Set("grant_type", deviceCodeGrantType)
 	body.Set("client_id", c.ClientID)
@@ -195,7 +236,10 @@ func (c *Client) PollDeviceAuth(ctx context.Context, deviceCode string) (*tokens
 }
 
 // postForm POSTs body as application/x-www-form-urlencoded to a path
-// resolved against the client's BaseURL.
+// resolved against the client's BaseURL. The caller is responsible
+// for applying any per-request timeout via context.WithTimeout — the
+// timeout must cover the body-read that happens after postForm
+// returns, so cancel-on-return here would interrupt that read.
 func (c *Client) postForm(ctx context.Context, path string, body url.Values) (*http.Response, error) {
 	endpoint, err := resolveURL(c.BaseURL, path)
 	if err != nil {

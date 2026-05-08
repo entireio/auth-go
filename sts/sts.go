@@ -68,6 +68,13 @@ func (r ExchangeRequest) validate() error {
 	return nil
 }
 
+// DefaultRequestTimeout caps a single token-exchange round-trip. Set
+// conservatively: even with a slow auth host plus TLS handshake, a
+// healthy exchange completes in sub-seconds. The cap mainly defends
+// against slow-loris responses dripping bytes within MaxResponseBytes
+// — see Client.RequestTimeout for the per-Client override.
+const DefaultRequestTimeout = 30 * time.Second
+
 // Client exchanges subject tokens for tokens of a different type at an
 // RFC 8693 token endpoint.
 //
@@ -78,6 +85,12 @@ type Client struct {
 	BaseURL   string
 	Path      string
 	UserAgent string
+
+	// RequestTimeout is the per-Exchange deadline applied via
+	// context.WithTimeout on top of the caller's context. Zero falls
+	// back to DefaultRequestTimeout. Negative disables the cap (useful
+	// for tests that want to drive timing via the caller's ctx alone).
+	RequestTimeout time.Duration
 }
 
 // Exchange performs one RFC 8693 token exchange.
@@ -96,6 +109,12 @@ func (c *Client) Exchange(ctx context.Context, req ExchangeRequest) (*tokens.Tok
 	endpoint, err := resolveURL(c.BaseURL, c.Path)
 	if err != nil {
 		return nil, fmt.Errorf("token exchange: resolve URL: %w", err)
+	}
+
+	if timeout := c.requestTimeout(); timeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, timeout)
+		defer cancel()
 	}
 
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, strings.NewReader(form.Encode()))
@@ -174,6 +193,20 @@ func buildForm(req ExchangeRequest) url.Values {
 		form.Set("scope", req.Scope)
 	}
 	return form
+}
+
+// requestTimeout resolves the effective per-request timeout: the
+// configured RequestTimeout if positive, the package default if zero,
+// or zero (no cap) if negative.
+func (c *Client) requestTimeout() time.Duration {
+	switch {
+	case c.RequestTimeout < 0:
+		return 0
+	case c.RequestTimeout == 0:
+		return DefaultRequestTimeout
+	default:
+		return c.RequestTimeout
+	}
 }
 
 func resolveURL(baseURL, path string) (string, error) {

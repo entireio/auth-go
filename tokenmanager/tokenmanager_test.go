@@ -41,16 +41,36 @@ func (s *memStore) DeleteTokens(profile string) error {
 }
 
 const (
-	testIssuer   = "https://auth.example.com"
-	testResource = "https://api.example.com"
-	testClientID = "test-cli"
-	testSTSPath  = "/sts/token"
+	testIssuer       = "https://auth.example.com"
+	testResource     = "https://api.example.com"
+	testClientID     = "test-cli"
+	testSTSPath      = "/sts/token"
+	testExchangedTok = "exchanged"
 )
 
 func makeJWTWithAudience(t *testing.T, aud []string) string {
 	t.Helper()
 	header := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"none","typ":"JWT"}`))
 	payload, err := json.Marshal(map[string]any{"aud": aud, "sub": "test"})
+	if err != nil {
+		t.Fatalf("marshal payload: %v", err)
+	}
+	body := base64.RawURLEncoding.EncodeToString(payload)
+	sig := base64.RawURLEncoding.EncodeToString([]byte("not-real"))
+	return header + "." + body + "." + sig
+}
+
+// makeJWTWithExp builds an unsigned JWT carrying `exp` (and optionally
+// `aud`). The signature segment is junk — tokenmanager never verifies
+// it, ParseClaims is documented as unverified.
+func makeJWTWithExp(t *testing.T, exp time.Time, aud []string) string {
+	t.Helper()
+	header := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"none","typ":"JWT"}`))
+	claims := map[string]any{"sub": "test", "exp": exp.Unix()}
+	if len(aud) > 0 {
+		claims["aud"] = aud
+	}
+	payload, err := json.Marshal(claims)
 	if err != nil {
 		t.Fatalf("marshal payload: %v", err)
 	}
@@ -216,7 +236,7 @@ func TestToken_ExplicitAudienceBypassesAudienceShortcut(t *testing.T) {
 	m := newTestManager(t, store, func(_ context.Context, req sts.ExchangeRequest) (*tokens.TokenSet, error) {
 		calls++
 		got = req
-		return &tokens.TokenSet{AccessToken: "exchanged"}, nil
+		return &tokens.TokenSet{AccessToken: testExchangedTok}, nil
 	})
 
 	token, err := m.Token(context.Background(), TokenRequest{Resource: testResource, Audience: requestedAudience})
@@ -224,7 +244,7 @@ func TestToken_ExplicitAudienceBypassesAudienceShortcut(t *testing.T) {
 		t.Fatalf("Token: %v", err)
 	}
 
-	if token != "exchanged" || calls != 1 {
+	if token != testExchangedTok || calls != 1 {
 		t.Fatalf("Token returned %q with %d exchange calls, want exchanged token from one exchange", token, calls)
 	}
 	if got.Audience != requestedAudience {
@@ -288,7 +308,7 @@ func TestToken_ExchangeIncludesResource(t *testing.T) {
 	var got sts.ExchangeRequest
 	m := newTestManager(t, store, func(_ context.Context, req sts.ExchangeRequest) (*tokens.TokenSet, error) {
 		got = req
-		return &tokens.TokenSet{AccessToken: "exchanged"}, nil
+		return &tokens.TokenSet{AccessToken: testExchangedTok}, nil
 	})
 
 	if _, err := m.TokenForResource(context.Background(), testResource); err != nil {
@@ -383,7 +403,7 @@ func TestToken_CacheExpires(t *testing.T) {
 		Now: func() time.Time { return now },
 		Exchange: func(_ context.Context, _ sts.ExchangeRequest) (*tokens.TokenSet, error) {
 			calls++
-			return &tokens.TokenSet{AccessToken: "exchanged", ExpiresAt: now.Add(time.Minute)}, nil
+			return &tokens.TokenSet{AccessToken: testExchangedTok, ExpiresAt: now.Add(time.Minute)}, nil
 		},
 	})
 	if err != nil {
@@ -630,7 +650,7 @@ func TestCoreTokenAudienceShortcut_FallsThroughOnMalformedJWT(t *testing.T) {
 	var exchangeCalls int
 	m := newTestManager(t, store, func(_ context.Context, _ sts.ExchangeRequest) (*tokens.TokenSet, error) {
 		exchangeCalls++
-		return &tokens.TokenSet{AccessToken: "exchanged"}, nil
+		return &tokens.TokenSet{AccessToken: testExchangedTok}, nil
 	})
 
 	got, err := m.TokenForResource(context.Background(), testResource)
@@ -664,5 +684,195 @@ func TestToken_StoreErrorSurfacesNotAsErrNotLoggedIn(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "keyring permission denied") {
 		t.Fatalf("err = %v, want underlying store error", err)
+	}
+}
+
+// TestToken_ExpiredCoreReturnsNotLoggedIn pins the preflight behaviour:
+// a core token whose JWT `exp` is in the past surfaces ErrNotLoggedIn
+// before the request reaches STS or the resource. Without preflight,
+// users see a confusing "invalid_grant" / "401" instead of "run login".
+func TestToken_ExpiredCoreReturnsNotLoggedIn(t *testing.T) {
+	t.Parallel()
+	now := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	expired := makeJWTWithExp(t, now.Add(-time.Hour), nil)
+
+	store := newMemStore()
+	store.data[testIssuer] = tokens.TokenSet{AccessToken: expired}
+
+	m, err := New(Config{
+		Issuer: testIssuer, ClientID: testClientID, STSPath: testSTSPath, Store: store,
+		Now: func() time.Time { return now },
+		Exchange: func(_ context.Context, _ sts.ExchangeRequest) (*tokens.TokenSet, error) {
+			t.Fatal("exchange must not run for an expired core token")
+			return nil, errors.New("unreachable")
+		},
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	_, err = m.TokenForResource(context.Background(), testResource)
+	if !errors.Is(err, ErrNotLoggedIn) {
+		t.Fatalf("err = %v, want ErrNotLoggedIn", err)
+	}
+}
+
+// TestToken_OpaqueCorePassesPreflight guards the parse-failure branch:
+// non-JWT (opaque) access tokens have no client-visible expiry, so
+// they must NOT be classified as expired by the preflight check.
+func TestToken_OpaqueCorePassesPreflight(t *testing.T) {
+	t.Parallel()
+	store := newMemStore()
+	store.data[testIssuer] = tokens.TokenSet{AccessToken: "opaque-not-a-jwt"}
+
+	m, err := New(Config{
+		Issuer: testIssuer, ClientID: testClientID, Store: store,
+		Exchange: func(_ context.Context, _ sts.ExchangeRequest) (*tokens.TokenSet, error) {
+			t.Fatal("same-host shortcut should win for opaque core token == issuer")
+			return nil, errors.New("unreachable")
+		},
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	got, err := m.TokenForResource(context.Background(), testIssuer)
+	if err != nil {
+		t.Fatalf("TokenForResource: %v", err)
+	}
+	if got != "opaque-not-a-jwt" {
+		t.Fatalf("got %q, want opaque core verbatim", got)
+	}
+}
+
+// TestSaveCoreToken_ClearsExchangeCache pins the cache-invalidation
+// contract on save: a re-login under a different identity must not
+// return the previous user's exchanged tokens, even if a future
+// refactor accidentally drops CoreToken from the cache key.
+func TestSaveCoreToken_ClearsExchangeCache(t *testing.T) {
+	t.Parallel()
+	store := newMemStore()
+	store.data[testIssuer] = tokens.TokenSet{AccessToken: "user-a-core"}
+
+	calls := 0
+	m := newTestManager(t, store, func(_ context.Context, _ sts.ExchangeRequest) (*tokens.TokenSet, error) {
+		calls++
+		return &tokens.TokenSet{AccessToken: "user-a-exchanged"}, nil
+	})
+
+	if _, err := m.TokenForResource(context.Background(), testResource); err != nil {
+		t.Fatalf("first call: %v", err)
+	}
+	if calls != 1 {
+		t.Fatalf("calls after first Token = %d, want 1", calls)
+	}
+
+	if err := m.SaveCoreToken("user-b-core"); err != nil {
+		t.Fatalf("SaveCoreToken: %v", err)
+	}
+
+	if _, err := m.TokenForResource(context.Background(), testResource); err != nil {
+		t.Fatalf("post-save call: %v", err)
+	}
+	if calls != 2 {
+		t.Fatalf("exchange calls after save = %d, want 2 (cache must be cleared on save)", calls)
+	}
+}
+
+// TestNormalizeOriginURL covers the cases where same-host / aud-shortcut
+// equality has historically misfired: trailing slash, scheme/host case,
+// default-port presence. Inputs that don't parse as origin URLs must
+// pass through unchanged so non-URL audiences keep byte-exact compare.
+func TestNormalizeOriginURL(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{"empty", "", ""},
+		{"plain", "https://api.example.com", "https://api.example.com"},
+		{"trailing slash", "https://api.example.com/", "https://api.example.com"},
+		{"upper scheme", "HTTPS://api.example.com", "https://api.example.com"},
+		{"upper host", "https://API.Example.COM", "https://api.example.com"},
+		{"default https port", "https://api.example.com:443", "https://api.example.com"},
+		{"default http port", "http://api.example.com:80/", "http://api.example.com"},
+		{"non-default port preserved", "https://api.example.com:8443", "https://api.example.com:8443"},
+		{"path preserved (sans trailing slash)", "https://api.example.com/v2/", "https://api.example.com/v2"},
+		{"non-URL audience passes through", "urn:example:cli", "urn:example:cli"},
+		{"bare string passes through", "some-audience", "some-audience"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			if got := normalizeOriginURL(tc.in); got != tc.want {
+				t.Errorf("normalizeOriginURL(%q) = %q, want %q", tc.in, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestToken_SameHostShortcut_NormalisesURLs guards against a regression
+// where a trailing-slash or case difference between Issuer and Resource
+// forces a needless STS exchange (or fails outright on single-host
+// deployments where STSPath is empty).
+func TestToken_SameHostShortcut_NormalisesURLs(t *testing.T) {
+	t.Parallel()
+	store := newMemStore()
+	store.data[testIssuer] = tokens.TokenSet{AccessToken: "core-tok"}
+
+	m, err := New(Config{
+		Issuer: testIssuer, ClientID: testClientID, // STSPath intentionally empty
+		Store: store,
+		Exchange: func(_ context.Context, _ sts.ExchangeRequest) (*tokens.TokenSet, error) {
+			t.Fatal("exchange must not run when issuer == resource modulo trailing slash / case")
+			return nil, errors.New("unreachable")
+		},
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	for _, resource := range []string{
+		testIssuer + "/", // trailing slash
+		strings.ToUpper(testIssuer[:8]) + testIssuer[8:], // uppercase scheme
+	} {
+		got, err := m.TokenForResource(context.Background(), resource)
+		if err != nil {
+			t.Fatalf("TokenForResource(%q): %v", resource, err)
+		}
+		if got != "core-tok" {
+			t.Fatalf("TokenForResource(%q) = %q, want core token verbatim", resource, got)
+		}
+	}
+}
+
+// TestToken_CacheCollapsesURLEquivalents pins the cache key being
+// computed off the normalised resource: two equivalent forms must
+// share a single entry rather than each driving its own STS round-trip.
+func TestToken_CacheCollapsesURLEquivalents(t *testing.T) {
+	t.Parallel()
+	store := newMemStore()
+	store.data[testIssuer] = tokens.TokenSet{AccessToken: "core-tok"}
+
+	var calls int
+	m := newTestManager(t, store, func(_ context.Context, _ sts.ExchangeRequest) (*tokens.TokenSet, error) {
+		calls++
+		return &tokens.TokenSet{AccessToken: testExchangedTok}, nil
+	})
+
+	first, err := m.TokenForResource(context.Background(), testResource)
+	if err != nil {
+		t.Fatalf("first call: %v", err)
+	}
+	second, err := m.TokenForResource(context.Background(), testResource+"/")
+	if err != nil {
+		t.Fatalf("second call: %v", err)
+	}
+	if first != testExchangedTok || second != testExchangedTok {
+		t.Fatalf("tokens = (%q, %q), want both exchanged", first, second)
+	}
+	if calls != 1 {
+		t.Fatalf("exchange calls = %d, want 1 (trailing-slash variant must hit cache)", calls)
 	}
 }

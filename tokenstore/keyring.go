@@ -114,6 +114,17 @@ func decodeTokenSet(raw string) (tokens.TokenSet, error) {
 		return tokens.TokenSet{}, fmt.Errorf("%w: unmarshal TokenSet: %w", ErrMalformed, err)
 	}
 
+	// json.Unmarshal happily decodes any well-formed JSON object to a
+	// zero keyringTokenSet — for example {} or an unrelated CLI's blob
+	// that happens to be keyed against the same (service, profile). We
+	// surface that as ErrMalformed so the embedding shim can route to
+	// its legacy/upgrade path rather than returning a TokenSet with an
+	// empty AccessToken (which the caller can't distinguish from a
+	// successful load of a freshly-cleared entry).
+	if strings.TrimSpace(wire.AccessToken) == "" {
+		return tokens.TokenSet{}, fmt.Errorf("%w: stored entry has no access_token", ErrMalformed)
+	}
+
 	t := tokens.TokenSet{
 		AccessToken:  wire.AccessToken,
 		RefreshToken: wire.RefreshToken,
