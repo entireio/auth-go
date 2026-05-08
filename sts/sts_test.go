@@ -50,8 +50,8 @@ func mustReadForm(t *testing.T, r *http.Request) {
 }
 
 func TestExchange_Success(t *testing.T) {
-	t.Parallel()
-
+	// Not parallel: freezeClock mutates the package-level nowFunc.
+	// Any other parallel test calling Exchange would race against it.
 	freezeClock(t, time.Date(2026, 5, 6, 12, 0, 0, 0, time.UTC))
 
 	c := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {

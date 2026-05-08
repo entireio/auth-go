@@ -114,7 +114,7 @@ type Manager struct {
 	cfg Config
 
 	mu    sync.Mutex
-	cache map[string]cachedToken
+	cache map[cacheKey]cachedToken
 }
 
 // New builds a Manager from cfg. Returns an error when required
@@ -129,7 +129,7 @@ func New(cfg Config) (*Manager, error) {
 	if cfg.Now == nil {
 		cfg.Now = time.Now
 	}
-	return &Manager{cfg: cfg, cache: map[string]cachedToken{}}, nil
+	return &Manager{cfg: cfg, cache: map[cacheKey]cachedToken{}}, nil
 }
 
 // Issuer returns the configured issuer URL.
@@ -168,7 +168,7 @@ func (m *Manager) DeleteCoreToken() error {
 		return fmt.Errorf("delete core token: %w", err)
 	}
 	m.mu.Lock()
-	m.cache = map[string]cachedToken{}
+	m.cache = map[cacheKey]cachedToken{}
 	m.mu.Unlock()
 	return nil
 }
@@ -234,7 +234,7 @@ func (m *Manager) Token(ctx context.Context, req TokenRequest) (string, error) {
 	}
 
 	resolved := m.resolve(req)
-	key := cacheKey(core, resolved)
+	key := makeCacheKey(core, resolved)
 	if hit, ok := m.cacheLookup(key); ok {
 		return hit, nil
 	}
@@ -282,20 +282,33 @@ func (c cachedToken) usable(now time.Time) bool {
 	return now.Add(exchangeSkew).Before(c.expiresAt)
 }
 
-// cacheKey derives a stable cache key from the (resolved) request.
-// Includes every wire-affecting field so different combinations don't
-// shadow each other.
-func cacheKey(coreToken string, req TokenRequest) string {
-	return strings.Join([]string{
-		coreToken,
-		req.Resource,
-		req.Audience,
-		req.RequestedTokenType,
-		req.Scope,
-	}, "|")
+// cacheKey is a structurally-keyed exchange-cache key. Using a struct
+// rather than a delimiter-joined string sidesteps any chance of two
+// distinct (core token, resource, audience, requested-token-type,
+// scope) tuples hashing to the same map slot via embedded delimiters
+// in any field.
+type cacheKey struct {
+	CoreToken          string
+	Resource           string
+	Audience           string
+	RequestedTokenType string
+	Scope              string
 }
 
-func (m *Manager) cacheLookup(key string) (string, bool) {
+// makeCacheKey builds a cacheKey from the (resolved) request. Includes
+// every wire-affecting field so different combinations don't shadow
+// each other.
+func makeCacheKey(coreToken string, req TokenRequest) cacheKey {
+	return cacheKey{
+		CoreToken:          coreToken,
+		Resource:           req.Resource,
+		Audience:           req.Audience,
+		RequestedTokenType: req.RequestedTokenType,
+		Scope:              req.Scope,
+	}
+}
+
+func (m *Manager) cacheLookup(key cacheKey) (string, bool) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	entry, ok := m.cache[key]
@@ -309,7 +322,7 @@ func (m *Manager) cacheLookup(key string) (string, bool) {
 	return entry.accessToken, true
 }
 
-func (m *Manager) cacheStore(key string, t *tokens.TokenSet) {
+func (m *Manager) cacheStore(key cacheKey, t *tokens.TokenSet) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.cache[key] = cachedToken{
