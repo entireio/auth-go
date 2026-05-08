@@ -1,13 +1,5 @@
 // Package tokenstore is the persistence interface for tokens, plus
-// reference implementations.
-//
-// Callers pick a Store at startup. Two impls ship with this package:
-//
-//   - Keyring stores one entry per profile in the OS keyring. Suitable
-//     for interactive single-user CLIs.
-//   - File stores entries in a JSON file on disk, with refresh tokens
-//     in the OS keyring. Suitable for CLIs that need to persist
-//     additional per-profile metadata (e.g. context bindings).
+// the Keyring reference implementation.
 //
 // Profile is whatever string the caller wants to key by — typically a
 // base URL, a kubectl-style context name, or a principal handle.
@@ -22,6 +14,13 @@ import (
 // ErrNotFound is returned when a profile has no stored tokens. Callers
 // distinguish "not logged in" from genuine errors with errors.Is.
 var ErrNotFound = errors.New("token not found")
+
+// ErrMalformed is returned (wrapped) when a stored entry exists but
+// can't be decoded into a TokenSet. Used by callers that want to treat
+// a malformed entry as a legacy/upgrade path (e.g. pre-shim bare-string
+// entries from older binaries) without confusing it with transport
+// errors from the underlying keyring.
+var ErrMalformed = errors.New("malformed token entry")
 
 // Store persists token bundles keyed by an opaque profile string.
 //

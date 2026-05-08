@@ -79,10 +79,9 @@ func (k *Keyring) DeleteTokens(profile string) error {
 
 // keyringTokenSet is the on-keyring JSON shape. Time fields are
 // serialised as RFC 3339 strings so the wire form survives keyring
-// implementations that don't preserve byte-for-byte equality.
-// keyringTokenSet is the wire shape; access_token is intentionally
-// serialised so the OS keyring (encrypted at rest) holds the full
-// TokenSet for round-tripping. The G117 lint flag is suppressed below.
+// implementations that don't preserve byte-for-byte equality. The
+// access_token is intentionally serialised so the OS keyring
+// (encrypted at rest) holds the full TokenSet for round-tripping.
 type keyringTokenSet struct {
 	AccessToken  string `json:"access_token"`
 	RefreshToken string `json:"refresh_token,omitempty"`
@@ -112,7 +111,7 @@ func encodeTokenSet(t tokens.TokenSet) (string, error) {
 func decodeTokenSet(raw string) (tokens.TokenSet, error) {
 	var wire keyringTokenSet
 	if err := json.Unmarshal([]byte(raw), &wire); err != nil {
-		return tokens.TokenSet{}, fmt.Errorf("unmarshal TokenSet: %w", err)
+		return tokens.TokenSet{}, fmt.Errorf("%w: unmarshal TokenSet: %w", ErrMalformed, err)
 	}
 
 	t := tokens.TokenSet{
@@ -124,7 +123,7 @@ func decodeTokenSet(raw string) (tokens.TokenSet, error) {
 	if wire.ExpiresAt != "" {
 		exp, err := time.Parse(time.RFC3339, wire.ExpiresAt)
 		if err != nil {
-			return tokens.TokenSet{}, fmt.Errorf("parse expires_at: %w", err)
+			return tokens.TokenSet{}, fmt.Errorf("%w: parse expires_at: %w", ErrMalformed, err)
 		}
 		t.ExpiresAt = exp.UTC()
 	}
