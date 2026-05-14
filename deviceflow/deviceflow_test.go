@@ -2,6 +2,7 @@ package deviceflow
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -42,12 +43,13 @@ func newTestClient(t *testing.T, h http.HandlerFunc) *Client {
 	t.Cleanup(srv.Close)
 
 	c := &Client{
-		HTTP:           srv.Client(),
-		BaseURL:        srv.URL,
-		ClientID:       testClientID,
-		Scope:          "cli",
-		DeviceCodePath: testDeviceCodePath,
-		TokenPath:      testTokenPath,
+		HTTP:              srv.Client(),
+		BaseURL:           srv.URL,
+		ClientID:          testClientID,
+		Scope:             "cli",
+		DeviceCodePath:    testDeviceCodePath,
+		TokenPath:         testTokenPath,
+		AllowInsecureHTTP: true, // httptest.NewServer is http://
 	}
 	return c
 }
@@ -102,7 +104,7 @@ func TestStartDeviceAuth_OmitsScopeWhenEmpty(t *testing.T) {
 			t.Errorf("scope should not be sent when Client.Scope is empty")
 		}
 		w.Header().Set("Content-Type", "application/json")
-		writeBody(t, w, `{"device_code":"d","user_code":"u","verification_uri":"x","expires_in":1,"interval":1}`)
+		writeBody(t, w, `{"device_code":"d","user_code":"u","verification_uri":"https://example.com/cli","expires_in":1,"interval":1}`)
 	})
 	c.Scope = ""
 
@@ -116,7 +118,7 @@ func TestStartDeviceAuth_RejectsUnknownFields(t *testing.T) {
 
 	c := newTestClient(t, func(w http.ResponseWriter, _ *http.Request) {
 		writeBody(t, w, `{
-			"device_code":"d","user_code":"u","verification_uri":"x","expires_in":1,"interval":1,
+			"device_code":"d","user_code":"u","verification_uri":"https://example.com/cli","expires_in":1,"interval":1,
 			"surprise":"field"
 		}`)
 	})
@@ -334,23 +336,25 @@ func TestResolveURL(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
-		name    string
-		base    string
-		path    string
-		want    string
-		wantErr bool
+		name              string
+		base              string
+		path              string
+		allowInsecureHTTP bool
+		want              string
+		wantErr           bool
 	}{
-		{"https + absolute path", "https://entire.io", "/oauth/device/code", "https://entire.io/oauth/device/code", false},
-		{"trailing slash + absolute path", "https://entire.io/", "/oauth/token", "https://entire.io/oauth/token", false},
-		{"http allowed", "http://localhost:8180", "/api/auth/token", "http://localhost:8180/api/auth/token", false},
-		{"unsupported scheme", "ftp://x", "/y", "", true},
-		{"malformed base", "://", "/y", "", true},
+		{"https + absolute path", "https://entire.io", "/oauth/device/code", false, "https://entire.io/oauth/device/code", false},
+		{"trailing slash + absolute path", "https://entire.io/", "/oauth/token", false, "https://entire.io/oauth/token", false},
+		{"http rejected by default", "http://localhost:8180", "/api/auth/token", false, "", true},
+		{"http allowed with opt-in", "http://localhost:8180", "/api/auth/token", true, "http://localhost:8180/api/auth/token", false},
+		{"unsupported scheme", "ftp://x", "/y", false, "", true},
+		{"malformed base", "://", "/y", false, "", true},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			got, err := resolveURL(tt.base, tt.path)
+			got, err := resolveURL(tt.base, tt.path, tt.allowInsecureHTTP)
 			if (err != nil) != tt.wantErr {
 				t.Fatalf("resolveURL() err = %v, wantErr %v", err, tt.wantErr)
 			}
@@ -439,4 +443,93 @@ func TestRequestTimeout_DefaultAndOverride(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestStartDeviceAuth_RejectsUnsafeVerificationURI pins the
+// anti-phishing checks on the verification_uri returned by the AS.
+// A compromised or misconfigured server must not be able to redirect
+// users to an attacker-controlled login page; the URL we'd otherwise
+// echo and open carries the user code.
+func TestStartDeviceAuth_RejectsUnsafeVerificationURI(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name string
+		uri  string
+	}{
+		{"empty", ""},
+		{"missing scheme", "example.com/cli"},
+		{"non-https scheme", "ftp://example.com/cli"},
+		{"plain http on non-loopback", "http://example.com/cli"},
+		{"embedded userinfo", "https://entire.io@evil.example.com/cli"},
+		{"newline injection", "https://example.com/cli\nGET /steal"},
+		{"control character", "https://example.com/\x07cli"},
+		{"javascript scheme", "javascript:alert(1)"},
+		{"data scheme", "data:text/html,<script>"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			c := newTestClient(t, func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				body, _ := jsonMarshal(map[string]any{ //nolint:errcheck // map literal can't fail to marshal
+					"device_code":      "d",
+					"user_code":        "u",
+					"verification_uri": tc.uri,
+					"expires_in":       60,
+					"interval":         5,
+				})
+				_, _ = w.Write(body) //nolint:errcheck // test handler
+			})
+
+			_, err := c.StartDeviceAuth(context.Background())
+			if !errors.Is(err, ErrUnsafeVerificationURI) {
+				t.Fatalf("StartDeviceAuth(verification_uri=%q) error = %v, want ErrUnsafeVerificationURI", tc.uri, err)
+			}
+		})
+	}
+}
+
+// TestStartDeviceAuth_AcceptsSafeVerificationURI sanity check: the
+// safe-shape cases must continue to pass. Pins the contract that the
+// rejection logic is narrowly scoped.
+func TestStartDeviceAuth_AcceptsSafeVerificationURI(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name string
+		uri  string
+	}{
+		{"https with path", "https://entire.io/cli/auth"},
+		{"https with query", "https://entire.io/cli/auth?ref=device"},
+		{"https with port", "https://auth.example.com:8443/cli"},
+		{"loopback http", "http://localhost:8787/cli"},
+		{"loopback ip http", "http://127.0.0.1:8787/cli"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			c := newTestClient(t, func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				body, _ := jsonMarshal(map[string]any{ //nolint:errcheck // map literal can't fail to marshal
+					"device_code":      "d",
+					"user_code":        "u",
+					"verification_uri": tc.uri,
+					"expires_in":       60,
+					"interval":         5,
+				})
+				_, _ = w.Write(body) //nolint:errcheck // test handler
+			})
+
+			if _, err := c.StartDeviceAuth(context.Background()); err != nil {
+				t.Fatalf("StartDeviceAuth(verification_uri=%q) error = %v, want nil", tc.uri, err)
+			}
+		})
+	}
+}
+
+// jsonMarshal is a tiny helper that lets us produce the wire payload
+// inline without sprintf-fighting with embedded quotes.
+func jsonMarshal(v any) ([]byte, error) {
+	return json.Marshal(v)
 }

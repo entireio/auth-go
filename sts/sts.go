@@ -91,6 +91,13 @@ type Client struct {
 	// back to DefaultRequestTimeout. Negative disables the cap (useful
 	// for tests that want to drive timing via the caller's ctx alone).
 	RequestTimeout time.Duration
+
+	// AllowInsecureHTTP permits http:// BaseURLs. Default (false) is
+	// reject — token exchanges carry the subject token (a bearer) on
+	// the wire and must be TLS-protected end to end. Production callers
+	// MUST leave this false; only tests and local development that pin
+	// the issuer to loopback should flip it.
+	AllowInsecureHTTP bool
 }
 
 // Exchange performs one RFC 8693 token exchange.
@@ -106,7 +113,7 @@ func (c *Client) Exchange(ctx context.Context, req ExchangeRequest) (*tokens.Tok
 
 	form := buildForm(req)
 
-	endpoint, err := resolveURL(c.BaseURL, c.Path)
+	endpoint, err := resolveURL(c.BaseURL, c.Path, c.AllowInsecureHTTP)
 	if err != nil {
 		return nil, fmt.Errorf("token exchange: resolve URL: %w", err)
 	}
@@ -209,12 +216,25 @@ func (c *Client) requestTimeout() time.Duration {
 	}
 }
 
-func resolveURL(baseURL, path string) (string, error) {
+// ErrInsecureBaseURL is returned when Exchange is called against an
+// http:// BaseURL without AllowInsecureHTTP set. Token exchange ships
+// a subject_token (typically the user's core bearer) in the request
+// body — over plain HTTP that's a credential in the clear.
+var ErrInsecureBaseURL = errors.New("refusing to perform token exchange over plain HTTP (set Client.AllowInsecureHTTP only for local dev / test)")
+
+func resolveURL(baseURL, path string, allowInsecureHTTP bool) (string, error) {
 	base, err := url.Parse(baseURL)
 	if err != nil {
 		return "", fmt.Errorf("parse base URL: %w", err)
 	}
-	if base.Scheme != "http" && base.Scheme != "https" {
+	switch base.Scheme {
+	case "https":
+		// fine
+	case "http":
+		if !allowInsecureHTTP {
+			return "", ErrInsecureBaseURL
+		}
+	default:
 		return "", fmt.Errorf("unsupported base URL scheme %q (must be http or https)", base.Scheme)
 	}
 	rel, err := url.Parse(path)

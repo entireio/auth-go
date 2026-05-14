@@ -36,9 +36,10 @@ func newTestClient(t *testing.T, h http.HandlerFunc) *Client {
 	t.Cleanup(srv.Close)
 
 	return &Client{
-		HTTP:    srv.Client(),
-		BaseURL: srv.URL,
-		Path:    testTokenPath,
+		HTTP:              srv.Client(),
+		BaseURL:           srv.URL,
+		Path:              testTokenPath,
+		AllowInsecureHTTP: true, // httptest.NewServer is http://
 	}
 }
 

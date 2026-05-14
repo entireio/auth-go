@@ -70,13 +70,43 @@ type Claims struct {
 // well-formed JWT (three base64url-encoded segments separated by dots).
 var ErrMalformedJWT = errors.New("malformed JWT")
 
+// ErrUnsignedJWT is returned by ParseClaims when the JWT header
+// declares `alg: none`. The unsigned-JWT shape was deprecated by
+// RFC 7518 §3.6 and is a known attack vector (an attacker can craft
+// arbitrary claims that pass shape checks). Defense in depth: even
+// though this package never trusts claims for authorization
+// decisions, we refuse to parse them so a future caller can't be
+// tricked into routing on attacker-controlled values.
+var ErrUnsignedJWT = errors.New("refusing to parse unsigned JWT (alg:none)")
+
 // ParseClaims decodes the payload segment of jwt without verifying the
 // signature. Audience is normalised to a slice even when the wire form
 // is a single string.
+//
+// Rejects JWTs whose header declares `alg: none` — see ErrUnsignedJWT
+// for the rationale. The signature payload itself is still not
+// verified; that remains the issuing server's responsibility.
 func ParseClaims(jwt string) (*Claims, error) {
 	parts := strings.Split(jwt, ".")
 	if len(parts) != 3 {
 		return nil, fmt.Errorf("%w: expected 3 segments, got %d", ErrMalformedJWT, len(parts))
+	}
+
+	header, err := base64.RawURLEncoding.DecodeString(parts[0])
+	if err != nil {
+		return nil, fmt.Errorf("decode JWT header: %w", err)
+	}
+	var hdr struct {
+		Alg string `json:"alg"`
+	}
+	if err := json.Unmarshal(header, &hdr); err != nil {
+		return nil, fmt.Errorf("decode JWT header: %w", err)
+	}
+	// Case-insensitive because RFC 7515 §4.1.1 doesn't strictly
+	// canonicalise case, and "None" / "NONE" have been observed in the
+	// wild.
+	if strings.EqualFold(strings.TrimSpace(hdr.Alg), "none") {
+		return nil, ErrUnsignedJWT
 	}
 
 	payload, err := base64.RawURLEncoding.DecodeString(parts[1])

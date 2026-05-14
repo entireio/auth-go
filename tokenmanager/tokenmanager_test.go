@@ -50,7 +50,7 @@ const (
 
 func makeJWTWithAudience(t *testing.T, aud []string) string {
 	t.Helper()
-	header := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"none","typ":"JWT"}`))
+	header := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"EdDSA","typ":"JWT"}`))
 	payload, err := json.Marshal(map[string]any{"aud": aud, "sub": "test"})
 	if err != nil {
 		t.Fatalf("marshal payload: %v", err)
@@ -65,7 +65,7 @@ func makeJWTWithAudience(t *testing.T, aud []string) string {
 // it, ParseClaims is documented as unverified.
 func makeJWTWithExp(t *testing.T, exp time.Time, aud []string) string {
 	t.Helper()
-	header := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"none","typ":"JWT"}`))
+	header := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"EdDSA","typ":"JWT"}`))
 	claims := map[string]any{"sub": "test", "exp": exp.Unix()}
 	if len(aud) > 0 {
 		claims["aud"] = aud

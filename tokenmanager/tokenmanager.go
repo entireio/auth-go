@@ -84,6 +84,12 @@ type Config struct {
 	// UserAgent for HTTP requests. Empty → none.
 	UserAgent string
 
+	// AllowInsecureHTTP permits exchanges against http:// issuers. Off
+	// by default — STS calls ship the user's core token in the request
+	// body and must be TLS-protected. Only flip this for local/dev
+	// deployments pinned to loopback.
+	AllowInsecureHTTP bool
+
 	// HTTPClient overrides the http.Client used for exchange calls.
 	// Useful for installing a debug transport. nil → http.DefaultClient.
 	HTTPClient *http.Client
@@ -439,10 +445,11 @@ func (m *Manager) runExchange(ctx context.Context, coreToken string, req TokenRe
 	}
 
 	stsClient := &sts.Client{
-		HTTP:      m.cfg.HTTPClient,
-		BaseURL:   m.cfg.Issuer,
-		Path:      m.cfg.STSPath,
-		UserAgent: m.cfg.UserAgent,
+		HTTP:              m.cfg.HTTPClient,
+		BaseURL:           m.cfg.Issuer,
+		Path:              m.cfg.STSPath,
+		UserAgent:         m.cfg.UserAgent,
+		AllowInsecureHTTP: m.cfg.AllowInsecureHTTP,
 	}
 	return stsClient.Exchange(ctx, stsReq) //nolint:wrapcheck // sts.Exchange already prefixes "token exchange:"
 }

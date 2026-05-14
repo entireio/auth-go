@@ -75,6 +75,14 @@ type Client struct {
 	// back to DefaultRequestTimeout. Negative disables the cap (useful
 	// for tests that want to drive timing via the caller's ctx alone).
 	RequestTimeout time.Duration
+
+	// AllowInsecureHTTP permits http:// BaseURLs. Default (false) is
+	// reject — the device-flow token endpoint returns the user's
+	// freshly-minted access token in the response body and must be
+	// TLS-protected end to end. Production callers MUST leave this
+	// false; only tests and local development pinned to loopback
+	// should flip it.
+	AllowInsecureHTTP bool
 }
 
 // requestTimeout resolves the effective per-request timeout: the
@@ -165,7 +173,72 @@ func (c *Client) StartDeviceAuth(ctx context.Context) (*DeviceCode, error) {
 	if err := oauthhttp.ReadAndDecodeJSON(resp.Body, &result, true); err != nil {
 		return nil, fmt.Errorf("start device auth: %w", err)
 	}
+	if err := validateVerificationURI(result.VerificationURI, c.AllowInsecureHTTP); err != nil {
+		return nil, fmt.Errorf("start device auth: verification_uri: %w", err)
+	}
+	if result.VerificationURIComplete != "" {
+		if err := validateVerificationURI(result.VerificationURIComplete, c.AllowInsecureHTTP); err != nil {
+			return nil, fmt.Errorf("start device auth: verification_uri_complete: %w", err)
+		}
+	}
 	return &result, nil
+}
+
+// ErrUnsafeVerificationURI is returned when the authorization server
+// returns a verification_uri that fails minimum-trust checks. Defense
+// against a compromised or misconfigured AS pointing users at a
+// phishing page: the URL we'd otherwise echo to the user and open in
+// their browser carries the user code, so a wrong destination is a
+// direct credential-harvesting vector.
+var ErrUnsafeVerificationURI = errors.New("unsafe verification_uri")
+
+// validateVerificationURI rejects URIs that obviously look like
+// phishing or shell-injection attempts:
+//
+//   - Must parse as an absolute URL.
+//   - Scheme must be https (or http only when allowInsecureHTTP is
+//     set AND the host is loopback — production never qualifies).
+//   - Must not embed userinfo (user:password@host tricks the eye).
+//   - Must not contain control characters (CR/LF/etc.) that could
+//     break terminal output or sneak past glance-checks.
+//
+// This is the bottom-floor check; the embedding CLI is still expected
+// to show the URL to the user for visual inspection, and the user is
+// expected to read it before opening.
+func validateVerificationURI(raw string, allowInsecureHTTP bool) error {
+	if raw == "" {
+		return fmt.Errorf("%w: missing", ErrUnsafeVerificationURI)
+	}
+	for _, r := range raw {
+		if r < 0x20 || r == 0x7f {
+			return fmt.Errorf("%w: contains control character", ErrUnsafeVerificationURI)
+		}
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		return fmt.Errorf("%w: parse: %w", ErrUnsafeVerificationURI, err)
+	}
+	if u.Host == "" {
+		return fmt.Errorf("%w: missing host", ErrUnsafeVerificationURI)
+	}
+	if u.User != nil {
+		return fmt.Errorf("%w: embedded userinfo not permitted", ErrUnsafeVerificationURI)
+	}
+	switch u.Scheme {
+	case "https":
+		// fine
+	case "http":
+		if !allowInsecureHTTP {
+			return fmt.Errorf("%w: scheme must be https", ErrUnsafeVerificationURI)
+		}
+		host := u.Hostname()
+		if host != "localhost" && host != "127.0.0.1" && host != "::1" {
+			return fmt.Errorf("%w: http only permitted on loopback hosts", ErrUnsafeVerificationURI)
+		}
+	default:
+		return fmt.Errorf("%w: scheme %q (must be https)", ErrUnsafeVerificationURI, u.Scheme)
+	}
+	return nil
 }
 
 // PollDeviceAuth exchanges deviceCode for a TokenSet at the token
@@ -241,7 +314,7 @@ func (c *Client) PollDeviceAuth(ctx context.Context, deviceCode string) (*tokens
 // timeout must cover the body-read that happens after postForm
 // returns, so cancel-on-return here would interrupt that read.
 func (c *Client) postForm(ctx context.Context, path string, body url.Values) (*http.Response, error) {
-	endpoint, err := resolveURL(c.BaseURL, path)
+	endpoint, err := resolveURL(c.BaseURL, path, c.AllowInsecureHTTP)
 	if err != nil {
 		return nil, fmt.Errorf("resolve URL %s: %w", path, err)
 	}
@@ -269,12 +342,25 @@ func (c *Client) postForm(ctx context.Context, path string, body url.Values) (*h
 	return resp, nil
 }
 
-func resolveURL(baseURL, path string) (string, error) {
+// ErrInsecureBaseURL is returned when device-flow requests are made
+// against an http:// BaseURL without AllowInsecureHTTP set. The token
+// endpoint returns the user's access token in the response body — over
+// plain HTTP that's a credential in the clear.
+var ErrInsecureBaseURL = errors.New("refusing to run device-flow over plain HTTP (set Client.AllowInsecureHTTP only for local dev / test)")
+
+func resolveURL(baseURL, path string, allowInsecureHTTP bool) (string, error) {
 	base, err := url.Parse(baseURL)
 	if err != nil {
 		return "", fmt.Errorf("parse base URL: %w", err)
 	}
-	if base.Scheme != "http" && base.Scheme != "https" {
+	switch base.Scheme {
+	case "https":
+		// fine
+	case "http":
+		if !allowInsecureHTTP {
+			return "", ErrInsecureBaseURL
+		}
+	default:
 		return "", fmt.Errorf("unsupported base URL scheme %q (must be http or https)", base.Scheme)
 	}
 	rel, err := url.Parse(path)
