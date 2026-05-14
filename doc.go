@@ -1,4 +1,5 @@
-// Package auth is the umbrella for the Entire CLI auth library.
+// Package auth is the umbrella for github.com/entireio/auth-go, a
+// shareable OAuth 2.0 client library for CLIs.
 //
 // All real code lives in the subpackages:
 //

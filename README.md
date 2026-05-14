@@ -1,8 +1,16 @@
-# auth — shareable OAuth 2.0 client library for internal CLIs
+# auth-go — shareable OAuth 2.0 client library for CLIs
+
+[![Tests](https://github.com/entireio/auth-go/actions/workflows/test.yml/badge.svg)](https://github.com/entireio/auth-go/actions/workflows/test.yml)
+[![Lint](https://github.com/entireio/auth-go/actions/workflows/lint.yml/badge.svg)](https://github.com/entireio/auth-go/actions/workflows/lint.yml)
+[![Go Reference](https://pkg.go.dev/badge/github.com/entireio/auth-go.svg)](https://pkg.go.dev/github.com/entireio/auth-go)
 
 Provider-agnostic Go library for CLIs that authenticate end-users via OAuth 2.0 device flow (RFC 8628), present resource-scoped bearer tokens to data APIs, and (when the auth host and data API live on different origins) exchange tokens via RFC 8693 STS.
 
-The library has no global state, no env-var reads, and no implicit URLs. Every endpoint, identifier, and default value is supplied by the embedding CLI through a `Config` struct. That keeps it usable by any CLI in the org without forking.
+No global state, no env-var reads, no implicit URLs. Every endpoint, identifier, and default value is supplied by the embedding CLI through a `Config` struct.
+
+```
+go get github.com/entireio/auth-go@latest
+```
 
 ## Subpackages
 
@@ -10,25 +18,27 @@ The library has no global state, no env-var reads, and no implicit URLs. Every e
 |---|---|
 | [`deviceflow`](./deviceflow/) | RFC 8628 OAuth 2.0 Device Authorization Grant client. Polls the token endpoint, surfaces RFC 8628 §3.5 error codes (`authorization_pending`, `slow_down`, `access_denied`, `expired_token`, `invalid_grant`) as Go sentinels with optional `error_description`. |
 | [`sts`](./sts/) | RFC 8693 OAuth 2.0 Token Exchange client. Provider-agnostic — caller supplies endpoint path, `subject_token_type`, `requested_token_type`, optional `audience` / `resource` / `scope`, and any provider-specific `Extra` form fields (e.g. `client_id`). |
-| [`tokens`](./tokens/) | `TokenSet` value type plus unverified JWT claim parsing. The package never validates signatures — that's the issuing server's responsibility. CLIs use `Claims` for routing decisions (which issuer, which audience) and UX (display the principal handle), not as a security boundary. |
+| [`tokens`](./tokens/) | `TokenSet` value type plus unverified JWT claim parsing. Rejects `alg:none` (RFC 7515 / RFC 7518 §3.6 known attack vector). The package never validates signatures — that's the issuing server's responsibility. Callers use `Claims` for routing decisions (which issuer, which audience) and UX (display the principal handle), not as a security boundary. |
 | [`tokenstore`](./tokenstore/) | `Store` interface for token persistence + `Keyring` reference impl backed by `github.com/zalando/go-keyring`. Each CLI passes its own service name so credentials are isolated across CLIs sharing this library. Returns `ErrNotFound` for unknown profiles and `ErrMalformed` (wrapped) when a stored entry exists but can't be decoded — used by upgrade fallbacks. |
 | [`tokenmanager`](./tokenmanager/) | Orchestration: stores the device-flow core token, runs RFC 8693 exchanges when needed to obtain resource-scoped bearers, caches the results until expiry, and short-circuits when no exchange is needed (same-host or core-token's `aud` already covers the resource). Most CLIs only need to interact with this package directly. |
 
-Internal helper:
+The `internal/oauthhttp` package holds shared HTTP body-reading + JSON-decoding helpers (detects HTML responses from captive portals / proxy intercepts and surfaces them as actionable errors instead of unmarshal failures). It is unexported in the Go sense — not importable by other modules — and not part of the public API surface.
 
-| Package | What it does |
-|---|---|
-| [`internal/oauthhttp`](./internal/oauthhttp/) | Shared HTTP body-reading + JSON-decoding helpers. Detects HTML responses (captive portal / proxy intercept) and surfaces them as actionable errors instead of unmarshal failures. Not exported. |
+## Security
+
+Defense-in-depth checks layered on top of server-side validation:
+
+- **HTTPS required.** Both `sts.Client` and `deviceflow.Client` reject `http://` BaseURLs unless `AllowInsecureHTTP` is set. Callers typically opt that in only for loopback (`localhost` / `127.0.0.1` / `::1`) so production misconfigurations fail loudly.
+- **`alg:none` JWTs rejected.** `tokens.ParseClaims` decodes the JWT header and refuses the unsigned shape (any case variant of `none`). Even though claim use is routing-only, this keeps an obvious attack surface closed.
+- **`verification_uri` validated.** The device-code response field is what your CLI echoes and opens in the user's browser — a malicious AS pointing it at a phishing page would be a credential-harvesting vector. The library rejects non-https (loopback http excepted), embedded `user:pass@host` userinfo, and control characters in the URI.
 
 ## Quick start
 
-The typical embedding CLI does roughly this at startup:
-
 ```go
 import (
-    "github.com/entireio/cli/auth/deviceflow"
-    "github.com/entireio/cli/auth/tokenmanager"
-    "github.com/entireio/cli/auth/tokenstore"
+    "github.com/entireio/auth-go/deviceflow"
+    "github.com/entireio/auth-go/tokenmanager"
+    "github.com/entireio/auth-go/tokenstore"
 )
 
 const (
@@ -98,10 +108,10 @@ Deletes the keyring entry first; only clears the in-memory exchange cache on suc
 - **No globals, no env-var reads, no implicit URLs.** Everything ships through `Config`. The library should compile and run identically inside any CLI.
 - **Provider-agnostic.** `deviceflow.Client` and `sts.Client` are field-bag structs; neither knows about your provider's endpoint paths or token-type URIs. Pass them in.
 - **Bearer-presenter, not bearer-validator.** This library is for CLIs that *receive* tokens from an auth server and *present* them to a resource server. JWT signature verification is intentionally not done — the resource server validates. `tokens.ParseClaims` is documented as unverified and used only for routing decisions.
-- **Per-CLI keyring isolation.** Each CLI passes a unique service name to `tokenstore.NewKeyring`. OS keyrings key by `(service, account)`, so different CLIs naturally get separate credential stores.
+- **Per-CLI keyring isolation.** Each CLI passes a unique service name to `tokenstore.NewKeyring`. OS keyrings key by `(service, account)`, so consumers naturally get separate credential stores.
 - **Caller controls the wire shape.** Default values (RFC 8693 `requested_token_type`, `scope`, audience-empty) live in the embedding CLI's wiring, not in this library.
 
-## Embedding checklist for a new CLI
+## Embedding checklist
 
 1. Pick a stable service name for `tokenstore.NewKeyring(...)`. **Don't change it later** — renaming orphans every existing user's stored credentials.
 2. Pick a `client_id` that the auth server recognises.
@@ -117,4 +127,8 @@ Deletes the keyring entry first; only clears the in-memory exchange cache on suc
 
 ## Status
 
-Used in production by [`entireio/cli`](https://github.com/entireio/cli). Open to additional internal CLI consumers — file an issue if you hit a gap.
+Used in production by [`entireio/cli`](https://github.com/entireio/cli). Issues and PRs welcome.
+
+## License
+
+MIT — see [LICENSE](./LICENSE).
