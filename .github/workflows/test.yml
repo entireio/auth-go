@@ -9,6 +9,13 @@ on:
 permissions:
   contents: read
 
+defaults:
+  run:
+    # Git Bash is available on Windows runners; using bash everywhere
+    # avoids PowerShell-specific quoting quirks (e.g. `./...` getting
+    # split into `.out`).
+    shell: bash
+
 jobs:
   test:
     name: test (${{ matrix.os }})
