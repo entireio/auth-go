@@ -23,8 +23,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/entireio/cli/auth/internal/oauthhttp"
-	"github.com/entireio/cli/auth/tokens"
+	"github.com/entireio/auth-go/internal/oauthhttp"
+	"github.com/entireio/auth-go/tokens"
 )
 
 // nowFunc is the package's clock. Tests override it; production uses

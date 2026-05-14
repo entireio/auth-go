@@ -8,7 +8,7 @@ package tokenstore
 import (
 	"errors"
 
-	"github.com/entireio/cli/auth/tokens"
+	"github.com/entireio/auth-go/tokens"
 )
 
 // ErrNotFound is returned when a profile has no stored tokens. Callers

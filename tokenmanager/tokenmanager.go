@@ -22,9 +22,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/entireio/cli/auth/sts"
-	"github.com/entireio/cli/auth/tokens"
-	"github.com/entireio/cli/auth/tokenstore"
+	"github.com/entireio/auth-go/sts"
+	"github.com/entireio/auth-go/tokens"
+	"github.com/entireio/auth-go/tokenstore"
 )
 
 // DefaultRequestedTokenType is the RFC 8693 §3 URI used when neither

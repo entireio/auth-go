@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/entireio/cli/auth/tokens"
+	"github.com/entireio/auth-go/tokens"
 	"github.com/zalando/go-keyring"
 )
 

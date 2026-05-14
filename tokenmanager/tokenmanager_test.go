@@ -9,9 +9,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/entireio/cli/auth/sts"
-	"github.com/entireio/cli/auth/tokens"
-	"github.com/entireio/cli/auth/tokenstore"
+	"github.com/entireio/auth-go/sts"
+	"github.com/entireio/auth-go/tokens"
+	"github.com/entireio/auth-go/tokenstore"
 )
 
 // memStore is an in-memory tokenstore.Store for tests. Avoids pulling
