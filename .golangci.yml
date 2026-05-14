@@ -1,0 +1,16 @@
+version: "2"
+
+run:
+  timeout: 5m
+
+linters:
+  default: standard
+  exclusions:
+    rules:
+      # Idiomatic Go for HTTP clients: errors from resp.Body.Close()
+      # are not actionable at the caller — the request already
+      # succeeded by the time defer fires. Suppress at the lint
+      # level rather than scattering //nolint:errcheck comments.
+      - linters:
+          - errcheck
+        source: 'resp\.Body\.Close\(\)'

@@ -21,7 +21,9 @@ jobs:
           check-latest: true
       - uses: golangci/golangci-lint-action@1e7e51e771db61008b38414a730f564565cf7c20 # v9
         with:
-          version: latest
+          # Pin so CI results stay stable; bump deliberately when
+          # adopting new linter rules.
+          version: v2.12.2
           args: --timeout=5m
 
   gofmt:
