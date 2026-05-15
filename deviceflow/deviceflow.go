@@ -95,17 +95,11 @@ type Client struct {
 	AllowInsecureHTTP bool
 }
 
-// httpClient builds the *http.Client used for one request. The
-// transport is c.Transport when non-nil; otherwise http.DefaultTransport.
-// We always construct a fresh *http.Client (rather than caching one)
-// because the per-request timeout is driven by ctx.WithTimeout in the
-// caller, not by *http.Client.Timeout — keeping construction local
-// avoids accidentally sharing state across Clients.
+// httpClient builds the *http.Client used for one request. See
+// oauthhttp.HTTPClient for the construction policy (fresh per call,
+// shared underlying Transport, no Client.Timeout).
 func (c *Client) httpClient() *http.Client {
-	if c.Transport == nil {
-		return http.DefaultClient
-	}
-	return &http.Client{Transport: c.Transport}
+	return oauthhttp.HTTPClient(c.Transport)
 }
 
 // requestTimeout resolves the effective per-request timeout: the
@@ -358,43 +352,23 @@ func (c *Client) postForm(ctx context.Context, path string, body url.Values) (*h
 // ErrInsecureBaseURL is returned when device-flow requests are made
 // against an http:// BaseURL without AllowInsecureHTTP set. The token
 // endpoint returns the user's access token in the response body — over
-// plain HTTP that's a credential in the clear.
-var ErrInsecureBaseURL = errors.New("refusing to run device-flow over plain HTTP (set Client.AllowInsecureHTTP only for local dev / test)")
+// plain HTTP that's a credential in the clear. Re-exported from
+// internal/oauthhttp so callers can errors.Is(err, deviceflow.ErrInsecureBaseURL)
+// regardless of which package raised it.
+var ErrInsecureBaseURL = oauthhttp.ErrInsecureBaseURL
 
 // ErrAbsolutePath is returned when DeviceCodePath or TokenPath is an
-// absolute URL rather than a path relative to BaseURL. Go's
-// url.ResolveReference *replaces* the base when handed an absolute
-// reference, so accepting an absolute path would let any caller who can
-// influence the configuration (env var, config file, server-discovery
-// doc) redirect the device-code or token request to an attacker — and
-// in the token-endpoint case, capture the user's access token.
-var ErrAbsolutePath = errors.New("path must be a relative URL, not absolute")
+// absolute or scheme-relative URL rather than a path relative to
+// BaseURL. Go's url.ResolveReference *replaces* the base when handed
+// an absolute reference, so accepting an absolute path would let any
+// caller who can influence the configuration (env var, config file,
+// server-discovery doc) redirect the device-code or token request to
+// an attacker — and in the token-endpoint case, capture the user's
+// access token. Re-exported from internal/oauthhttp.
+var ErrAbsolutePath = oauthhttp.ErrAbsolutePath
 
 func resolveURL(baseURL, path string, allowInsecureHTTP bool) (string, error) {
-	base, err := url.Parse(baseURL)
-	if err != nil {
-		return "", fmt.Errorf("parse base URL: %w", err)
-	}
-	switch base.Scheme {
-	case "https":
-		// fine
-	case "http":
-		if !allowInsecureHTTP {
-			return "", ErrInsecureBaseURL
-		}
-	default:
-		return "", fmt.Errorf("unsupported base URL scheme %q (must be http or https)", base.Scheme)
-	}
-	rel, err := url.Parse(path)
-	if err != nil {
-		return "", fmt.Errorf("parse path: %w", err)
-	}
-	// Reject both scheme-relative (e.g. "//host/path") and absolute
-	// references — both override BaseURL's host via url.ResolveReference.
-	if rel.IsAbs() || rel.Host != "" {
-		return "", fmt.Errorf("%w: got %q", ErrAbsolutePath, path)
-	}
-	return base.ResolveReference(rel).String(), nil
+	return oauthhttp.ResolveURL(baseURL, path, allowInsecureHTTP) //nolint:wrapcheck // pass through with sentinel-preserving semantics
 }
 
 type errorResponse struct {
@@ -438,50 +412,9 @@ func readAPIError(resp *http.Response, action string) error {
 	return fmt.Errorf("%s: %w", action, err)
 }
 
-// maxErrorDescriptionRunes caps the sanitised error_description by
-// rune count. Real values are short ("user denied", "code expired");
-// past this the truncated form points at server misbehaviour rather
-// than user-facing guidance, and unbounded length is a UX-DoS vector.
-// Counted in runes rather than bytes so truncation lands on a valid
-// UTF-8 boundary (preserving the comment's "preserves printable
-// Unicode" invariant).
-const maxErrorDescriptionRunes = 512
-
-// sanitizeDescription strips control characters (incl. ANSI escapes'
-// ESC byte 0x1b, CR, LF, NUL, DEL, BEL) and caps length so a hostile
-// or buggy AS can't write into the user's terminal or balloon CLI
-// logs. Preserves printable Unicode, including non-ASCII; truncates
-// on rune boundaries rather than byte offsets so a CJK / emoji /
-// combining-character payload can't be cut mid-rune into invalid
-// UTF-8.
-func sanitizeDescription(s string) string {
-	if s == "" {
-		return ""
-	}
-	var b strings.Builder
-	b.Grow(len(s))
-	runes := 0
-	truncated := false
-	for _, r := range s {
-		switch {
-		case r < 0x20: // C0 controls, including ESC (0x1b), CR/LF/TAB/NUL/BEL
-			continue
-		case r == 0x7f: // DEL
-			continue
-		}
-		if runes >= maxErrorDescriptionRunes {
-			truncated = true
-			break
-		}
-		b.WriteRune(r)
-		runes++
-	}
-	out := strings.TrimSpace(b.String())
-	if truncated {
-		out += "…"
-	}
-	return out
-}
+// sanitizeDescription is a thin alias kept for in-package readability.
+// The implementation lives in internal/oauthhttp.
+func sanitizeDescription(s string) string { return oauthhttp.SanitizeDescription(s) }
 
 // slowDownBump is the per-RFC 8628 §3.5 mandated interval increase
 // applied each time the AS responds with `slow_down`. RFC says "at

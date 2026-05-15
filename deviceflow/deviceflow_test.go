@@ -11,7 +11,6 @@ import (
 	"strings"
 	"testing"
 	"time"
-	"unicode/utf8"
 )
 
 // writeBody writes body to w from a test handler. Wraps io.WriteString
@@ -712,72 +711,6 @@ func TestStartDeviceAuth_RoutesSentinel(t *testing.T) {
 				t.Errorf("StartDeviceAuth err = %v, expected sanitised description surfaced", err)
 			}
 		})
-	}
-}
-
-// TestSanitizeDescription pins the control-char + length defenses
-// against a hostile or buggy AS smuggling ANSI escapes or megabyte
-// payloads into the user's terminal via error_description.
-func TestSanitizeDescription(t *testing.T) {
-	t.Parallel()
-	cases := []struct {
-		name string
-		in   string
-		want string
-	}{
-		{"plain", "user denied", "user denied"},
-		{"strips CR LF", "hello\r\nworld", "helloworld"},
-		{"strips ESC", "\x1b[31mred", "[31mred"},
-		{"strips BEL", "boom\x07", "boom"},
-		{"strips NUL", "a\x00b", "ab"},
-		{"strips DEL", "a\x7fb", "ab"},
-		{"keeps unicode", "ご利用ありがとう", "ご利用ありがとう"},
-		{"trims whitespace after stripping", "\t hi \t", "hi"},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			t.Parallel()
-			if got := sanitizeDescription(tc.in); got != tc.want {
-				t.Fatalf("sanitizeDescription(%q) = %q, want %q", tc.in, got, tc.want)
-			}
-		})
-	}
-
-	long := strings.Repeat("A", 1000)
-	got := sanitizeDescription(long)
-	wantRunes := maxErrorDescriptionRunes + 1 // +1 for the appended ellipsis
-	if r := utf8.RuneCountInString(got); r != wantRunes {
-		t.Fatalf("sanitizeDescription(<1000 A's>) rune count = %d, want %d", r, wantRunes)
-	}
-	if !utf8.ValidString(got) {
-		t.Fatalf("sanitizeDescription(<1000 A's>) produced invalid UTF-8: %q", got)
-	}
-}
-
-// TestSanitizeDescription_TruncatesOnRuneBoundary pins the
-// truncation-mid-rune defence (Cursor Bugbot finding on the v0.2.0
-// PR). A payload of multi-byte runes that would straddle the byte
-// cap must not be cut into invalid UTF-8 — truncation has to land on
-// a rune boundary.
-func TestSanitizeDescription_TruncatesOnRuneBoundary(t *testing.T) {
-	t.Parallel()
-	// Each "あ" is 3 bytes in UTF-8. 600 of them exceeds the rune cap
-	// (and would have been chopped mid-rune by the previous byte-offset
-	// slice once the rune cap moved past a multi-byte boundary).
-	in := strings.Repeat("あ", 600)
-	got := sanitizeDescription(in)
-	if !utf8.ValidString(got) {
-		t.Fatalf("sanitizeDescription produced invalid UTF-8 from %d-rune input", 600)
-	}
-	// Sanity: the runes that survive are all the original CJK char,
-	// terminated by the truncation ellipsis.
-	for _, r := range got {
-		if r != 'あ' && r != '…' {
-			t.Fatalf("unexpected rune %U in output", r)
-		}
-	}
-	if r := utf8.RuneCountInString(got); r != maxErrorDescriptionRunes+1 {
-		t.Fatalf("rune count = %d, want %d (cap + ellipsis)", r, maxErrorDescriptionRunes+1)
 	}
 }
 

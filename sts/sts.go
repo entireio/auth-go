@@ -209,15 +209,10 @@ func buildForm(req ExchangeRequest) url.Values {
 	return form
 }
 
-// httpClient builds the *http.Client used for one Exchange call. The
-// transport is c.Transport when non-nil; otherwise http.DefaultTransport.
-// We always construct a fresh *http.Client because the per-request
-// timeout is driven by ctx.WithTimeout, not by *http.Client.Timeout.
+// httpClient builds the *http.Client used for one Exchange call. See
+// oauthhttp.HTTPClient for the construction policy.
 func (c *Client) httpClient() *http.Client {
-	if c.Transport == nil {
-		return http.DefaultClient
-	}
-	return &http.Client{Transport: c.Transport}
+	return oauthhttp.HTTPClient(c.Transport)
 }
 
 // requestTimeout resolves the effective per-request timeout: the
@@ -237,41 +232,19 @@ func (c *Client) requestTimeout() time.Duration {
 // ErrInsecureBaseURL is returned when Exchange is called against an
 // http:// BaseURL without AllowInsecureHTTP set. Token exchange ships
 // a subject_token (typically the user's core bearer) in the request
-// body — over plain HTTP that's a credential in the clear.
-var ErrInsecureBaseURL = errors.New("refusing to perform token exchange over plain HTTP (set Client.AllowInsecureHTTP only for local dev / test)")
+// body — over plain HTTP that's a credential in the clear. Re-exported
+// from internal/oauthhttp so callers can errors.Is uniformly across
+// deviceflow and sts.
+var ErrInsecureBaseURL = oauthhttp.ErrInsecureBaseURL
 
-// ErrAbsolutePath is returned when Path is an absolute URL rather
-// than a path relative to BaseURL. Go's url.ResolveReference *replaces*
-// the base when handed an absolute reference, so accepting an absolute
-// Path would let any caller who can influence Path (env var, config,
-// server-discovery doc) redirect the subject token to an attacker.
-var ErrAbsolutePath = errors.New("path must be a relative URL, not absolute")
+// ErrAbsolutePath is returned when Path is an absolute or
+// scheme-relative URL rather than a path relative to BaseURL. See
+// oauthhttp.ErrAbsolutePath for the rationale; re-exported here so
+// callers can errors.Is on either package's sentinel.
+var ErrAbsolutePath = oauthhttp.ErrAbsolutePath
 
 func resolveURL(baseURL, path string, allowInsecureHTTP bool) (string, error) {
-	base, err := url.Parse(baseURL)
-	if err != nil {
-		return "", fmt.Errorf("parse base URL: %w", err)
-	}
-	switch base.Scheme {
-	case "https":
-		// fine
-	case "http":
-		if !allowInsecureHTTP {
-			return "", ErrInsecureBaseURL
-		}
-	default:
-		return "", fmt.Errorf("unsupported base URL scheme %q (must be http or https)", base.Scheme)
-	}
-	rel, err := url.Parse(path)
-	if err != nil {
-		return "", fmt.Errorf("parse path: %w", err)
-	}
-	// Reject both scheme-relative (e.g. "//host/path") and absolute
-	// references — both override BaseURL's host via url.ResolveReference.
-	if rel.IsAbs() || rel.Host != "" {
-		return "", fmt.Errorf("%w: got %q", ErrAbsolutePath, path)
-	}
-	return base.ResolveReference(rel).String(), nil
+	return oauthhttp.ResolveURL(baseURL, path, allowInsecureHTTP) //nolint:wrapcheck // pass through with sentinel-preserving semantics
 }
 
 type errorResponse struct {
@@ -279,49 +252,9 @@ type errorResponse struct {
 	ErrorDescription string `json:"error_description"`
 }
 
-// maxErrorDescriptionRunes caps the sanitised error_description by
-// rune count. Real values are short ("subject not active", "audience
-// denied"); past this the truncated form points at server
-// misbehaviour rather than user-facing guidance, and unbounded length
-// is a UX-DoS vector. Counted in runes rather than bytes so
-// truncation lands on a valid UTF-8 boundary.
-const maxErrorDescriptionRunes = 512
-
-// sanitizeDescription strips control characters (incl. ANSI escapes'
-// ESC byte 0x1b, CR, LF, NUL, DEL, BEL) and caps length so a hostile
-// or buggy AS can't write into the user's terminal or balloon CLI
-// logs. Preserves printable Unicode, including non-ASCII; truncates
-// on rune boundaries rather than byte offsets so a CJK / emoji /
-// combining-character payload can't be cut mid-rune into invalid
-// UTF-8.
-func sanitizeDescription(s string) string {
-	if s == "" {
-		return ""
-	}
-	var b strings.Builder
-	b.Grow(len(s))
-	runes := 0
-	truncated := false
-	for _, r := range s {
-		switch {
-		case r < 0x20:
-			continue
-		case r == 0x7f:
-			continue
-		}
-		if runes >= maxErrorDescriptionRunes {
-			truncated = true
-			break
-		}
-		b.WriteRune(r)
-		runes++
-	}
-	out := strings.TrimSpace(b.String())
-	if truncated {
-		out += "…"
-	}
-	return out
-}
+// sanitizeDescription is a thin alias kept for in-package readability.
+// The implementation lives in internal/oauthhttp.
+func sanitizeDescription(s string) string { return oauthhttp.SanitizeDescription(s) }
 
 func readAPIError(resp *http.Response) error {
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, oauthhttp.MaxResponseBytes)) //nolint:errcheck // best-effort body read for error message
