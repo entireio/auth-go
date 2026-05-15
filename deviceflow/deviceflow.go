@@ -453,7 +453,10 @@ func pollInterval(dc *DeviceCode) time.Duration {
 //   - On ErrSlowDown, bumps the interval by 5s permanently per RFC
 //     8628 §3.5. Subsequent slow_down responses bump again.
 //   - Stops with the most-recent error when dc.ExpiresIn elapses since
-//     PollUntil was called.
+//     PollUntil was called. If the AS omitted expires_in (zero or
+//     negative), falls back to defaultExpiresIn so the loop is always
+//     bounded — closes a hostile-AS DoS vector parallel to the
+//     pollInterval clamp.
 //   - Returns the TokenSet on success.
 //   - Returns ctx.Err() (wrapped) when the caller cancels.
 //   - Returns terminal sentinels (ErrAccessDenied, ErrExpiredToken,
@@ -468,11 +471,8 @@ func (c *Client) PollUntil(ctx context.Context, dc *DeviceCode) (*tokens.TokenSe
 	}
 
 	interval := pollInterval(dc)
-
-	deadline := time.Time{}
-	if dc.ExpiresIn > 0 {
-		deadline = nowFunc().Add(time.Duration(dc.ExpiresIn) * time.Second)
-	}
+	expiresInSecs, defaulted := pollExpiresIn(dc)
+	deadline := nowFunc().Add(time.Duration(expiresInSecs) * time.Second)
 
 	for {
 		ts, err := c.PollDeviceAuth(ctx, dc.DeviceCode)
@@ -490,8 +490,11 @@ func (c *Client) PollUntil(ctx context.Context, dc *DeviceCode) (*tokens.TokenSe
 			return nil, err
 		}
 
-		if !deadline.IsZero() && !nowFunc().Before(deadline) {
-			return nil, fmt.Errorf("PollUntil: device code expired after %ds", dc.ExpiresIn)
+		if !nowFunc().Before(deadline) {
+			if defaulted {
+				return nil, fmt.Errorf("PollUntil: default expiry (%ds) reached; AS omitted expires_in", expiresInSecs)
+			}
+			return nil, fmt.Errorf("PollUntil: device code expired after %ds", expiresInSecs)
 		}
 
 		select {
@@ -500,4 +503,25 @@ func (c *Client) PollUntil(ctx context.Context, dc *DeviceCode) (*tokens.TokenSe
 		case <-time.After(interval):
 		}
 	}
+}
+
+// defaultPollExpiresIn caps PollUntil when the AS omits expires_in.
+// 30 minutes mirrors what most production device-flow servers issue
+// (RFC 8628 doesn't mandate a value); long enough that legitimate
+// users have time to authenticate, short enough that a buggy server
+// can't keep us polling indefinitely. Declared as a var so the
+// PollUntil tests can shrink it without burning real wall-clock
+// minutes; production code must not mutate it.
+var defaultPollExpiresIn = 30 * 60
+
+// pollExpiresIn returns the effective expires_in (in seconds) for a
+// device-code response, plus whether the value came from the default
+// fallback (true) or the wire value (false). RFC 8628 expects the AS
+// to provide expires_in, but a buggy or hostile server might omit
+// it — in which case we must still bound the loop.
+func pollExpiresIn(dc *DeviceCode) (secs int, defaulted bool) {
+	if dc.ExpiresIn <= 0 {
+		return defaultPollExpiresIn, true
+	}
+	return dc.ExpiresIn, false
 }

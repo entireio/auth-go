@@ -665,6 +665,48 @@ func TestPollUntil_TerminalSentinelsPropagate(t *testing.T) {
 	}
 }
 
+// TestPollUntil_ClampsZeroExpiresIn pins that an AS omitting (or
+// negating) expires_in does NOT leave the poll loop running forever
+// — bugbot caught this on the v0.2.0 PR. Without the clamp the loop
+// would only break via ctx cancellation, contradicting both
+// PollUntil's doc and the RFC 8628 §5.5 DoS-defence rationale that
+// motivated the helper.
+func TestPollUntil_ClampsZeroExpiresIn(t *testing.T) {
+	// Not parallel: mutates the package-level defaultPollExpiresIn.
+	prev := defaultPollExpiresIn
+	defaultPollExpiresIn = 1 // 1 second cap for test speed
+	t.Cleanup(func() { defaultPollExpiresIn = prev })
+
+	c := newTestClient(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		writeBody(t, w, `{"error":"authorization_pending"}`)
+	})
+
+	dc := &DeviceCode{
+		DeviceCode: "device-x",
+		Interval:   1,
+		ExpiresIn:  0, // hostile/buggy AS omitted expires_in
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	start := time.Now()
+	_, err := c.PollUntil(ctx, dc)
+	elapsed := time.Since(start)
+
+	if err == nil {
+		t.Fatal("expected default-expiry error, got nil")
+	}
+	if !strings.Contains(err.Error(), "default expiry") {
+		t.Fatalf("err = %v, want default-expiry error", err)
+	}
+	if elapsed > 5*time.Second {
+		t.Fatalf("PollUntil took %v, expected ≤ 5s before defaulted ExpiresIn ceiling fires", elapsed)
+	}
+}
+
 // TestPollUntil_ClampsZeroInterval defends against a hostile or buggy
 // AS returning interval=0 — without clamping, PollUntil would hot-loop
 // against the token endpoint.
