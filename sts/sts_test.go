@@ -24,11 +24,12 @@ func writeBody(t *testing.T, w io.Writer, body string) {
 
 const testTokenPath = "/sts/token"
 
-func freezeClock(t *testing.T, at time.Time) {
+// freezeClock pins c.now() for the duration of a test. Per-Client
+// rather than package-global so parallel tests with independent
+// Clients don't race each other.
+func freezeClock(t *testing.T, c *Client, at time.Time) {
 	t.Helper()
-	prev := nowFunc
-	nowFunc = func() time.Time { return at }
-	t.Cleanup(func() { nowFunc = prev })
+	SetNowForTest(t, c, func() time.Time { return at })
 }
 
 func newTestClient(t *testing.T, h http.HandlerFunc) *Client {
@@ -52,9 +53,7 @@ func mustReadForm(t *testing.T, r *http.Request) {
 }
 
 func TestExchange_Success(t *testing.T) {
-	// Not parallel: freezeClock mutates the package-level nowFunc.
-	// Any other parallel test calling Exchange would race against it.
-	freezeClock(t, time.Date(2026, 5, 6, 12, 0, 0, 0, time.UTC))
+	t.Parallel()
 
 	c := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
 		mustReadForm(t, r)
@@ -89,6 +88,7 @@ func TestExchange_Success(t *testing.T) {
 			"scope":"thing:do"
 		}`)
 	})
+	freezeClock(t, c, time.Date(2026, 5, 6, 12, 0, 0, 0, time.UTC))
 
 	got, err := c.Exchange(context.Background(), ExchangeRequest{
 		SubjectToken:       "sub-jwt",

@@ -62,21 +62,32 @@ if err != nil { /* misconfiguration */ }
 ### Login
 
 ```go
-dfc := &deviceflow.Client{
+dfc, err := deviceflow.New(&deviceflow.Client{
     BaseURL:        issuer,
     ClientID:       clientID,
     Scope:          "cli",
     DeviceCodePath: "/oauth/device/code",
     TokenPath:      "/oauth/token",
-}
+})
+if err != nil { /* required field missing */ }
 
 dc, err := dfc.StartDeviceAuth(ctx)
 // show dc.UserCode + dc.VerificationURI to user, then drive the poll loop:
 ts, err := dfc.PollUntil(ctx, dc)
 if err != nil { /* surface RFC 8628 §3.5 sentinel as needed */ }
 
-if err := mgr.SaveCoreToken(ts.AccessToken); err != nil { /* keyring failed */ }
+if err := mgr.SaveCoreToken(*ts); err != nil { /* keyring failed */ }
 ```
+
+`deviceflow.New` (and `sts.New`) validate required fields at
+construction time rather than at the first request — misconfiguration
+becomes a startup error rather than a confusing AS-side rejection
+mid-flow. Field-bag `&deviceflow.Client{...}` construction still
+works for callers that prefer it.
+
+`SaveCoreToken` takes the full `tokens.TokenSet` so `RefreshToken`,
+absolute `ExpiresAt`, and `Scope` survive the round-trip through the
+keyring — earlier versions silently dropped these.
 
 `PollUntil` is the helper most embedders want. It honours `dc.Interval`,
 applies the RFC 8628 §3.5 `+5s` bump on `slow_down`, stops at the

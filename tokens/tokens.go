@@ -32,6 +32,46 @@ type TokenSet struct {
 // HasRefresh reports whether the set carries a refresh token.
 func (t TokenSet) HasRefresh() bool { return t.RefreshToken != "" }
 
+// String redacts the AccessToken and RefreshToken so accidental
+// log/print-debug exposure (e.g. `fmt.Printf("%+v", ts)`) doesn't
+// leak the bearer to the user's terminal, log aggregator, or crash
+// report. Length of the elided value is preserved so callers can
+// still tell "had a token / didn't" at a glance.
+//
+// To get the raw values, read the struct fields directly. Note that
+// fmt and log packages reach for Stringer first, so the redacted
+// form is what shows up by default.
+func (t TokenSet) String() string {
+	return fmt.Sprintf(
+		"TokenSet{AccessToken:%s RefreshToken:%s TokenType:%q ExpiresAt:%s Scope:%q}",
+		ElideSecret(t.AccessToken),
+		ElideSecret(t.RefreshToken),
+		t.TokenType,
+		t.ExpiresAt.Format(time.RFC3339),
+		t.Scope,
+	)
+}
+
+// GoString delegates to String so %#v in fmt also redacts the secret
+// fields. Without this, `fmt.Sprintf("%#v", ts)` would dump the raw
+// struct and reveal the AccessToken.
+func (t TokenSet) GoString() string { return t.String() }
+
+// ElideSecret returns a `<elided:N bytes>` placeholder when s is
+// non-empty, `""` otherwise. Length is preserved so callers can see
+// "this had a token of length N" without seeing the token itself.
+// Exported because deviceflow.DeviceCode and sts.ExchangeRequest
+// both have their own Stringer methods that need to redact secrets
+// in the same way — duplicating this two-line helper across three
+// packages would invite the same fix-one-miss-the-other hazard as
+// the sanitize duplication v0.2.0 consolidated.
+func ElideSecret(s string) string {
+	if s == "" {
+		return `""`
+	}
+	return fmt.Sprintf("<elided:%d bytes>", len(s))
+}
+
 // Expired reports whether the access token's advertised lifetime has
 // elapsed at now. Returns false for tokens with a zero ExpiresAt.
 func (t TokenSet) Expired(now time.Time) bool {
@@ -51,12 +91,16 @@ func (t TokenSet) ShouldRefresh(now time.Time, skew time.Duration) bool {
 	return !now.Add(skew).Before(t.ExpiresAt)
 }
 
-// Claims holds the fields parsed from a JWT access token's payload.
+// UnverifiedClaims holds the fields parsed from a JWT access token's
+// payload. The name carries a deliberate warning: the signature is
+// not verified by this library, so the fields are attacker-controlled
+// if an unsigned JWT slips through.
 //
 // Signature verification is the issuing server's responsibility; this
 // package never validates signatures. Clients read claims for routing
-// (which issuer, which audience) and UX (display the principal handle).
-type Claims struct {
+// (which issuer, which audience) and UX (display the principal
+// handle) — never as a security boundary.
+type UnverifiedClaims struct {
 	Issuer    string
 	Subject   string
 	Audience  []string
@@ -86,7 +130,7 @@ var ErrUnsignedJWT = errors.New("refusing to parse unsigned JWT (alg:none)")
 // Rejects JWTs whose header declares `alg: none` — see ErrUnsignedJWT
 // for the rationale. The signature payload itself is still not
 // verified; that remains the issuing server's responsibility.
-func ParseClaims(jwt string) (*Claims, error) {
+func ParseClaims(jwt string) (*UnverifiedClaims, error) {
 	parts := strings.Split(jwt, ".")
 	if len(parts) != 3 {
 		return nil, fmt.Errorf("%w: expected 3 segments, got %d", ErrMalformedJWT, len(parts))
@@ -94,13 +138,13 @@ func ParseClaims(jwt string) (*Claims, error) {
 
 	header, err := base64.RawURLEncoding.DecodeString(parts[0])
 	if err != nil {
-		return nil, fmt.Errorf("decode JWT header: %w", err)
+		return nil, fmt.Errorf("%w: decode header: %w", ErrMalformedJWT, err)
 	}
 	var hdr struct {
 		Alg string `json:"alg"`
 	}
 	if err := json.Unmarshal(header, &hdr); err != nil {
-		return nil, fmt.Errorf("decode JWT header: %w", err)
+		return nil, fmt.Errorf("%w: parse header: %w", ErrMalformedJWT, err)
 	}
 	// JWS algorithm identifiers (RFC 7515 §4.1.1, IANA "JSON Web
 	// Signature and Encryption Algorithms" registry) are ASCII
@@ -127,7 +171,7 @@ func ParseClaims(jwt string) (*Claims, error) {
 
 	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
 	if err != nil {
-		return nil, fmt.Errorf("decode JWT payload: %w", err)
+		return nil, fmt.Errorf("%w: decode payload: %w", ErrMalformedJWT, err)
 	}
 
 	var raw struct {
@@ -140,10 +184,10 @@ func ParseClaims(jwt string) (*Claims, error) {
 		Handle string          `json:"handle"`
 	}
 	if err := json.Unmarshal(payload, &raw); err != nil {
-		return nil, fmt.Errorf("decode JWT claims: %w", err)
+		return nil, fmt.Errorf("%w: parse payload: %w", ErrMalformedJWT, err)
 	}
 
-	c := &Claims{
+	c := &UnverifiedClaims{
 		Issuer:  raw.Iss,
 		Subject: raw.Sub,
 		Handle:  raw.Handle,
@@ -187,5 +231,5 @@ func decodeAudience(raw json.RawMessage) ([]string, error) {
 		return multi, nil
 	}
 
-	return nil, errors.New("decode JWT aud claim: not a string or array")
+	return nil, fmt.Errorf("%w: aud claim is neither a string nor a string array", ErrMalformedJWT)
 }

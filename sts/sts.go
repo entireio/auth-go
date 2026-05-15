@@ -17,14 +17,19 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/entireio/auth-go/internal/oauthhttp"
 	"github.com/entireio/auth-go/tokens"
 )
 
-// nowFunc is the package's clock. Override in tests.
-var nowFunc = time.Now
+// Client.now reads c.nowOverride (set only via SetNowForTest) and
+// falls back to time.Now. The override lives on the Client rather
+// than as a package global so tests using independent Clients can
+// freeze their own clocks without racing each other — the v0.2.0
+// review flagged the previous package-global `nowFunc` as a latent
+// t.Parallel hazard.
 
 // RFC 8693 grant_type and standard subject-token type URIs. Caller
 // supplies RequestedTokenType (which is always implementation-specific
@@ -55,6 +60,25 @@ type ExchangeRequest struct {
 
 	Extra url.Values
 }
+
+// String redacts SubjectToken (the user's core bearer) so accidental
+// log/print-debug exposure doesn't leak it. Other fields are
+// configuration metadata and shown verbatim.
+func (r ExchangeRequest) String() string {
+	return fmt.Sprintf(
+		"ExchangeRequest{SubjectToken:%s SubjectTokenType:%q RequestedTokenType:%q Audience:%q Resource:%q Scope:%q Extra:%v}",
+		tokens.ElideSecret(r.SubjectToken),
+		r.SubjectTokenType,
+		r.RequestedTokenType,
+		r.Audience,
+		r.Resource,
+		r.Scope,
+		r.Extra,
+	)
+}
+
+// GoString delegates to String so %#v in fmt also redacts.
+func (r ExchangeRequest) GoString() string { return r.String() }
 
 func (r ExchangeRequest) validate() error {
 	switch {
@@ -104,6 +128,23 @@ type Client struct {
 	// MUST leave this false; only tests and local development that pin
 	// the issuer to loopback should flip it.
 	AllowInsecureHTTP bool
+
+	// nowOverride is the per-Client clock. Set only via
+	// SetNowForTest. Held behind atomic.Pointer so hot-path reads in
+	// Exchange don't race against test setup.
+	nowOverride atomic.Pointer[nowFuncType]
+}
+
+// nowFuncType is named so we can hold it behind an atomic.Pointer.
+type nowFuncType func() time.Time
+
+// now returns the Client's effective clock. Tests can replace it via
+// SetNowForTest; production callers always get time.Now.
+func (c *Client) now() time.Time {
+	if p := c.nowOverride.Load(); p != nil {
+		return (*p)()
+	}
+	return time.Now()
 }
 
 // Exchange performs one RFC 8693 token exchange.
@@ -179,7 +220,7 @@ func (c *Client) Exchange(ctx context.Context, req ExchangeRequest) (*tokens.Tok
 		RefreshToken: raw.RefreshToken,
 		TokenType:    raw.TokenType,
 		Scope:        raw.Scope,
-		ExpiresAt:    nowFunc().Add(time.Duration(raw.ExpiresIn) * time.Second),
+		ExpiresAt:    c.now().Add(time.Duration(raw.ExpiresIn) * time.Second),
 	}, nil
 }
 
@@ -213,6 +254,34 @@ func buildForm(req ExchangeRequest) url.Values {
 // oauthhttp.HTTPClient for the construction policy.
 func (c *Client) httpClient() *http.Client {
 	return oauthhttp.HTTPClient(c.Transport)
+}
+
+// New validates a Client's required fields at construction time
+// rather than at the first Exchange call. Returns an error if
+// BaseURL or Path is empty — these would otherwise surface as a
+// confusing "POST to :///token: ..." error from the caller at the
+// worst moment.
+//
+// Takes a *Client (rather than a Client value) because the struct
+// embeds an atomic.Pointer for the test-clock seam, which can't be
+// copied per the noCopy convention. Returns the same pointer on
+// success.
+//
+// Field-bag construction (`&sts.Client{...}`) is still supported for
+// callers who want to set optional fields piecemeal, but `New` is
+// the recommended path — it makes misconfiguration a startup error
+// rather than a runtime one.
+func New(c *Client) (*Client, error) {
+	if c == nil {
+		return nil, errors.New("sts.New: nil Client")
+	}
+	switch {
+	case c.BaseURL == "":
+		return nil, errors.New("sts.New: BaseURL is required")
+	case c.Path == "":
+		return nil, errors.New("sts.New: Path is required")
+	}
+	return c, nil
 }
 
 // requestTimeout resolves the effective per-request timeout: the

@@ -161,7 +161,7 @@ func TestNew_NormalizesIssuer(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New(trailing slash + uppercase): %v", err)
 	}
-	if err := withTrailing.SaveCoreToken("core-tok"); err != nil {
+	if err := withTrailing.SaveCoreToken(tokens.TokenSet{AccessToken: "core-tok"}); err != nil {
 		t.Fatalf("SaveCoreToken: %v", err)
 	}
 
@@ -524,7 +524,7 @@ func TestSaveLookupDeleteCoreToken(t *testing.T) {
 		t.Fatalf("initial lookup: got=%q err=%v, want empty/nil", got, err)
 	}
 
-	if err := m.SaveCoreToken("new-core"); err != nil {
+	if err := m.SaveCoreToken(tokens.TokenSet{AccessToken: "new-core"}); err != nil {
 		t.Fatalf("SaveCoreToken: %v", err)
 	}
 	got, err := m.LookupCoreToken()
@@ -573,7 +573,7 @@ func TestDeleteCoreToken_ClearsExchangeCache(t *testing.T) {
 	// Re-login with a fresh core token; the next Token() must not
 	// surface the stale cached entry.
 	freshCore := makeJWTWithAudience(t, []string{testIssuer})
-	if err := m.SaveCoreToken(freshCore); err != nil {
+	if err := m.SaveCoreToken(tokens.TokenSet{AccessToken: freshCore}); err != nil {
 		t.Fatalf("SaveCoreToken: %v", err)
 	}
 	if _, err := m.TokenForResource(context.Background(), testResource); err != nil {
@@ -836,7 +836,7 @@ func TestSaveCoreToken_ClearsExchangeCache(t *testing.T) {
 		t.Fatalf("calls after first Token = %d, want 1", calls)
 	}
 
-	if err := m.SaveCoreToken("user-b-core"); err != nil {
+	if err := m.SaveCoreToken(tokens.TokenSet{AccessToken: "user-b-core"}); err != nil {
 		t.Fatalf("SaveCoreToken: %v", err)
 	}
 

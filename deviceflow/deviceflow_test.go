@@ -31,12 +31,13 @@ const (
 	testTokenPath      = "/oauth/token"
 )
 
-// freezeClock pins nowFunc for the duration of a test.
-func freezeClock(t *testing.T, at time.Time) {
+// freezeClock pins c.now() for the duration of a test. Per-Client
+// rather than package-global so parallel tests with independent
+// Clients don't race each other (the v0.2.0 review surfaced the old
+// package-global nowFunc as a latent t.Parallel hazard).
+func freezeClock(t *testing.T, c *Client, at time.Time) {
 	t.Helper()
-	prev := nowFunc
-	nowFunc = func() time.Time { return at }
-	t.Cleanup(func() { nowFunc = prev })
+	SetNowForTest(t, c, func() time.Time { return at })
 }
 
 func newTestClient(t *testing.T, h http.HandlerFunc) *Client {
@@ -145,9 +146,7 @@ func TestStartDeviceAuth_NonOK(t *testing.T) {
 }
 
 func TestPollDeviceAuth_Success(t *testing.T) {
-	// Not parallel: freezeClock mutates the package-level nowFunc.
-	// Any other parallel test calling PollDeviceAuth would race against it.
-	freezeClock(t, time.Date(2026, 5, 6, 12, 0, 0, 0, time.UTC))
+	t.Parallel()
 
 	c := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
 		mustReadForm(t, r)
@@ -166,6 +165,7 @@ func TestPollDeviceAuth_Success(t *testing.T) {
 			"scope":"cli"
 		}`)
 	})
+	freezeClock(t, c, time.Date(2026, 5, 6, 12, 0, 0, 0, time.UTC))
 
 	got, err := c.PollDeviceAuth(context.Background(), "dev-1")
 	if err != nil {

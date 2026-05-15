@@ -15,6 +15,7 @@ package tokenmanager
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"net/http"
@@ -173,16 +174,28 @@ func New(cfg Config) (*Manager, error) {
 // Issuer returns the configured issuer URL.
 func (m *Manager) Issuer() string { return m.cfg.Issuer }
 
-// SaveCoreToken persists the device-flow access token under the
-// configured Issuer.
+// SaveCoreToken persists the full device-flow token bundle under the
+// configured Issuer. Takes the entire tokens.TokenSet (rather than
+// just the access token) so RefreshToken, absolute ExpiresAt, and
+// Scope survive the round-trip through the keyring — earlier versions
+// dropped these fields silently, blocking refresh-token support and
+// losing the wire-side expiry hint for opaque tokens.
+//
+// AccessToken is required (rejected here rather than letting it
+// surface as a confusing "Bearer <empty>" later). The tokens.TokenSet
+// is otherwise stored verbatim; consumers can read the persisted
+// fields back via Store.LoadTokens.
 //
 // On successful save the in-memory exchange cache is cleared so a
 // re-login under a different identity can't return the previous user's
-// exchanged tokens. The cacheKey already binds entries to CoreToken so
-// this is defence-in-depth against a future refactor that drops the
-// core token from the cache key — see TestSaveCoreToken_ClearsExchangeCache.
-func (m *Manager) SaveCoreToken(accessToken string) error {
-	if err := m.cfg.Store.SaveTokens(m.cfg.Issuer, tokens.TokenSet{AccessToken: accessToken}); err != nil {
+// exchanged tokens. The cacheKey already binds entries to the core
+// token's SHA-256 hash, so this is defence-in-depth — see
+// TestSaveCoreToken_ClearsExchangeCache.
+func (m *Manager) SaveCoreToken(t tokens.TokenSet) error {
+	if t.AccessToken == "" {
+		return errors.New("save core token: AccessToken is empty")
+	}
+	if err := m.cfg.Store.SaveTokens(m.cfg.Issuer, t); err != nil {
 		return fmt.Errorf("save core token: %w", err)
 	}
 	m.mu.Lock()
@@ -319,19 +332,37 @@ func (m *Manager) resolve(req TokenRequest) TokenRequest {
 	return req
 }
 
-// coreTokenExpired reports whether the core token has an `exp` claim
-// in the past at now. JWT parse failures (and tokens without an `exp`
-// claim) are reported as not-expired so opaque access tokens flow
-// through the rest of the resolution rules unchanged.
+// coreTokenExpired reports whether the core token is not currently
+// usable: either its `exp` claim is in the past (or within
+// exchangeSkew of now) or its `nbf` claim is in the future. JWT
+// parse failures (and tokens without an `exp` claim) are reported as
+// not-expired so opaque access tokens flow through the rest of the
+// resolution rules unchanged.
+//
+// Applying exchangeSkew here closes a race: a token expiring at
+// now+1ms is technically "live", but if we present it to the resource
+// (or STS), the request body's TLS handshake + DNS + queue can easily
+// push the AS-side validation past the wire-side exp — landing a
+// confusing invalid_grant / 401 that triggers a re-login at the worst
+// moment. The cost is one fresh login slightly earlier than strictly
+// necessary; the cache's exchangeSkew uses the same window so the
+// two stay in sync.
+//
+// Enforcing `nbf` is defence in depth — a token that's not-yet-valid
+// shouldn't be presented either. RFC 7519 §4.1.5 requires the
+// processor to reject a JWT with `nbf` in the future.
 func coreTokenExpired(coreJWT string, now time.Time) bool {
 	claims, err := tokens.ParseClaims(coreJWT)
 	if err != nil {
 		return false
 	}
+	if !claims.NotBefore.IsZero() && now.Before(claims.NotBefore) {
+		return true
+	}
 	if claims.ExpiresAt.IsZero() {
 		return false
 	}
-	return !now.Before(claims.ExpiresAt)
+	return !now.Add(exchangeSkew).Before(claims.ExpiresAt)
 }
 
 // coreTokenAudienceIncludes reports whether the core JWT's `aud` claim
@@ -417,8 +448,17 @@ func (c cachedToken) usable(now time.Time) bool {
 // distinct (core token, resource, audience, requested-token-type,
 // scope) tuples hashing to the same map slot via embedded delimiters
 // in any field.
+//
+// CoreTokenHash is a SHA-256 of the core token rather than the token
+// itself: a long-running embedder (daemon, server agent) accumulates
+// one cache entry per (Resource, Audience, RequestedTokenType, Scope)
+// tuple, so embedding the full token replicates the bearer N times
+// across the per-process exchange cache. Memory dumps, crash reports,
+// and profile heap snapshots then leak N copies. The hash is a stable
+// identifier (collision-resistant for this purpose) that still
+// distinguishes between cores from different logins.
 type cacheKey struct {
-	CoreToken          string
+	CoreTokenHash      [sha256.Size]byte
 	Resource           string
 	Audience           string
 	RequestedTokenType string
@@ -432,7 +472,7 @@ type cacheKey struct {
 // https://api.example.com/ share a single cache entry.
 func makeCacheKey(coreToken string, req TokenRequest, normalizedResource string) cacheKey {
 	return cacheKey{
-		CoreToken:          coreToken,
+		CoreTokenHash:      sha256.Sum256([]byte(coreToken)),
 		Resource:           normalizedResource,
 		Audience:           req.Audience,
 		RequestedTokenType: req.RequestedTokenType,
