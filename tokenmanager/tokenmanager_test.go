@@ -122,9 +122,9 @@ func TestNew_RequiresFields(t *testing.T) {
 func TestNew_RejectsRelativeIssuer(t *testing.T) {
 	t.Parallel()
 	cases := []string{
-		"auth.example.com",        // no scheme
-		"https:///oauth/token",    // no host
-		"://broken",               // invalid scheme syntax
+		"auth.example.com",     // no scheme
+		"https:///oauth/token", // no host
+		"://broken",            // invalid scheme syntax
 	}
 	for _, iss := range cases {
 		t.Run(iss, func(t *testing.T) {
