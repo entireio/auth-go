@@ -11,12 +11,21 @@ import "strings"
 // UTF-8 boundary.
 const MaxErrorDescriptionRunes = 512
 
-// SanitizeDescription strips control characters (incl. ANSI escapes'
-// ESC byte 0x1b, CR, LF, NUL, DEL, BEL) and caps length so a hostile
-// or buggy AS can't write into the user's terminal or balloon CLI
-// logs via the error_description field of an OAuth error response.
+// SanitizeDescription strips control characters and caps length so
+// a hostile or buggy AS can't write into the user's terminal or
+// balloon CLI logs via the error_description field of an OAuth error
+// response.
 //
-// Preserves printable Unicode, including non-ASCII; truncates on
+// Rejected ranges:
+//
+//   - C0 controls (U+0000–U+001F): ESC (0x1b) for ANSI sequences,
+//     CR, LF, TAB, NUL, BEL, etc.
+//   - DEL (U+007F).
+//   - C1 controls (U+0080–U+009F): notably CSI (U+009B), which is
+//     functionally equivalent to "ESC [" in 8-bit-aware terminals
+//     and can start an ANSI escape sequence on its own.
+//
+// Preserves printable Unicode (including non-ASCII); truncates on
 // rune boundaries rather than byte offsets so a CJK / emoji /
 // combining-character payload can't be cut mid-rune into invalid
 // UTF-8.
@@ -30,9 +39,11 @@ func SanitizeDescription(s string) string {
 	truncated := false
 	for _, r := range s {
 		switch {
-		case r < 0x20: // C0 controls, including ESC (0x1b), CR/LF/TAB/NUL/BEL
+		case r < 0x20: // C0 controls
 			continue
 		case r == 0x7f: // DEL
+			continue
+		case r >= 0x80 && r <= 0x9f: // C1 controls (includes CSI U+009B)
 			continue
 		}
 		if runes >= MaxErrorDescriptionRunes {

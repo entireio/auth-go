@@ -23,7 +23,8 @@ type TestingTB interface {
 
 // SetExchangeForTest replaces the STS-exchange dispatch on m with fn
 // for the lifetime of the test. The previous override (if any) is
-// restored when t.Cleanup runs.
+// restored when t.Cleanup runs. Stores go through atomic.Pointer so
+// they don't race the unsynchronised hot-path reads in runExchange.
 //
 // This is the test seam previously exposed as Config.Exchange. It was
 // moved off the public Config so production callers can't bypass the
@@ -32,33 +33,36 @@ type TestingTB interface {
 // the library otherwise relies on.
 func SetExchangeForTest(t TestingTB, m *Manager, fn func(context.Context, sts.ExchangeRequest) (*tokens.TokenSet, error)) {
 	t.Helper()
-	m.mu.Lock()
-	prev := m.exchangeOverride
-	m.exchangeOverride = fn
-	m.mu.Unlock()
+	prev := m.exchangeOverride.Load()
+	if fn == nil {
+		m.exchangeOverride.Store(nil)
+	} else {
+		stored := exchangeFunc(fn)
+		m.exchangeOverride.Store(&stored)
+	}
 	t.Cleanup(func() {
-		m.mu.Lock()
-		m.exchangeOverride = prev
-		m.mu.Unlock()
+		m.exchangeOverride.Store(prev)
 	})
 }
 
 // SetNowForTest replaces the manager's clock with now for the lifetime
 // of the test. The previous override (if any) is restored when
-// t.Cleanup runs.
+// t.Cleanup runs. Stores go through atomic.Pointer so they don't race
+// the unsynchronised hot-path reads in m.now().
 //
 // This is the test seam previously exposed as Config.Now. It was moved
 // off the public Config alongside Exchange so the two have a single
 // idiom for test injection.
 func SetNowForTest(t TestingTB, m *Manager, now func() time.Time) {
 	t.Helper()
-	m.mu.Lock()
-	prev := m.nowOverride
-	m.nowOverride = now
-	m.mu.Unlock()
+	prev := m.nowOverride.Load()
+	if now == nil {
+		m.nowOverride.Store(nil)
+	} else {
+		stored := nowFuncType(now)
+		m.nowOverride.Store(&stored)
+	}
 	t.Cleanup(func() {
-		m.mu.Lock()
-		m.nowOverride = prev
-		m.mu.Unlock()
+		m.nowOverride.Store(prev)
 	})
 }

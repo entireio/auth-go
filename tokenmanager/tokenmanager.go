@@ -21,6 +21,7 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/entireio/auth-go/sts"
@@ -110,6 +111,14 @@ func (c Config) validate() error {
 	return nil
 }
 
+// exchangeFunc / nowFuncType are named so we can hold them in
+// atomic.Pointer values. Storing the override behind an
+// atomic.Pointer rather than a plain field plus mu lets the hot read
+// paths (runExchange, m.now) avoid taking the lock — they were
+// previously racing with SetExchangeForTest / SetNowForTest.
+type exchangeFunc func(ctx context.Context, req sts.ExchangeRequest) (*tokens.TokenSet, error)
+type nowFuncType func() time.Time
+
 // Manager orchestrates core-token storage and STS exchanges. Safe for
 // concurrent use.
 type Manager struct {
@@ -120,16 +129,18 @@ type Manager struct {
 
 	// Test seams. Set only via SetExchangeForTest / SetNowForTest,
 	// both of which require a testing.TB to discourage production
-	// callers from synthesising a fake TB to bypass STS.
-	exchangeOverride func(ctx context.Context, req sts.ExchangeRequest) (*tokens.TokenSet, error)
-	nowOverride      func() time.Time
+	// callers from synthesising a fake TB to bypass STS. Held behind
+	// atomic.Pointer so hot-path reads (runExchange, now) don't race
+	// against test setup/teardown.
+	exchangeOverride atomic.Pointer[exchangeFunc]
+	nowOverride      atomic.Pointer[nowFuncType]
 }
 
 // now returns the manager's effective clock. Tests can replace it via
 // SetNowForTest; production callers always get time.Now.
 func (m *Manager) now() time.Time {
-	if m.nowOverride != nil {
-		return m.nowOverride()
+	if p := m.nowOverride.Load(); p != nil {
+		return (*p)()
 	}
 	return time.Now()
 }
@@ -468,8 +479,8 @@ func (m *Manager) runExchange(ctx context.Context, coreToken string, req TokenRe
 		Extra: url.Values{"client_id": {m.cfg.ClientID}},
 	}
 
-	if m.exchangeOverride != nil {
-		return m.exchangeOverride(ctx, stsReq)
+	if p := m.exchangeOverride.Load(); p != nil {
+		return (*p)(ctx, stsReq)
 	}
 
 	if strings.TrimSpace(m.cfg.STSPath) == "" {

@@ -22,6 +22,10 @@ func TestSanitizeDescription(t *testing.T) {
 		{"strips BEL", "boom\x07", "boom"},
 		{"strips NUL", "a\x00b", "ab"},
 		{"strips DEL", "a\x7fb", "ab"},
+		{"strips CSI (U+009B)", "a\u009b[31mb", "a[31mb"},
+		{"strips C1 control U+0080", "a\u0080b", "ab"},
+		{"strips C1 control U+009F", "a\u009fb", "ab"},
+		{"keeps U+00A0 NBSP (printable, just exotic)", "a\u00a0b", "a\u00a0b"},
 		{"keeps unicode", "ご利用ありがとう", "ご利用ありがとう"},
 		{"trims whitespace after stripping", "\t hi \t", "hi"},
 	}

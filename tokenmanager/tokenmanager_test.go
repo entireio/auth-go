@@ -945,3 +945,61 @@ func TestToken_CacheCollapsesURLEquivalents(t *testing.T) {
 		t.Fatalf("exchange calls = %d, want 1 (trailing-slash variant must hit cache)", calls)
 	}
 }
+
+// TestSetSeams_ConcurrentReadDuringWrite pins the test-seam fields as
+// race-free under the Go memory model. Without atomic.Pointer (or a
+// mutex on the read path) a concurrent Token() call hitting m.now() /
+// runExchange while SetNowForTest / SetExchangeForTest stores the
+// override would race — `go test -race` would catch it. Bugbot
+// flagged this in v0.2.0 review.
+func TestSetSeams_ConcurrentReadDuringWrite(t *testing.T) {
+	t.Parallel()
+	core := makeJWTWithAudience(t, []string{testIssuer})
+	store := newMemStore()
+	store.data[testIssuer] = tokens.TokenSet{AccessToken: core}
+
+	m, err := New(Config{
+		Issuer: testIssuer, ClientID: testClientID, STSPath: testSTSPath, Store: store,
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	// Seed an exchange override so runExchange's pointer-load path runs.
+	SetExchangeForTest(t, m, func(_ context.Context, _ sts.ExchangeRequest) (*tokens.TokenSet, error) {
+		return &tokens.TokenSet{AccessToken: "ok", ExpiresAt: time.Now().Add(time.Hour)}, nil
+	})
+
+	// Reader goroutines spin on Token; writer goroutine repeatedly
+	// replaces the seam. With atomic.Pointer this is a no-op for
+	// the race detector; with the previous plain-field implementation
+	// it would have tripped.
+	stop := make(chan struct{})
+	readers := 4
+	done := make(chan struct{}, readers)
+	for i := 0; i < readers; i++ {
+		go func() {
+			defer func() { done <- struct{}{} }()
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+					_, _ = m.TokenForResource(context.Background(), testResource)
+				}
+			}
+		}()
+	}
+
+	// 200 writes are enough to give the race detector ample chances
+	// to find an unsynchronised read; takes <100ms with atomic.Pointer.
+	for i := 0; i < 200; i++ {
+		SetNowForTest(t, m, func() time.Time { return time.Unix(int64(i), 0).UTC() })
+		SetExchangeForTest(t, m, func(_ context.Context, _ sts.ExchangeRequest) (*tokens.TokenSet, error) {
+			return &tokens.TokenSet{AccessToken: "ok", ExpiresAt: time.Now().Add(time.Hour)}, nil
+		})
+	}
+	close(stop)
+	for i := 0; i < readers; i++ {
+		<-done
+	}
+}
