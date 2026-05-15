@@ -102,10 +102,26 @@ func ParseClaims(jwt string) (*Claims, error) {
 	if err := json.Unmarshal(header, &hdr); err != nil {
 		return nil, fmt.Errorf("decode JWT header: %w", err)
 	}
+	// JWS algorithm identifiers (RFC 7515 §4.1.1, IANA "JSON Web
+	// Signature and Encryption Algorithms" registry) are ASCII
+	// alphanumeric only — "HS256", "RS512", "EdDSA", "none", …
+	//
+	// Anything else is malformed. Rejecting non-alphanumeric runes
+	// here closes a class of bypasses against the alg:none check:
+	// `strings.TrimSpace` only handles unicode.IsSpace, missing
+	// U+200B (zero-width space), U+FEFF (BOM), and other invisible
+	// chars that a hostile AS could pad around "none" to slip past
+	// a case-fold comparison.
+	for _, r := range hdr.Alg {
+		if (r >= 'A' && r <= 'Z') || (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') {
+			continue
+		}
+		return nil, fmt.Errorf("%w: alg contains non-alphanumeric character", ErrMalformedJWT)
+	}
 	// Case-insensitive because RFC 7515 §4.1.1 doesn't strictly
-	// canonicalise case, and "None" / "NONE" have been observed in the
-	// wild.
-	if strings.EqualFold(strings.TrimSpace(hdr.Alg), "none") {
+	// canonicalise case, and "None" / "NONE" have been observed in
+	// the wild.
+	if strings.EqualFold(hdr.Alg, "none") {
 		return nil, ErrUnsignedJWT
 	}
 

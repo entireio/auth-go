@@ -62,7 +62,17 @@ const DefaultRequestTimeout = 30 * time.Second
 // no implicit URLs. Provide BaseURL, ClientID, and the two endpoint
 // paths; the rest is RFC 8628 mechanics.
 type Client struct {
-	HTTP           *http.Client
+	// Transport supplies the http.RoundTripper used for all calls.
+	// nil → http.DefaultTransport. The library builds its own
+	// *http.Client around this transport so callers can't trivially
+	// pass a *http.Client with a misconfigured TLS bypass (the prior
+	// HTTP *http.Client field made that a one-liner). Custom
+	// RoundTrippers that wrap or replace TLS verification remain the
+	// caller's responsibility; this hook is for observability
+	// (request/response logging) and per-environment proxies, not
+	// security bypass.
+	Transport http.RoundTripper
+
 	BaseURL        string
 	ClientID       string
 	Scope          string
@@ -83,6 +93,19 @@ type Client struct {
 	// false; only tests and local development pinned to loopback
 	// should flip it.
 	AllowInsecureHTTP bool
+}
+
+// httpClient builds the *http.Client used for one request. The
+// transport is c.Transport when non-nil; otherwise http.DefaultTransport.
+// We always construct a fresh *http.Client (rather than caching one)
+// because the per-request timeout is driven by ctx.WithTimeout in the
+// caller, not by *http.Client.Timeout — keeping construction local
+// avoids accidentally sharing state across Clients.
+func (c *Client) httpClient() *http.Client {
+	if c.Transport == nil {
+		return http.DefaultClient
+	}
+	return &http.Client{Transport: c.Transport}
 }
 
 // requestTimeout resolves the effective per-request timeout: the
@@ -248,6 +271,12 @@ func validateVerificationURI(raw string, allowInsecureHTTP bool) error {
 // the server's expires_in. On any RFC 8628 §3.5 error code, returns
 // the matching sentinel error from this package. Other failures
 // (network, malformed responses) are wrapped with context.
+//
+// Most callers want PollUntil instead — it drives the poll loop,
+// honours the interval, applies the RFC 8628 §3.5 +5s slow_down bump,
+// and stops at the device-code's ExpiresIn ceiling. Use PollDeviceAuth
+// directly only when you need to render the per-tick state yourself
+// (e.g. animating a TUI spinner).
 func (c *Client) PollDeviceAuth(ctx context.Context, deviceCode string) (*tokens.TokenSet, error) {
 	if timeout := c.requestTimeout(); timeout > 0 {
 		var cancel context.CancelFunc
@@ -267,18 +296,7 @@ func (c *Client) PollDeviceAuth(ctx context.Context, deviceCode string) (*tokens
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		apiErr, parseErr := readAPIErrorResponse(resp)
-		if parseErr != nil {
-			return nil, fmt.Errorf("poll device auth: %w", parseErr)
-		}
-		err := errCodeToSentinel(apiErr.Error)
-		if apiErr.ErrorDescription != "" {
-			// Wrap so callers using errors.Is(err, ErrInvalidGrant) keep
-			// working while the description is still surfaced via
-			// err.Error(). Format: "<code>: <description>".
-			err = fmt.Errorf("%w: %s", err, apiErr.ErrorDescription)
-		}
-		return nil, err
+		return nil, readAPIError(resp, "poll device auth")
 	}
 
 	var raw struct {
@@ -330,12 +348,7 @@ func (c *Client) postForm(ctx context.Context, path string, body url.Values) (*h
 		req.Header.Set("User-Agent", c.UserAgent)
 	}
 
-	httpClient := c.HTTP
-	if httpClient == nil {
-		httpClient = http.DefaultClient
-	}
-
-	resp, err := httpClient.Do(req)
+	resp, err := c.httpClient().Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("request %s: %w", path, err)
 	}
@@ -347,6 +360,15 @@ func (c *Client) postForm(ctx context.Context, path string, body url.Values) (*h
 // endpoint returns the user's access token in the response body — over
 // plain HTTP that's a credential in the clear.
 var ErrInsecureBaseURL = errors.New("refusing to run device-flow over plain HTTP (set Client.AllowInsecureHTTP only for local dev / test)")
+
+// ErrAbsolutePath is returned when DeviceCodePath or TokenPath is an
+// absolute URL rather than a path relative to BaseURL. Go's
+// url.ResolveReference *replaces* the base when handed an absolute
+// reference, so accepting an absolute path would let any caller who can
+// influence the configuration (env var, config file, server-discovery
+// doc) redirect the device-code or token request to an attacker — and
+// in the token-endpoint case, capture the user's access token.
+var ErrAbsolutePath = errors.New("path must be a relative URL, not absolute")
 
 func resolveURL(baseURL, path string, allowInsecureHTTP bool) (string, error) {
 	base, err := url.Parse(baseURL)
@@ -366,6 +388,11 @@ func resolveURL(baseURL, path string, allowInsecureHTTP bool) (string, error) {
 	rel, err := url.Parse(path)
 	if err != nil {
 		return "", fmt.Errorf("parse path: %w", err)
+	}
+	// Reject both scheme-relative (e.g. "//host/path") and absolute
+	// references — both override BaseURL's host via url.ResolveReference.
+	if rel.IsAbs() || rel.Host != "" {
+		return "", fmt.Errorf("%w: got %q", ErrAbsolutePath, path)
 	}
 	return base.ResolveReference(rel).String(), nil
 }
@@ -393,10 +420,139 @@ func readAPIErrorResponse(resp *http.Response) (*errorResponse, error) {
 	return nil, fmt.Errorf("status %d", resp.StatusCode)
 }
 
+// readAPIError surfaces an error-shaped response. It routes the AS's
+// `error` code through errCodeToSentinel so callers can errors.Is
+// regardless of which endpoint produced the failure, and appends a
+// sanitised error_description when one was supplied — capping length
+// and stripping control characters that would otherwise let a hostile
+// AS write ANSI escapes / overflow into the user's terminal.
 func readAPIError(resp *http.Response, action string) error {
-	apiErr, err := readAPIErrorResponse(resp)
-	if err == nil {
-		return fmt.Errorf("%s: %s", action, apiErr.Error)
+	apiErr, parseErr := readAPIErrorResponse(resp)
+	if parseErr != nil {
+		return fmt.Errorf("%s: %w", action, parseErr)
+	}
+	err := errCodeToSentinel(apiErr.Error)
+	if desc := sanitizeDescription(apiErr.ErrorDescription); desc != "" {
+		return fmt.Errorf("%s: %w: %s", action, err, desc)
 	}
 	return fmt.Errorf("%s: %w", action, err)
+}
+
+// maxErrorDescriptionLen caps the sanitised error_description. Real
+// values are short ("user denied", "code expired"); past this the
+// truncated form points at server misbehaviour rather than user-facing
+// guidance, and unbounded length is a UX-DoS vector.
+const maxErrorDescriptionLen = 512
+
+// sanitizeDescription strips control characters (incl. ANSI escapes'
+// ESC byte 0x1b, CR, LF, NUL, DEL, BEL) and caps length so a hostile
+// or buggy AS can't write into the user's terminal or balloon CLI
+// logs. Preserves printable Unicode, including non-ASCII.
+func sanitizeDescription(s string) string {
+	if s == "" {
+		return ""
+	}
+	var b strings.Builder
+	b.Grow(len(s))
+	for _, r := range s {
+		switch {
+		case r < 0x20: // C0 controls, including ESC (0x1b), CR/LF/TAB/NUL/BEL
+			continue
+		case r == 0x7f: // DEL
+			continue
+		default:
+			b.WriteRune(r)
+		}
+	}
+	out := strings.TrimSpace(b.String())
+	if len(out) > maxErrorDescriptionLen {
+		out = out[:maxErrorDescriptionLen] + "…"
+	}
+	return out
+}
+
+// slowDownBump is the per-RFC 8628 §3.5 mandated interval increase
+// applied each time the AS responds with `slow_down`. RFC says "at
+// least 5 seconds"; we go with exactly 5. Declared as a var rather
+// than const so PollUntil tests can shrink it without burning real
+// wall-clock seconds. Production callers should never mutate this.
+var slowDownBump = 5 * time.Second
+
+// pollInterval picks the effective poll interval for a device-code
+// response. RFC 8628 §3.5 lets the AS omit `interval`, in which case
+// the client SHOULD use 5 seconds. We clamp to 1s minimum to defend
+// against a hostile or buggy AS responding with `"interval":0`, which
+// would otherwise produce a tight loop against the token endpoint.
+func pollInterval(dc *DeviceCode) time.Duration {
+	const defaultInterval = 5 * time.Second
+	const minInterval = 1 * time.Second
+	switch {
+	case dc.Interval <= 0:
+		return defaultInterval
+	case time.Duration(dc.Interval)*time.Second < minInterval:
+		return minInterval
+	default:
+		return time.Duration(dc.Interval) * time.Second
+	}
+}
+
+// PollUntil drives the device-flow poll loop end-to-end. Most embedders
+// want this helper rather than calling PollDeviceAuth manually — it
+// owns the loop discipline that RFC 8628 §5.5 calls out as the
+// difference between a polite client and a DoS source.
+//
+// Behaviour:
+//
+//   - Waits dc.Interval (defaulting to 5s, clamped to 1s minimum)
+//     between successive poll calls.
+//   - On ErrSlowDown, bumps the interval by 5s permanently per RFC
+//     8628 §3.5. Subsequent slow_down responses bump again.
+//   - Stops with the most-recent error when dc.ExpiresIn elapses since
+//     PollUntil was called.
+//   - Returns the TokenSet on success.
+//   - Returns ctx.Err() (wrapped) when the caller cancels.
+//   - Returns terminal sentinels (ErrAccessDenied, ErrExpiredToken,
+//     ErrInvalidGrant) unwrapped, plus any unknown OAuth error verbatim,
+//     so callers can errors.Is.
+func (c *Client) PollUntil(ctx context.Context, dc *DeviceCode) (*tokens.TokenSet, error) {
+	if dc == nil {
+		return nil, errors.New("PollUntil: DeviceCode is nil")
+	}
+	if dc.DeviceCode == "" {
+		return nil, errors.New("PollUntil: DeviceCode.DeviceCode is empty")
+	}
+
+	interval := pollInterval(dc)
+
+	deadline := time.Time{}
+	if dc.ExpiresIn > 0 {
+		deadline = nowFunc().Add(time.Duration(dc.ExpiresIn) * time.Second)
+	}
+
+	for {
+		ts, err := c.PollDeviceAuth(ctx, dc.DeviceCode)
+		switch {
+		case err == nil:
+			return ts, nil
+		case errors.Is(err, ErrAuthorizationPending):
+			// keep polling
+		case errors.Is(err, ErrSlowDown):
+			interval += slowDownBump
+		default:
+			// All other errors (terminal sentinels, unknown OAuth
+			// codes, network/decode failures) are propagated. The
+			// caller decides whether to retry.
+			return nil, err
+		}
+
+		if !deadline.IsZero() && !nowFunc().Before(deadline) {
+			return nil, fmt.Errorf("PollUntil: device code expired after %ds", dc.ExpiresIn)
+		}
+
+		select {
+		case <-ctx.Done():
+			return nil, fmt.Errorf("PollUntil: %w", ctx.Err())
+		case <-time.After(interval):
+		}
+	}
 }

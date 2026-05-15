@@ -8,8 +8,9 @@
 // The package is provider-agnostic: every endpoint, identifier, and
 // default value comes from Config. It has no env-var reads, no
 // implicit URLs, and no embedded provider tables. Tests inject
-// Config.Exchange and Config.Now to avoid hitting the network and to
-// freeze the clock.
+// behaviour via SetExchangeForTest / SetNowForTest (see testseams.go)
+// rather than via the public Config — keeping the STS call out of the
+// caller-controllable surface.
 package tokenmanager
 
 import (
@@ -90,15 +91,11 @@ type Config struct {
 	// deployments pinned to loopback.
 	AllowInsecureHTTP bool
 
-	// HTTPClient overrides the http.Client used for exchange calls.
-	// Useful for installing a debug transport. nil → http.DefaultClient.
-	HTTPClient *http.Client
-
-	// Now overrides time.Now for cache-expiry decisions. Tests only.
-	Now func() time.Time
-
-	// Exchange overrides the STS call. Tests only.
-	Exchange func(ctx context.Context, req sts.ExchangeRequest) (*tokens.TokenSet, error)
+	// Transport overrides the http.RoundTripper used for STS calls.
+	// Useful for installing a debug logger or proxy. nil →
+	// http.DefaultTransport. Replaces the previous HTTPClient field —
+	// see sts.Client.Transport for the security rationale.
+	Transport http.RoundTripper
 }
 
 func (c Config) validate() error {
@@ -120,19 +117,44 @@ type Manager struct {
 
 	mu    sync.Mutex
 	cache map[cacheKey]cachedToken
+
+	// Test seams. Set only via SetExchangeForTest / SetNowForTest,
+	// both of which require a testing.TB to discourage production
+	// callers from synthesising a fake TB to bypass STS.
+	exchangeOverride func(ctx context.Context, req sts.ExchangeRequest) (*tokens.TokenSet, error)
+	nowOverride      func() time.Time
+}
+
+// now returns the manager's effective clock. Tests can replace it via
+// SetNowForTest; production callers always get time.Now.
+func (m *Manager) now() time.Time {
+	if m.nowOverride != nil {
+		return m.nowOverride()
+	}
+	return time.Now()
 }
 
 // New builds a Manager from cfg. Returns an error when required
-// fields are missing.
+// fields are missing or Issuer is not an absolute URL.
+//
+// Issuer is normalized via RFC 3986 §6.2.2 (lowercase scheme/host,
+// default-port stripped, no trailing slash) before being used as the
+// Store profile key and as the same-host shortcut comparison. Without
+// this, two Managers configured with cosmetically-different issuers
+// (`https://auth.example.com/` vs `https://auth.example.com`) would
+// write to different keyring entries but compare equal for the
+// shortcut — one Manager handing out the other's tokens.
 func New(cfg Config) (*Manager, error) {
 	if err := cfg.validate(); err != nil {
 		return nil, err
 	}
+	parsed, err := url.Parse(cfg.Issuer)
+	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
+		return nil, fmt.Errorf("Config.Issuer must be an absolute URL with scheme and host, got %q", cfg.Issuer)
+	}
+	cfg.Issuer = normalizeOriginURL(cfg.Issuer)
 	if cfg.RequestedTokenType == "" {
 		cfg.RequestedTokenType = DefaultRequestedTokenType
-	}
-	if cfg.Now == nil {
-		cfg.Now = time.Now
 	}
 	return &Manager{cfg: cfg, cache: map[cacheKey]cachedToken{}}, nil
 }
@@ -247,13 +269,14 @@ func (m *Manager) Token(ctx context.Context, req TokenRequest) (string, error) {
 	// "401". Parse-failure is intentionally not treated as expired —
 	// opaque (non-JWT) access tokens have no client-visible expiry, so
 	// we let them flow and trust the server to reject if necessary.
-	if coreTokenExpired(core, m.cfg.Now()) {
+	if coreTokenExpired(core, m.now()) {
 		return "", ErrNotLoggedIn
 	}
 
 	normResource := normalizeOriginURL(req.Resource)
 
-	if req.Audience == "" && normalizeOriginURL(m.cfg.Issuer) == normResource {
+	// m.cfg.Issuer was normalized at New() time, so no re-normalize here.
+	if req.Audience == "" && m.cfg.Issuer == normResource {
 		return core, nil
 	}
 	if req.Audience == "" && coreTokenAudienceIncludes(core, normResource) {
@@ -354,10 +377,18 @@ func normalizeOriginURL(raw string) string {
 	return u.String()
 }
 
+// maxCachedTokenLifetime bounds entries with an unknown wire-side
+// expiry. Today this can't happen on the exchange path (sts.Exchange
+// rejects non-positive expires_in), but it would still apply if a
+// future code path stored a TokenSet without ExpiresAt — capping at 1h
+// prevents an indefinitely-cached stale token in that case.
+const maxCachedTokenLifetime = time.Hour
+
 // cachedToken is one entry in the per-process exchange cache.
 type cachedToken struct {
 	accessToken string
 	expiresAt   time.Time
+	cachedAt    time.Time
 }
 
 func (c cachedToken) usable(now time.Time) bool {
@@ -365,7 +396,7 @@ func (c cachedToken) usable(now time.Time) bool {
 		return false
 	}
 	if c.expiresAt.IsZero() {
-		return true
+		return now.Sub(c.cachedAt) < maxCachedTokenLifetime
 	}
 	return now.Add(exchangeSkew).Before(c.expiresAt)
 }
@@ -405,7 +436,7 @@ func (m *Manager) cacheLookup(key cacheKey) (string, bool) {
 	if !ok {
 		return "", false
 	}
-	if !entry.usable(m.cfg.Now()) {
+	if !entry.usable(m.now()) {
 		delete(m.cache, key)
 		return "", false
 	}
@@ -418,6 +449,7 @@ func (m *Manager) cacheStore(key cacheKey, t *tokens.TokenSet) {
 	m.cache[key] = cachedToken{
 		accessToken: t.AccessToken,
 		expiresAt:   t.ExpiresAt,
+		cachedAt:    m.now(),
 	}
 }
 
@@ -436,8 +468,8 @@ func (m *Manager) runExchange(ctx context.Context, coreToken string, req TokenRe
 		Extra: url.Values{"client_id": {m.cfg.ClientID}},
 	}
 
-	if m.cfg.Exchange != nil {
-		return m.cfg.Exchange(ctx, stsReq)
+	if m.exchangeOverride != nil {
+		return m.exchangeOverride(ctx, stsReq)
 	}
 
 	if strings.TrimSpace(m.cfg.STSPath) == "" {
@@ -445,7 +477,7 @@ func (m *Manager) runExchange(ctx context.Context, coreToken string, req TokenRe
 	}
 
 	stsClient := &sts.Client{
-		HTTP:              m.cfg.HTTPClient,
+		Transport:         m.cfg.Transport,
 		BaseURL:           m.cfg.Issuer,
 		Path:              m.cfg.STSPath,
 		UserAgent:         m.cfg.UserAgent,

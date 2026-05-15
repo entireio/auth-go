@@ -36,7 +36,7 @@ func newTestClient(t *testing.T, h http.HandlerFunc) *Client {
 	t.Cleanup(srv.Close)
 
 	return &Client{
-		HTTP:              srv.Client(),
+		Transport:         srv.Client().Transport,
 		BaseURL:           srv.URL,
 		Path:              testTokenPath,
 		AllowInsecureHTTP: true, // httptest.NewServer is http://
@@ -120,7 +120,7 @@ func TestExchange_OmitsOptionalFieldsWhenEmpty(t *testing.T) {
 				t.Errorf("optional field %q should not be sent when empty", k)
 			}
 		}
-		writeBody(t, w, `{"access_token":"acc"}`)
+		writeBody(t, w, `{"access_token":"acc","expires_in":300}`)
 	})
 
 	if _, err := c.Exchange(context.Background(), ExchangeRequest{
@@ -140,7 +140,7 @@ func TestExchange_ExtraFieldsForwarded(t *testing.T) {
 		if got := r.PostForm.Get("custom_field"); got != "custom-value" {
 			t.Errorf("custom_field = %q", got)
 		}
-		writeBody(t, w, `{"access_token":"acc"}`)
+		writeBody(t, w, `{"access_token":"acc","expires_in":300}`)
 	})
 
 	if _, err := c.Exchange(context.Background(), ExchangeRequest{
@@ -162,7 +162,7 @@ func TestExchange_StandardFieldsOverrideExtra(t *testing.T) {
 		if got := r.PostForm.Get("grant_type"); got != GrantTypeTokenExchange {
 			t.Errorf("Extra should not override standard grant_type; got %q", got)
 		}
-		writeBody(t, w, `{"access_token":"acc"}`)
+		writeBody(t, w, `{"access_token":"acc","expires_in":300}`)
 	})
 
 	if _, err := c.Exchange(context.Background(), ExchangeRequest{
@@ -187,7 +187,7 @@ func TestExchange_RejectsMissingRequiredFields(t *testing.T) {
 		{"no requested token type", ExchangeRequest{SubjectToken: "sub", SubjectTokenType: SubjectTokenTypeJWT}},
 	}
 
-	c := &Client{HTTP: http.DefaultClient, BaseURL: "https://example.test", Path: testTokenPath}
+	c := &Client{BaseURL: "https://example.test", Path: testTokenPath}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -279,23 +279,39 @@ func TestExchange_HTMLBodySurfacesFriendlyError(t *testing.T) {
 	}
 }
 
-func TestExchange_NoExpiry(t *testing.T) {
+// TestExchange_RejectsMissingExpiry pins the policy: exchanged tokens
+// must come back with a positive expires_in. A missing or zero value
+// is either misconfiguration or a hostile AS — either way we refuse
+// to cache an unknown-lifetime bearer.
+func TestExchange_RejectsMissingExpiry(t *testing.T) {
 	t.Parallel()
 
-	c := newTestClient(t, func(w http.ResponseWriter, _ *http.Request) {
-		writeBody(t, w, `{"access_token":"acc","token_type":"Bearer"}`)
-	})
-
-	got, err := c.Exchange(context.Background(), ExchangeRequest{
-		SubjectToken:       "sub",
-		SubjectTokenType:   SubjectTokenTypeJWT,
-		RequestedTokenType: "urn:example:t",
-	})
-	if err != nil {
-		t.Fatalf("Exchange() error = %v", err)
+	cases := []struct {
+		name string
+		body string
+	}{
+		{"missing", `{"access_token":"acc","token_type":"Bearer"}`},
+		{"zero", `{"access_token":"acc","token_type":"Bearer","expires_in":0}`},
+		{"negative", `{"access_token":"acc","token_type":"Bearer","expires_in":-1}`},
 	}
-	if !got.ExpiresAt.IsZero() {
-		t.Fatalf("ExpiresAt = %v, want zero", got.ExpiresAt)
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			c := newTestClient(t, func(w http.ResponseWriter, _ *http.Request) {
+				writeBody(t, w, tc.body)
+			})
+			_, err := c.Exchange(context.Background(), ExchangeRequest{
+				SubjectToken:       "sub",
+				SubjectTokenType:   SubjectTokenTypeJWT,
+				RequestedTokenType: "urn:example:t",
+			})
+			if err == nil {
+				t.Fatalf("Exchange(%s expires_in) returned nil error, want non-positive expires_in", tc.name)
+			}
+			if !strings.Contains(err.Error(), "non-positive expires_in") {
+				t.Fatalf("err = %v, want non-positive expires_in error", err)
+			}
+		})
 	}
 }
 
@@ -330,6 +346,32 @@ func TestExchange_RequestTimeoutFires(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "context deadline exceeded") {
 		t.Fatalf("err = %v, want context deadline exceeded", err)
+	}
+}
+
+// TestResolveURL_RejectsAbsolutePath pins the redirect defence: an
+// absolute Path would replace BaseURL via url.ResolveReference,
+// sending the subject_token to whatever host the caller (or its
+// configuration source) supplied. The library refuses.
+func TestResolveURL_RejectsAbsolutePath(t *testing.T) {
+	t.Parallel()
+	cases := []string{
+		"https://attacker.example.com/sts",
+		"http://attacker.example.com/sts",
+		"//attacker.example.com/sts",
+	}
+	for _, p := range cases {
+		t.Run(p, func(t *testing.T) {
+			t.Parallel()
+			_, err := resolveURL("https://auth.example.com", p, false)
+			if err == nil {
+				t.Fatalf("resolveURL(%q) returned nil error, want ErrAbsolutePath", p)
+			}
+			if !strings.Contains(err.Error(), "must be a relative URL") &&
+				!strings.Contains(err.Error(), "must be relative") {
+				t.Fatalf("err = %v, want ErrAbsolutePath", err)
+			}
+		})
 	}
 }
 

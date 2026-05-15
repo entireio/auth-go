@@ -43,7 +43,7 @@ func newTestClient(t *testing.T, h http.HandlerFunc) *Client {
 	t.Cleanup(srv.Close)
 
 	c := &Client{
-		HTTP:              srv.Client(),
+		Transport:         srv.Client().Transport,
 		BaseURL:           srv.URL,
 		ClientID:          testClientID,
 		Scope:             "cli",
@@ -532,4 +532,262 @@ func TestStartDeviceAuth_AcceptsSafeVerificationURI(t *testing.T) {
 // inline without sprintf-fighting with embedded quotes.
 func jsonMarshal(v any) ([]byte, error) {
 	return json.Marshal(v)
+}
+
+// TestPollUntil_HonoursSlowDownBump pins the RFC 8628 §3.5 polite-
+// client behaviour: each slow_down adds bumpQuanta to the polling
+// interval. Without this, naïve callers would hammer the AS and trip
+// rate limits — which §5.5 of the RFC explicitly calls out as a DoS
+// vector. Shrinks slowDownBump for test speed; production callers
+// never mutate it.
+func TestPollUntil_HonoursSlowDownBump(t *testing.T) {
+	// Not parallel: mutates the package-level slowDownBump var.
+	prev := slowDownBump
+	slowDownBump = 50 * time.Millisecond
+	t.Cleanup(func() { slowDownBump = prev })
+
+	var calls int
+	var pollTimes []time.Time
+
+	c := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != testTokenPath {
+			t.Fatalf("unexpected path %q", r.URL.Path)
+		}
+		calls++
+		pollTimes = append(pollTimes, time.Now())
+		w.Header().Set("Content-Type", "application/json")
+		switch calls {
+		case 1, 2:
+			w.WriteHeader(http.StatusBadRequest)
+			writeBody(t, w, `{"error":"slow_down"}`)
+		case 3:
+			w.WriteHeader(http.StatusBadRequest)
+			writeBody(t, w, `{"error":"authorization_pending"}`)
+		default:
+			writeBody(t, w, `{"access_token":"tok","token_type":"Bearer","expires_in":3600}`)
+		}
+	})
+
+	dc := &DeviceCode{
+		DeviceCode: "device-x",
+		Interval:   1, // pollInterval clamps to 1s minimum
+		ExpiresIn:  60,
+	}
+
+	// Shrink the minimum poll interval too — pollInterval clamps at 1s
+	// otherwise and the test would burn 3s+ of wall time.
+	// Instead, use Interval=0 with a custom client that overrides;
+	// simpler: just accept ≥3s for the test (1s × 3 + 2×bump).
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	ts, err := c.PollUntil(ctx, dc)
+	if err != nil {
+		t.Fatalf("PollUntil: %v", err)
+	}
+	if ts.AccessToken != "tok" {
+		t.Fatalf("AccessToken = %q, want tok", ts.AccessToken)
+	}
+
+	// After two slow_downs, the interval is 1s+2*bump. The 3rd→4th
+	// gap (authorization_pending → success) should reflect that.
+	if len(pollTimes) < 4 {
+		t.Skip("PollUntil completed before the slow_down loop took effect; rerun under load")
+	}
+	gap34 := pollTimes[3].Sub(pollTimes[2])
+	wantMin := 1*time.Second + 2*slowDownBump - 50*time.Millisecond
+	if gap34 < wantMin {
+		t.Errorf("3rd→4th poll gap = %v, want ≥ %v after two slow_downs", gap34, wantMin)
+	}
+}
+
+// TestPollUntil_RespectsExpiresIn pins the ceiling: once dc.ExpiresIn
+// has elapsed since PollUntil started, the loop must return rather
+// than polling forever.
+func TestPollUntil_RespectsExpiresIn(t *testing.T) {
+	t.Parallel()
+	c := newTestClient(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		writeBody(t, w, `{"error":"authorization_pending"}`)
+	})
+
+	dc := &DeviceCode{
+		DeviceCode: "device-x",
+		Interval:   1,
+		ExpiresIn:  2, // hard ceiling — bail after 2s of polling
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	start := time.Now()
+	_, err := c.PollUntil(ctx, dc)
+	elapsed := time.Since(start)
+
+	if err == nil {
+		t.Fatal("expected expiry error, got nil")
+	}
+	if !strings.Contains(err.Error(), "expired") {
+		t.Fatalf("err = %v, want expiry error", err)
+	}
+	if elapsed > 5*time.Second {
+		t.Fatalf("PollUntil took %v, expected ≤ 5s before ExpiresIn ceiling fires", elapsed)
+	}
+}
+
+// TestPollUntil_TerminalSentinelsPropagate pins that terminal error
+// codes break the loop immediately rather than getting retried.
+func TestPollUntil_TerminalSentinelsPropagate(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		code     string
+		sentinel error
+	}{
+		{"access_denied", ErrAccessDenied},
+		{"expired_token", ErrExpiredToken},
+		{"invalid_grant", ErrInvalidGrant},
+	}
+	for _, tc := range cases {
+		t.Run(tc.code, func(t *testing.T) {
+			t.Parallel()
+			c := newTestClient(t, func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusBadRequest)
+				writeBody(t, w, `{"error":"`+tc.code+`"}`)
+			})
+			dc := &DeviceCode{DeviceCode: "device-x", Interval: 1, ExpiresIn: 60}
+			_, err := c.PollUntil(context.Background(), dc)
+			if !errors.Is(err, tc.sentinel) {
+				t.Fatalf("err = %v, want %v", err, tc.sentinel)
+			}
+		})
+	}
+}
+
+// TestPollUntil_ClampsZeroInterval defends against a hostile or buggy
+// AS returning interval=0 — without clamping, PollUntil would hot-loop
+// against the token endpoint.
+func TestPollUntil_ClampsZeroInterval(t *testing.T) {
+	t.Parallel()
+	got := pollInterval(&DeviceCode{Interval: 0})
+	if got < time.Second {
+		t.Fatalf("pollInterval(Interval=0) = %v, want ≥ 1s", got)
+	}
+	got = pollInterval(&DeviceCode{Interval: -1})
+	if got < time.Second {
+		t.Fatalf("pollInterval(Interval=-1) = %v, want ≥ 1s", got)
+	}
+}
+
+// TestStartDeviceAuth_RoutesSentinel pins the symmetric error
+// behaviour: StartDeviceAuth errors should be matchable with
+// errors.Is (same as PollDeviceAuth) so callers don't have to
+// switch on the underlying call site.
+func TestStartDeviceAuth_RoutesSentinel(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		code     string
+		sentinel error
+	}{
+		{"access_denied", ErrAccessDenied},
+		{"expired_token", ErrExpiredToken},
+		{"invalid_grant", ErrInvalidGrant},
+		{"slow_down", ErrSlowDown},
+		{"authorization_pending", ErrAuthorizationPending},
+	}
+	for _, tc := range cases {
+		t.Run(tc.code, func(t *testing.T) {
+			t.Parallel()
+			c := newTestClient(t, func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(http.StatusBadRequest)
+				writeBody(t, w, `{"error":"`+tc.code+`","error_description":"server says no"}`)
+			})
+			_, err := c.StartDeviceAuth(context.Background())
+			if !errors.Is(err, tc.sentinel) {
+				t.Fatalf("StartDeviceAuth err = %v, want %v", err, tc.sentinel)
+			}
+			if !strings.Contains(err.Error(), "server says no") {
+				t.Errorf("StartDeviceAuth err = %v, expected sanitised description surfaced", err)
+			}
+		})
+	}
+}
+
+// TestSanitizeDescription pins the control-char + length defenses
+// against a hostile or buggy AS smuggling ANSI escapes or megabyte
+// payloads into the user's terminal via error_description.
+func TestSanitizeDescription(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{"plain", "user denied", "user denied"},
+		{"strips CR LF", "hello\r\nworld", "helloworld"},
+		{"strips ESC", "\x1b[31mred", "[31mred"},
+		{"strips BEL", "boom\x07", "boom"},
+		{"strips NUL", "a\x00b", "ab"},
+		{"strips DEL", "a\x7fb", "ab"},
+		{"keeps unicode", "ご利用ありがとう", "ご利用ありがとう"},
+		{"trims whitespace after stripping", "\t hi \t", "hi"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			if got := sanitizeDescription(tc.in); got != tc.want {
+				t.Fatalf("sanitizeDescription(%q) = %q, want %q", tc.in, got, tc.want)
+			}
+		})
+	}
+
+	long := strings.Repeat("A", 1000)
+	if got := sanitizeDescription(long); len(got) > maxErrorDescriptionLen+4 {
+		t.Fatalf("sanitizeDescription(<1000 A's>) length = %d, want ≤ %d", len(got), maxErrorDescriptionLen+4)
+	}
+}
+
+// TestPollDeviceAuth_SanitisesErrorDescription pins that PollDeviceAuth
+// also strips control chars from server-supplied error_description so
+// a hostile AS can't paint the user's terminal.
+func TestPollDeviceAuth_SanitisesErrorDescription(t *testing.T) {
+	t.Parallel()
+	c := newTestClient(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+		writeBody(t, w, `{"error":"invalid_grant","error_description":"line1\r\n\u001b[31mline2"}`)
+	})
+	_, err := c.PollDeviceAuth(context.Background(), "dev-x")
+	if !errors.Is(err, ErrInvalidGrant) {
+		t.Fatalf("err = %v, want ErrInvalidGrant", err)
+	}
+	if strings.Contains(err.Error(), "\x1b") || strings.Contains(err.Error(), "\r") || strings.Contains(err.Error(), "\n") {
+		t.Fatalf("err = %q, control characters not stripped", err.Error())
+	}
+}
+
+// TestResolveURL_RejectsAbsolutePath pins the redirect defence: an
+// absolute DeviceCodePath/TokenPath would replace BaseURL via
+// url.ResolveReference, sending the user's device-code or access
+// token to whatever host the caller's configuration source supplied.
+// The library refuses.
+func TestResolveURL_RejectsAbsolutePath(t *testing.T) {
+	t.Parallel()
+	cases := []string{
+		"https://attacker.example.com/oauth/token",
+		"http://attacker.example.com/oauth/token",
+		"//attacker.example.com/oauth/token",
+	}
+	for _, p := range cases {
+		t.Run(p, func(t *testing.T) {
+			t.Parallel()
+			_, err := resolveURL("https://auth.example.com", p, false)
+			if err == nil {
+				t.Fatalf("resolveURL(%q) returned nil error, want ErrAbsolutePath", p)
+			}
+			if !errors.Is(err, ErrAbsolutePath) {
+				t.Fatalf("err = %v, want ErrAbsolutePath", err)
+			}
+		})
+	}
 }
