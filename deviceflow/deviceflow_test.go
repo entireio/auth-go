@@ -11,6 +11,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 )
 
 // writeBody writes body to w from a test handler. Wraps io.WriteString
@@ -743,8 +744,40 @@ func TestSanitizeDescription(t *testing.T) {
 	}
 
 	long := strings.Repeat("A", 1000)
-	if got := sanitizeDescription(long); len(got) > maxErrorDescriptionLen+4 {
-		t.Fatalf("sanitizeDescription(<1000 A's>) length = %d, want ≤ %d", len(got), maxErrorDescriptionLen+4)
+	got := sanitizeDescription(long)
+	wantRunes := maxErrorDescriptionRunes + 1 // +1 for the appended ellipsis
+	if r := utf8.RuneCountInString(got); r != wantRunes {
+		t.Fatalf("sanitizeDescription(<1000 A's>) rune count = %d, want %d", r, wantRunes)
+	}
+	if !utf8.ValidString(got) {
+		t.Fatalf("sanitizeDescription(<1000 A's>) produced invalid UTF-8: %q", got)
+	}
+}
+
+// TestSanitizeDescription_TruncatesOnRuneBoundary pins the
+// truncation-mid-rune defence (Cursor Bugbot finding on the v0.2.0
+// PR). A payload of multi-byte runes that would straddle the byte
+// cap must not be cut into invalid UTF-8 — truncation has to land on
+// a rune boundary.
+func TestSanitizeDescription_TruncatesOnRuneBoundary(t *testing.T) {
+	t.Parallel()
+	// Each "あ" is 3 bytes in UTF-8. 600 of them exceeds the rune cap
+	// (and would have been chopped mid-rune by the previous byte-offset
+	// slice once the rune cap moved past a multi-byte boundary).
+	in := strings.Repeat("あ", 600)
+	got := sanitizeDescription(in)
+	if !utf8.ValidString(got) {
+		t.Fatalf("sanitizeDescription produced invalid UTF-8 from %d-rune input", 600)
+	}
+	// Sanity: the runes that survive are all the original CJK char,
+	// terminated by the truncation ellipsis.
+	for _, r := range got {
+		if r != 'あ' && r != '…' {
+			t.Fatalf("unexpected rune %U in output", r)
+		}
+	}
+	if r := utf8.RuneCountInString(got); r != maxErrorDescriptionRunes+1 {
+		t.Fatalf("rune count = %d, want %d (cap + ellipsis)", r, maxErrorDescriptionRunes+1)
 	}
 }
 
