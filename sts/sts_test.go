@@ -2,6 +2,7 @@ package sts
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -367,8 +368,7 @@ func TestResolveURL_RejectsAbsolutePath(t *testing.T) {
 			if err == nil {
 				t.Fatalf("resolveURL(%q) returned nil error, want ErrAbsolutePath", p)
 			}
-			if !strings.Contains(err.Error(), "must be a relative URL") &&
-				!strings.Contains(err.Error(), "must be relative") {
+			if !errors.Is(err, ErrAbsolutePath) {
 				t.Fatalf("err = %v, want ErrAbsolutePath", err)
 			}
 		})

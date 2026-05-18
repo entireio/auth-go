@@ -424,18 +424,27 @@ func sanitizeDescription(s string) string { return oauthhttp.SanitizeDescription
 var slowDownBump = 5 * time.Second
 
 // pollInterval picks the effective poll interval for a device-code
-// response. RFC 8628 §3.5 lets the AS omit `interval`, in which case
-// the client SHOULD use 5 seconds. We clamp to 1s minimum to defend
-// against a hostile or buggy AS responding with `"interval":0`, which
-// would otherwise produce a tight loop against the token endpoint.
+// response.
+//
+//   - RFC 8628 §3.5 lets the AS omit `interval`, in which case the
+//     client SHOULD use 5 seconds.
+//   - Non-positive values (omitted, zero, negative) fall back to
+//     defaultInterval — a literal `"interval":0` would otherwise hot-
+//     loop against the token endpoint.
+//   - Values past maxIntervalSeconds are clamped to 1h. Without a
+//     ceiling, a hostile or buggy AS could effectively park the poll
+//     loop until ExpiresIn fires; on 64-bit platforms an extreme
+//     value could also overflow time.Duration's nanosecond range
+//     (max ~292y). 1h is several orders of magnitude above any real
+//     device-flow interval and still safely bounded.
 func pollInterval(dc *DeviceCode) time.Duration {
 	const defaultInterval = 5 * time.Second
-	const minInterval = 1 * time.Second
+	const maxIntervalSeconds = 3600
 	switch {
 	case dc.Interval <= 0:
 		return defaultInterval
-	case time.Duration(dc.Interval)*time.Second < minInterval:
-		return minInterval
+	case dc.Interval > maxIntervalSeconds:
+		return time.Duration(maxIntervalSeconds) * time.Second
 	default:
 		return time.Duration(dc.Interval) * time.Second
 	}
