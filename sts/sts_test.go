@@ -3,6 +3,7 @@ package sts
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -397,5 +398,102 @@ func TestRequestTimeout_DefaultAndOverride(t *testing.T) {
 				t.Fatalf("requestTimeout() = %v, want %v", got, tc.want)
 			}
 		})
+	}
+}
+
+// TestNew_RequiresFields pins the fail-fast contract for sts.New.
+// BaseURL + Path are required; Transport is optional (the package
+// builds its own http.Client when nil); AllowInsecureHTTP is a
+// production-disabled boolean. nil-Client is rejected so the
+// constructor never returns a typed-nil.
+func TestNew_RequiresFields(t *testing.T) {
+	t.Parallel()
+
+	base := func() *Client {
+		return &Client{BaseURL: "https://sts.example.com", Path: "/sts/token"}
+	}
+
+	t.Run("nil Client", func(t *testing.T) {
+		t.Parallel()
+		if _, err := New(nil); err == nil {
+			t.Fatal("New(nil) = nil, want error")
+		}
+	})
+
+	missing := []struct {
+		name   string
+		mutate func(*Client)
+		want   string
+	}{
+		{"empty BaseURL", func(c *Client) { c.BaseURL = "" }, "BaseURL"},
+		{"empty Path", func(c *Client) { c.Path = "" }, "Path"},
+	}
+	for _, tc := range missing {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			c := base()
+			tc.mutate(c)
+			_, err := New(c)
+			if err == nil {
+				t.Fatalf("New(%s missing) = nil, want error", tc.want)
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("err = %v, should mention %q", err, tc.want)
+			}
+		})
+	}
+
+	t.Run("complete returns same pointer", func(t *testing.T) {
+		t.Parallel()
+		c := base()
+		got, err := New(c)
+		if err != nil {
+			t.Fatalf("New(complete) = %v, want nil", err)
+		}
+		if got != c {
+			t.Fatal("New returned a different pointer; should return its input on success")
+		}
+	})
+}
+
+// TestExchangeRequest_StringRedactsSubjectToken pins the redaction
+// contract for the RFC 8693 request type: only SubjectToken (the
+// user's bearer) is redacted. Other fields are configuration
+// metadata and are intentionally shown verbatim — including Extra,
+// which is documented as caller-responsibility for log hygiene.
+func TestExchangeRequest_StringRedactsSubjectToken(t *testing.T) {
+	t.Parallel()
+
+	req := ExchangeRequest{
+		SubjectToken:       "super-secret-subject-token-xyz",
+		SubjectTokenType:   "urn:ietf:params:oauth:token-type:jwt",
+		RequestedTokenType: "urn:ietf:params:oauth:token-type:access_token",
+		Audience:           "https://api.example.com",
+		Resource:           "https://api.example.com",
+		Scope:              "read",
+		Extra:              url.Values{"x-tenant": []string{"acme"}},
+	}
+
+	got := req.String()
+	if strings.Contains(got, "super-secret-subject-token-xyz") {
+		t.Fatalf("String() leaked SubjectToken: %q", got)
+	}
+	if !strings.Contains(got, "<elided:30 bytes>") {
+		t.Fatalf("String() missing elided placeholder: %q", got)
+	}
+	for _, want := range []string{
+		`SubjectTokenType:"urn:ietf:params:oauth:token-type:jwt"`,
+		`Audience:"https://api.example.com"`,
+		`Scope:"read"`,
+		"x-tenant",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("String() should show %q: %q", want, got)
+		}
+	}
+
+	// And %#v must redact via GoString.
+	if v := fmt.Sprintf("%#v", req); strings.Contains(v, "super-secret-subject-token-xyz") {
+		t.Fatalf("%%#v leaked SubjectToken: %q", v)
 	}
 }

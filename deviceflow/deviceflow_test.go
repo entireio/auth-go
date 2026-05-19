@@ -832,3 +832,173 @@ func TestResolveURL_RejectsAbsolutePath(t *testing.T) {
 		})
 	}
 }
+
+// TestNew_RequiresFields pins the fail-fast contract for the
+// validating constructor. Each required field, when empty, must
+// surface at construction time rather than at the first request —
+// the whole point of the helper. The nil-Client case is included
+// because returning a typed-nil from a constructor would be the most
+// embarrassing of failure modes.
+func TestNew_RequiresFields(t *testing.T) {
+	t.Parallel()
+
+	base := func() *Client {
+		return &Client{
+			BaseURL:        "https://auth.example.com",
+			ClientID:       "cli",
+			DeviceCodePath: "/oauth/device/code",
+			TokenPath:      "/oauth/token",
+		}
+	}
+
+	t.Run("nil Client", func(t *testing.T) {
+		t.Parallel()
+		if _, err := New(nil); err == nil {
+			t.Fatal("New(nil) = nil, want error")
+		}
+	})
+
+	missing := []struct {
+		name   string
+		mutate func(*Client)
+		want   string
+	}{
+		{"empty BaseURL", func(c *Client) { c.BaseURL = "" }, "BaseURL"},
+		{"empty ClientID", func(c *Client) { c.ClientID = "" }, "ClientID"},
+		{"empty DeviceCodePath", func(c *Client) { c.DeviceCodePath = "" }, "DeviceCodePath"},
+		{"empty TokenPath", func(c *Client) { c.TokenPath = "" }, "TokenPath"},
+	}
+	for _, tc := range missing {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			c := base()
+			tc.mutate(c)
+			_, err := New(c)
+			if err == nil {
+				t.Fatalf("New(%s missing) = nil, want error", tc.want)
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("err = %v, should mention %q", err, tc.want)
+			}
+		})
+	}
+
+	t.Run("complete returns same pointer", func(t *testing.T) {
+		t.Parallel()
+		c := base()
+		got, err := New(c)
+		if err != nil {
+			t.Fatalf("New(complete) = %v, want nil", err)
+		}
+		if got != c {
+			t.Fatal("New returned a different pointer; should return its input on success")
+		}
+	})
+}
+
+// TestDeviceCode_StringRedactsSecrets pins the DeviceCode Stringer's
+// threat model: DeviceCode (poll-redemption secret) and
+// VerificationURIComplete (auto-fills the consent form → effectively
+// one-click consent during the auth window) are redacted. UserCode
+// is preserved because the user has to read it aloud, and plain
+// VerificationURI is preserved because the user has to navigate to
+// it. A regression that flips any of these would either spill a
+// secret or break the UX.
+func TestDeviceCode_StringRedactsSecrets(t *testing.T) {
+	t.Parallel()
+
+	dc := DeviceCode{
+		DeviceCode:              "device-poll-secret-1234567890",
+		UserCode:                "WDJB-MJHT",
+		VerificationURI:         "https://auth.example.com/device",
+		VerificationURIComplete: "https://auth.example.com/device?user_code=WDJB-MJHT",
+		ExpiresIn:               600,
+		Interval:                5,
+	}
+
+	got := dc.String()
+	if strings.Contains(got, "device-poll-secret-1234567890") {
+		t.Fatalf("String() leaked DeviceCode: %q", got)
+	}
+	if strings.Contains(got, "user_code=WDJB-MJHT") {
+		t.Fatalf("String() leaked VerificationURIComplete: %q", got)
+	}
+	if !strings.Contains(got, `UserCode:"WDJB-MJHT"`) {
+		t.Fatalf("String() should show UserCode verbatim (user reads it aloud): %q", got)
+	}
+	if !strings.Contains(got, `VerificationURI:"https://auth.example.com/device"`) {
+		t.Fatalf("String() should show plain VerificationURI verbatim: %q", got)
+	}
+	// And %#v must redact via GoString.
+	if v := fmt.Sprintf("%#v", dc); strings.Contains(v, "device-poll-secret-1234567890") {
+		t.Fatalf("%%#v leaked DeviceCode: %q", v)
+	}
+}
+
+// TestValidateVerificationURI_RejectsOversized pins the 2048-byte
+// cap against terminal-overflow phishing — a benign prefix followed
+// by enough padding to scroll a hostile suffix off-screen. The cap
+// is generous; real production verification URLs are well under
+// 200 chars.
+func TestValidateVerificationURI_RejectsOversized(t *testing.T) {
+	t.Parallel()
+
+	long := "https://auth.example.com/device?x=" + strings.Repeat("a", maxVerificationURILen)
+	if len(long) <= maxVerificationURILen {
+		t.Fatalf("test fixture too short: %d <= %d", len(long), maxVerificationURILen)
+	}
+	err := validateVerificationURI(long, false)
+	if !errors.Is(err, ErrUnsafeVerificationURI) {
+		t.Fatalf("validateVerificationURI(oversized) = %v, want ErrUnsafeVerificationURI", err)
+	}
+	if !strings.Contains(err.Error(), "too long") {
+		t.Fatalf("err = %v, should mention length", err)
+	}
+
+	// Boundary: exactly maxVerificationURILen is accepted (the check
+	// is `len > max`, not `len >= max`).
+	atMax := "https://auth.example.com/?" + strings.Repeat("a", maxVerificationURILen-len("https://auth.example.com/?"))
+	if len(atMax) != maxVerificationURILen {
+		t.Fatalf("test fixture not exactly maxVerificationURILen: got %d, want %d", len(atMax), maxVerificationURILen)
+	}
+	if err := validateVerificationURI(atMax, false); err != nil {
+		t.Fatalf("validateVerificationURI(exactly maxVerificationURILen) = %v, want nil", err)
+	}
+}
+
+// TestValidateVerificationURI_RejectsNonASCIIHost pins the
+// raw-Unicode hostname rejection (the cheap defence against
+// confusable-script attacks). Documented limitation: this catches
+// raw-Unicode only; Punycode-encoded confusables (xn--pple-43d.com)
+// pass because the wire layer is ASCII-clean — full homograph
+// defence belongs in the browser, not in this library.
+func TestValidateVerificationURI_RejectsNonASCIIHost(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name string
+		uri  string
+	}{
+		{"cyrillic a", "https://аpple.com/device"}, // U+0430
+		{"cyrillic full", "https://привет.example/device"},
+		{"emoji host", "https://\U0001F600.example/device"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			err := validateVerificationURI(tc.uri, false)
+			if !errors.Is(err, ErrUnsafeVerificationURI) {
+				t.Fatalf("validateVerificationURI(%q) = %v, want ErrUnsafeVerificationURI", tc.uri, err)
+			}
+			if !strings.Contains(err.Error(), "non-ASCII host") {
+				t.Fatalf("err = %v, should mention non-ASCII host", err)
+			}
+		})
+	}
+
+	// Sanity: Punycode-encoded form is accepted (this is the
+	// documented escape hatch and the wire-layer expectation).
+	if err := validateVerificationURI("https://xn--pple-43d.com/device", false); err != nil {
+		t.Fatalf("validateVerificationURI(Punycode) = %v, want nil (documented limitation)", err)
+	}
+}

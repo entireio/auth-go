@@ -1059,3 +1059,212 @@ func TestCachedToken_UsableCeiling(t *testing.T) {
 		})
 	}
 }
+
+// makeJWTWithExpNbf builds an unsigned JWT carrying exp and (optionally)
+// nbf claims. Used to exercise the boundary behaviour of
+// coreTokenExpired's two time-window checks. The signature segment is
+// junk because tokenmanager never verifies it.
+func makeJWTWithExpNbf(t *testing.T, exp, nbf time.Time) string {
+	t.Helper()
+	header := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"EdDSA","typ":"JWT"}`))
+	claims := map[string]any{"sub": "test"}
+	if !exp.IsZero() {
+		claims["exp"] = exp.Unix()
+	}
+	if !nbf.IsZero() {
+		claims["nbf"] = nbf.Unix()
+	}
+	payload, err := json.Marshal(claims)
+	if err != nil {
+		t.Fatalf("marshal payload: %v", err)
+	}
+	body := base64.RawURLEncoding.EncodeToString(payload)
+	sig := base64.RawURLEncoding.EncodeToString([]byte("not-real"))
+	return header + "." + body + "." + sig
+}
+
+// TestCoreTokenExpired_AppliesExchangeSkew pins the v0.3.0 finding
+// #11 contract: a token whose exp is within exchangeSkew of now is
+// treated as expired, not live. Without the skew, a token expiring
+// in 1ms passes the preflight, gets presented to the AS, and races
+// the wire-side validation past exp — the AS rejects, the CLI
+// surfaces a confusing invalid_grant, the user re-logs in. The
+// skew sacrifices one fresh login slightly earlier to eliminate
+// that race; the cache's exchangeSkew uses the same window so the
+// two stay in sync.
+func TestCoreTokenExpired_AppliesExchangeSkew(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, 5, 6, 12, 0, 0, 0, time.UTC)
+
+	cases := []struct {
+		name string
+		exp  time.Time
+		want bool
+	}{
+		{"comfortably future", now.Add(time.Hour), false},
+		{"just outside skew", now.Add(exchangeSkew + time.Second), false},
+		{"inside skew window", now.Add(exchangeSkew / 2), true},
+		{"exactly at exp", now, true},
+		{"already past exp", now.Add(-time.Second), true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			jwt := makeJWTWithExpNbf(t, tc.exp, time.Time{})
+			if got := coreTokenExpired(jwt, now); got != tc.want {
+				t.Fatalf("coreTokenExpired(exp=%v, now=%v) = %v, want %v",
+					tc.exp.Sub(now), now, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestCoreTokenExpired_EnforcesNotBefore pins finding #12: a token
+// whose nbf is in the future is unusable per RFC 7519 §4.1.5,
+// regardless of exp. Defence in depth — the resource server is also
+// expected to reject — but a CLI that presents a not-yet-valid
+// token wastes a round-trip and surfaces a confusing rejection.
+func TestCoreTokenExpired_EnforcesNotBefore(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, 5, 6, 12, 0, 0, 0, time.UTC)
+	exp := now.Add(time.Hour) // comfortably future so only nbf matters
+
+	cases := []struct {
+		name string
+		nbf  time.Time
+		want bool
+	}{
+		{"nbf in past (active token)", now.Add(-time.Hour), false},
+		{"nbf exactly now", now, false},
+		{"nbf in future (not yet valid)", now.Add(time.Minute), true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			jwt := makeJWTWithExpNbf(t, exp, tc.nbf)
+			if got := coreTokenExpired(jwt, now); got != tc.want {
+				t.Fatalf("coreTokenExpired(nbf=%v, now=%v) = %v, want %v",
+					tc.nbf.Sub(now), now, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestCoreTokenExpired_OpaqueTokensFlowThrough pins the
+// parse-failure escape hatch: opaque (non-JWT) access tokens cannot
+// be checked for exp/nbf, so coreTokenExpired returns false and lets
+// them flow to the rest of the resolution rules. Otherwise opaque
+// tokens (which the AS may legitimately issue) would all be
+// classified as expired and break every login.
+func TestCoreTokenExpired_OpaqueTokensFlowThrough(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, 5, 6, 12, 0, 0, 0, time.UTC)
+	for _, opaque := range []string{
+		"opaque-access-token-no-dots",
+		"two.segments",
+		"",
+	} {
+		if coreTokenExpired(opaque, now) {
+			t.Fatalf("coreTokenExpired(opaque=%q) = true, want false (opaque tokens must flow through)", opaque)
+		}
+	}
+}
+
+// TestSaveCoreToken_RejectsEmptyAccessToken pins finding #15's
+// storage-layer guard: an empty AccessToken is rejected at
+// SaveCoreToken rather than producing a confusing `Bearer <empty>`
+// at the first authenticated request. The previous
+// SaveCoreToken(string) signature couldn't make this distinction
+// cleanly; the TokenSet form makes the empty-token case explicit.
+func TestSaveCoreToken_RejectsEmptyAccessToken(t *testing.T) {
+	t.Parallel()
+
+	m := newTestManager(t, newMemStore(), nil)
+
+	err := m.SaveCoreToken(tokens.TokenSet{AccessToken: "", RefreshToken: "rt"})
+	if err == nil {
+		t.Fatal("SaveCoreToken(empty AccessToken) = nil, want error")
+	}
+	if !strings.Contains(err.Error(), "AccessToken") {
+		t.Fatalf("err = %v, should mention AccessToken", err)
+	}
+
+	// And the store should not have been touched.
+	got, err := m.LookupCoreToken()
+	if err != nil || got != "" {
+		t.Fatalf("LookupCoreToken after failed save = (%q, %v), want (\"\", nil)", got, err)
+	}
+}
+
+// TestSaveCoreToken_PersistsFullTokenSet pins the upgrade: the full
+// TokenSet (including RefreshToken, ExpiresAt, Scope) survives the
+// round-trip through the store. The previous SaveCoreToken(string)
+// signature silently dropped these, which blocked refresh-token
+// support and lost the wire-side expiry hint for opaque tokens.
+func TestSaveCoreToken_PersistsFullTokenSet(t *testing.T) {
+	t.Parallel()
+
+	store := newMemStore()
+	m := newTestManager(t, store, nil)
+
+	want := tokens.TokenSet{
+		AccessToken:  "core-tok",
+		RefreshToken: "refresh-tok",
+		TokenType:    "Bearer",
+		ExpiresAt:    time.Date(2026, 5, 6, 13, 0, 0, 0, time.UTC),
+		Scope:        "cli",
+	}
+	if err := m.SaveCoreToken(want); err != nil {
+		t.Fatalf("SaveCoreToken: %v", err)
+	}
+	got, err := store.LoadTokens(testIssuer)
+	if err != nil {
+		t.Fatalf("LoadTokens: %v", err)
+	}
+	if got != want {
+		t.Fatalf("LoadTokens = %+v, want %+v", got, want)
+	}
+}
+
+// TestMakeCacheKey_HashesCoreToken pins finding #10's privacy
+// invariant: the cache map key holds SHA-256 of the bearer, not the
+// bearer itself. A long-running embedder accumulates one entry per
+// (Resource, Audience, RequestedTokenType, Scope) tuple, and the
+// bearer must not be replicated across those entries — memory dumps
+// and heap profiles would otherwise leak N copies of the credential.
+//
+// SHA-256 isn't a one-way function in any security sense (anyone with
+// process-memory access already has the bearer), but it does
+// eliminate the per-entry replication.
+func TestMakeCacheKey_HashesCoreToken(t *testing.T) {
+	t.Parallel()
+
+	coreToken := "core-token-must-not-appear-in-cache-key"
+	req := TokenRequest{
+		Resource:           "https://api.example.com",
+		Audience:           "https://api.example.com",
+		RequestedTokenType: "urn:ietf:params:oauth:token-type:access_token",
+		Scope:              "read",
+	}
+
+	key := makeCacheKey(coreToken, req, req.Resource)
+
+	// The field is fixed-size sha256 output, not the raw token.
+	if string(key.CoreTokenHash[:]) == coreToken {
+		t.Fatal("CoreTokenHash contains the raw token, not a hash")
+	}
+	// Hashing the same token must produce the same key — otherwise
+	// cache hits are impossible.
+	again := makeCacheKey(coreToken, req, req.Resource)
+	if key != again {
+		t.Fatal("makeCacheKey is not deterministic for the same input")
+	}
+	// And a different core token must produce a different key.
+	other := makeCacheKey("a-different-core-token", req, req.Resource)
+	if key == other {
+		t.Fatal("makeCacheKey collides across different core tokens")
+	}
+}

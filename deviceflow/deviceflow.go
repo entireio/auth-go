@@ -335,6 +335,11 @@ func validateVerificationURI(raw string, allowInsecureHTTP bool) error {
 	// (https://аpple.com where 'а' is U+0430 Cyrillic). The library
 	// can't safely tell the two apart, and 2026-era OAuth servers
 	// don't use raw-Unicode hostnames in practice.
+	//
+	// This catches raw-Unicode homographs only. A Punycode-encoded
+	// confusable (xn--pple-43d.com → аpple.com) is pure ASCII and
+	// will pass this check; full IDN homograph defence lives in the
+	// browser's URL bar, not in an OAuth client library.
 	for _, r := range u.Hostname() {
 		if r > 0x7E {
 			return fmt.Errorf("%w: non-ASCII host (IDN hostnames must be Punycode-encoded)", ErrUnsafeVerificationURI)

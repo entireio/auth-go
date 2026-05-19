@@ -75,6 +75,7 @@ dc, err := dfc.StartDeviceAuth(ctx)
 // show dc.UserCode + dc.VerificationURI to user, then drive the poll loop:
 ts, err := dfc.PollUntil(ctx, dc)
 if err != nil { /* surface RFC 8628 §3.5 sentinel as needed */ }
+if ts == nil { /* defensive: PollUntil's contract is non-nil on nil err */ }
 
 if err := mgr.SaveCoreToken(*ts); err != nil { /* keyring failed */ }
 ```

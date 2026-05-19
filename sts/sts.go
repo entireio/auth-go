@@ -49,6 +49,13 @@ const (
 // form fields (e.g. server-defined parameters not in RFC 8693) that
 // the caller's server expects; the standard fields above always win
 // if Extra also sets them.
+//
+// Extra values are NOT redacted by the Stringer — only SubjectToken
+// is. Do not stuff bearer-equivalent credentials (client secrets,
+// assertion JWTs, refresh tokens) into Extra; the package is targeted
+// at public-client device flow where no such field is expected. If a
+// caller's server demands a secret-bearing form field via Extra, log
+// hygiene becomes that caller's responsibility.
 type ExchangeRequest struct {
 	SubjectToken       string
 	SubjectTokenType   string

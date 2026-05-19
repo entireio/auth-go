@@ -42,12 +42,16 @@ func (t TokenSet) HasRefresh() bool { return t.RefreshToken != "" }
 // fmt and log packages reach for Stringer first, so the redacted
 // form is what shows up by default.
 func (t TokenSet) String() string {
+	expiresAt := "zero"
+	if !t.ExpiresAt.IsZero() {
+		expiresAt = t.ExpiresAt.Format(time.RFC3339)
+	}
 	return fmt.Sprintf(
 		"TokenSet{AccessToken:%s RefreshToken:%s TokenType:%q ExpiresAt:%s Scope:%q}",
 		ElideSecret(t.AccessToken),
 		ElideSecret(t.RefreshToken),
 		t.TokenType,
-		t.ExpiresAt.Format(time.RFC3339),
+		expiresAt,
 		t.Scope,
 	)
 }
