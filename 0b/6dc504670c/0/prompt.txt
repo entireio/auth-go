@@ -1,0 +1,1 @@
+can you take a look at https://github.com/entireio/auth-go and the open PRs and also https://github.com/entireio/cli/pull/1153, we still need to merge the open PRs but based on that work: Can we sketch an integration already?
