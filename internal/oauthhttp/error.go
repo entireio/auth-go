@@ -17,9 +17,11 @@ type OAuthErrorResponse struct {
 }
 
 // ReadOAuthError reads a non-success OAuth response body and returns the
-// parsed OAuth error object when the server sent one. If the body is not an
-// OAuth JSON error, the returned error contains a bounded, sanitised fallback
-// message suitable for logs and terminals.
+// parsed OAuth error object when the server sent one. ErrorDescription on a
+// returned OAuthErrorResponse is unsanitised; callers must pass it through
+// SanitizeDescription before formatting it for logs or terminals. If the body
+// is not an OAuth JSON error, the returned error contains a bounded, sanitised
+// fallback message suitable for logs and terminals.
 func ReadOAuthError(resp *http.Response) (*OAuthErrorResponse, error) {
 	body, err := readLimitedBody(resp.Body)
 	if err != nil {
@@ -27,8 +29,13 @@ func ReadOAuthError(resp *http.Response) (*OAuthErrorResponse, error) {
 	}
 
 	var apiErr OAuthErrorResponse
-	if err := json.Unmarshal(bytes.TrimSpace(body), &apiErr); err == nil && strings.TrimSpace(apiErr.Error) != "" {
-		return &apiErr, nil
+	if err := json.Unmarshal(bytes.TrimSpace(body), &apiErr); err == nil {
+		if strings.TrimSpace(apiErr.Error) != "" {
+			return &apiErr, nil
+		}
+		if desc := SanitizeDescription(apiErr.ErrorDescription); desc != "" {
+			return nil, fmt.Errorf("status %d: %s", resp.StatusCode, desc)
+		}
 	}
 
 	text := SanitizeDescription(string(body))
