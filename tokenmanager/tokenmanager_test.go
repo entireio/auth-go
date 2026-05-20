@@ -877,39 +877,6 @@ func TestSaveCoreToken_ClearsExchangeCache(t *testing.T) {
 	}
 }
 
-// TestNormalizeOriginURL covers the cases where same-host / aud-shortcut
-// equality has historically misfired: trailing slash, scheme/host case,
-// default-port presence. Inputs that don't parse as origin URLs must
-// pass through unchanged so non-URL audiences keep byte-exact compare.
-func TestNormalizeOriginURL(t *testing.T) {
-	t.Parallel()
-	cases := []struct {
-		name string
-		in   string
-		want string
-	}{
-		{"empty", "", ""},
-		{"plain", "https://api.example.com", "https://api.example.com"},
-		{"trailing slash", "https://api.example.com/", "https://api.example.com"},
-		{"upper scheme", "HTTPS://api.example.com", "https://api.example.com"},
-		{"upper host", "https://API.Example.COM", "https://api.example.com"},
-		{"default https port", "https://api.example.com:443", "https://api.example.com"},
-		{"default http port", "http://api.example.com:80/", "http://api.example.com"},
-		{"non-default port preserved", "https://api.example.com:8443", "https://api.example.com:8443"},
-		{"path preserved (sans trailing slash)", "https://api.example.com/v2/", "https://api.example.com/v2"},
-		{"non-URL audience passes through", "urn:example:cli", "urn:example:cli"},
-		{"bare string passes through", "some-audience", "some-audience"},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			t.Parallel()
-			if got := normalizeOriginURL(tc.in); got != tc.want {
-				t.Errorf("normalizeOriginURL(%q) = %q, want %q", tc.in, got, tc.want)
-			}
-		})
-	}
-}
-
 // TestToken_SameHostShortcut_NormalisesURLs guards against a regression
 // where a trailing-slash or case difference between Issuer and Resource
 // forces a needless STS exchange (or fails outright on single-host

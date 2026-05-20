@@ -43,12 +43,9 @@ var ErrResponseTooLarge = errors.New("OAuth response body exceeds maximum size")
 // portal / proxy-interceptor case. Other read or decode failures are
 // wrapped with context.
 func ReadAndDecodeJSON(r io.Reader, dest any, strict bool) error {
-	body, err := io.ReadAll(io.LimitReader(r, MaxResponseBytes+1))
+	body, err := readLimitedBody(r)
 	if err != nil {
 		return fmt.Errorf("read JSON response: %w", err)
-	}
-	if len(body) > MaxResponseBytes {
-		return ErrResponseTooLarge
 	}
 	if looksLikeHTML(body) {
 		return ErrNonJSONResponse
