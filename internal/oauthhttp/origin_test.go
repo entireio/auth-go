@@ -46,6 +46,7 @@ func TestValidateOriginURL(t *testing.T) {
 		"http://api.example.com",
 		"https://user:pass@api.example.com",
 		"https://api.example.com/path",
+		"https://api.example.com//",
 		"https://api.example.com?x=1",
 		"https://api.example.com#frag",
 	}
