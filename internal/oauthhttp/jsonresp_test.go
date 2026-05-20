@@ -103,6 +103,26 @@ func TestReadAndDecodeJSON_EmptyBody(t *testing.T) {
 	}
 }
 
+func TestReadAndDecodeJSON_RejectsOversizedBody(t *testing.T) {
+	t.Parallel()
+
+	var dest map[string]any
+	err := ReadAndDecodeJSON(strings.NewReader(strings.Repeat(" ", MaxResponseBytes+1)), &dest, false)
+	if !errors.Is(err, ErrResponseTooLarge) {
+		t.Fatalf("error = %v, want ErrResponseTooLarge", err)
+	}
+}
+
+func TestReadAndDecodeJSON_RejectsTrailingData(t *testing.T) {
+	t.Parallel()
+
+	var dest map[string]any
+	err := ReadAndDecodeJSON(strings.NewReader(`{"a":1} {"b":2}`), &dest, false)
+	if err == nil || !strings.Contains(err.Error(), "trailing data") {
+		t.Fatalf("error = %v, want trailing data error", err)
+	}
+}
+
 func TestErrNonJSONResponse_MessageIsActionable(t *testing.T) {
 	t.Parallel()
 

@@ -387,7 +387,7 @@ func readAPIErrorResponse(resp *http.Response) (*errorResponse, error) {
 		return &apiErr, nil
 	}
 
-	text := strings.TrimSpace(string(body))
+	text := sanitizeDescription(string(body))
 	if text != "" {
 		return nil, fmt.Errorf("status %d: %s", resp.StatusCode, text)
 	}

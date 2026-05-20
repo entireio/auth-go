@@ -80,6 +80,12 @@ type Config struct {
 	// URI. Empty → DefaultRequestedTokenType.
 	RequestedTokenType string
 
+	// SubjectTokenType is the RFC 8693 subject_token_type sent on
+	// exchanges. Empty → sts.SubjectTokenTypeAccessToken, because the
+	// stored core token is an OAuth access token even when its wire format
+	// happens to be JWT.
+	SubjectTokenType string
+
 	// Scope is the default scope sent on exchanges. Empty → omitted.
 	Scope string
 
@@ -166,6 +172,9 @@ func New(cfg Config) (*Manager, error) {
 	cfg.Issuer = normalizeOriginURL(cfg.Issuer)
 	if cfg.RequestedTokenType == "" {
 		cfg.RequestedTokenType = DefaultRequestedTokenType
+	}
+	if cfg.SubjectTokenType == "" {
+		cfg.SubjectTokenType = sts.SubjectTokenTypeAccessToken
 	}
 	return &Manager{cfg: cfg, cache: map[cacheKey]cachedToken{}}, nil
 }
@@ -284,7 +293,10 @@ func (m *Manager) Token(ctx context.Context, req TokenRequest) (string, error) {
 		return "", ErrNotLoggedIn
 	}
 
-	normResource := normalizeOriginURL(req.Resource)
+	normResource, err := validateResourceOriginURL(req.Resource, m.cfg.AllowInsecureHTTP)
+	if err != nil {
+		return "", err
+	}
 
 	// m.cfg.Issuer was normalized at New() time, so no re-normalize here.
 	if req.Audience == "" && m.cfg.Issuer == normResource {
@@ -350,6 +362,37 @@ func coreTokenAudienceIncludes(coreJWT, target string) bool {
 		}
 	}
 	return false
+}
+
+func validateResourceOriginURL(raw string, allowInsecureHTTP bool) (string, error) {
+	u, err := url.Parse(raw)
+	if err != nil || u.Scheme == "" || u.Host == "" {
+		return "", fmt.Errorf("TokenRequest.Resource must be an absolute URL with scheme and host, got %q", raw)
+	}
+	if u.User != nil {
+		return "", errors.New("TokenRequest.Resource must not include userinfo")
+	}
+	switch u.Scheme {
+	case "https":
+		// fine
+	case "http":
+		if !allowInsecureHTTP {
+			return "", errors.New("TokenRequest.Resource must use https")
+		}
+		host := u.Hostname()
+		if host != "localhost" && host != "127.0.0.1" && host != "::1" {
+			return "", errors.New("TokenRequest.Resource http only permitted on loopback hosts")
+		}
+	default:
+		return "", fmt.Errorf("TokenRequest.Resource scheme %q is not supported", u.Scheme)
+	}
+	if u.RawQuery != "" || u.Fragment != "" {
+		return "", errors.New("TokenRequest.Resource must be an origin URL without query or fragment")
+	}
+	if strings.Trim(u.Path, "/") != "" {
+		return "", errors.New("TokenRequest.Resource must be an origin URL without a path")
+	}
+	return normalizeOriginURL(raw), nil
 }
 
 // normalizeOriginURL canonicalises an origin URL for equality
@@ -469,10 +512,10 @@ func (m *Manager) cacheStore(key cacheKey, t *tokens.TokenSet) {
 func (m *Manager) runExchange(ctx context.Context, coreToken string, req TokenRequest) (*tokens.TokenSet, error) {
 	stsReq := sts.ExchangeRequest{
 		SubjectToken:       coreToken,
-		SubjectTokenType:   sts.SubjectTokenTypeJWT,
+		SubjectTokenType:   m.cfg.SubjectTokenType,
 		RequestedTokenType: req.RequestedTokenType,
 		Audience:           req.Audience,
-		Resource:           req.Resource,
+		Resource:           normalizeOriginURL(req.Resource),
 		Scope:              req.Scope,
 		// Public-client identification per RFC 6749 §2.3.1 / §3.2.1.
 		// Carried via Extra because the sts package is provider-agnostic.
