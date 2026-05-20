@@ -4,6 +4,8 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"strings"
 	"testing"
 	"time"
 )
@@ -276,6 +278,104 @@ func TestParseClaims_RejectsAlgBypassAttempts(t *testing.T) {
 				t.Fatalf("ParseClaims(alg=%q) error = %v, want ErrMalformedJWT", tc.header, err)
 			}
 		})
+	}
+}
+
+// TestElideSecret pins the redaction format used by every Stringer
+// in the library. Empty input renders as a quoted empty string so
+// it reads naturally inside a `Field:%s` struct dump; non-empty
+// input preserves length only — the bearer itself never reaches the
+// formatted output.
+func TestElideSecret(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{"empty", "", `""`},
+		{"short", "abc", "<elided:3 bytes>"},
+		{"jwt-ish", "eyJhbGciOiJFZERTQSJ9.eyJzdWIiOiJ4In0.sig", "<elided:40 bytes>"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			if got := ElideSecret(tc.in); got != tc.want {
+				t.Fatalf("ElideSecret(%q) = %q, want %q", tc.in, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestTokenSet_StringRedactsSecrets pins the redaction contract: a
+// stray `fmt.Printf("%+v", ts)` (or "%s", or "%v") must never spill
+// AccessToken or RefreshToken to the formatted output. Length is
+// preserved deliberately so logs can still distinguish "had a token /
+// didn't" — see ElideSecret's documented tradeoff.
+func TestTokenSet_StringRedactsSecrets(t *testing.T) {
+	t.Parallel()
+
+	ts := TokenSet{
+		AccessToken:  "super-secret-access-token-xyz",
+		RefreshToken: "super-secret-refresh-token-abc",
+		TokenType:    "Bearer",
+		ExpiresAt:    time.Date(2026, 5, 6, 12, 0, 0, 0, time.UTC),
+		Scope:        "cli",
+	}
+
+	got := ts.String()
+	if strings.Contains(got, "super-secret-access-token-xyz") {
+		t.Fatalf("String() leaked AccessToken: %q", got)
+	}
+	if strings.Contains(got, "super-secret-refresh-token-abc") {
+		t.Fatalf("String() leaked RefreshToken: %q", got)
+	}
+	// Length-preserving placeholders must show.
+	if !strings.Contains(got, "<elided:29 bytes>") || !strings.Contains(got, "<elided:30 bytes>") {
+		t.Fatalf("String() missing elided placeholders: %q", got)
+	}
+	// Non-secret fields are shown verbatim.
+	if !strings.Contains(got, `TokenType:"Bearer"`) {
+		t.Fatalf("String() should show TokenType verbatim: %q", got)
+	}
+	if !strings.Contains(got, `Scope:"cli"`) {
+		t.Fatalf("String() should show Scope verbatim: %q", got)
+	}
+	if !strings.Contains(got, "2026-05-06T12:00:00Z") {
+		t.Fatalf("String() should format non-zero ExpiresAt as RFC3339: %q", got)
+	}
+}
+
+// TestTokenSet_StringZeroExpiresAt confirms a zero ExpiresAt renders
+// as the human-readable "zero" sentinel rather than the noisy default
+// `0001-01-01T00:00:00Z`. Cosmetic — but the default format suggests
+// a real (year-1) expiry, which is misleading in logs.
+func TestTokenSet_StringZeroExpiresAt(t *testing.T) {
+	t.Parallel()
+
+	got := TokenSet{AccessToken: "x"}.String()
+	if !strings.Contains(got, "ExpiresAt:zero") {
+		t.Fatalf("String() with zero ExpiresAt should print `ExpiresAt:zero`: %q", got)
+	}
+	if strings.Contains(got, "0001-01-01") {
+		t.Fatalf("String() with zero ExpiresAt should not print year-1 RFC3339: %q", got)
+	}
+}
+
+// TestTokenSet_GoStringDelegates confirms %#v also redacts. Without
+// GoString, fmt's verbose-print verb dumps the raw struct and reveals
+// the AccessToken — a common copy-paste hazard in caller debug code.
+func TestTokenSet_GoStringDelegates(t *testing.T) {
+	t.Parallel()
+
+	ts := TokenSet{AccessToken: "leak-me-if-you-can"}
+	if got := ts.GoString(); strings.Contains(got, "leak-me-if-you-can") {
+		t.Fatalf("GoString() leaked AccessToken: %q", got)
+	}
+	// And via fmt's %#v verb, which routes through GoString.
+	if got := fmt.Sprintf("%#v", ts); strings.Contains(got, "leak-me-if-you-can") {
+		t.Fatalf("%%#v leaked AccessToken: %q", got)
 	}
 }
 

@@ -21,15 +21,19 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/entireio/auth-go/internal/oauthhttp"
 	"github.com/entireio/auth-go/tokens"
 )
 
-// nowFunc is the package's clock. Tests override it; production uses
-// time.Now.
-var nowFunc = time.Now
+// Client.now reads c.nowOverride (set only via the
+// SetNowForTest helper) and falls back to time.Now. The override
+// lives on the Client rather than as a package global so tests using
+// independent Clients can freeze their own clocks without racing
+// each other — the v0.2.0 review flagged the previous package-global
+// `nowFunc` as a latent t.Parallel hazard.
 
 // deviceCodeGrantType is the RFC 8628 token-endpoint grant_type for
 // polling device-flow authorization.
@@ -46,6 +50,27 @@ type DeviceCode struct {
 	ExpiresIn               int    `json:"expires_in"`
 	Interval                int    `json:"interval"`
 }
+
+// String redacts DeviceCode (the device-flow secret that a hostile
+// observer could redeem against the token endpoint) and
+// VerificationURIComplete (which embeds the UserCode and is also a
+// credential during the auth window). UserCode itself is intentionally
+// shown to the user, so it's preserved. Without this, a stray
+// `fmt.Printf("%+v", dc)` in caller code would log the device code.
+func (d DeviceCode) String() string {
+	return fmt.Sprintf(
+		"DeviceCode{DeviceCode:%s UserCode:%q VerificationURI:%q VerificationURIComplete:%s ExpiresIn:%d Interval:%d}",
+		tokens.ElideSecret(d.DeviceCode),
+		d.UserCode,
+		d.VerificationURI,
+		tokens.ElideSecret(d.VerificationURIComplete),
+		d.ExpiresIn,
+		d.Interval,
+	)
+}
+
+// GoString delegates to String so %#v in fmt also redacts.
+func (d DeviceCode) GoString() string { return d.String() }
 
 // DefaultRequestTimeout caps a single device-flow HTTP round-trip
 // (StartDeviceAuth or one PollDeviceAuth call). Set conservatively:
@@ -93,6 +118,23 @@ type Client struct {
 	// false; only tests and local development pinned to loopback
 	// should flip it.
 	AllowInsecureHTTP bool
+
+	// nowOverride is the per-Client clock. Set only via
+	// SetNowForTest. Held behind atomic.Pointer so hot-path reads in
+	// PollDeviceAuth / PollUntil don't race against test setup.
+	nowOverride atomic.Pointer[nowFuncType]
+}
+
+// nowFuncType is named so we can hold it behind an atomic.Pointer.
+type nowFuncType func() time.Time
+
+// now returns the Client's effective clock. Tests can replace it via
+// SetNowForTest; production callers always get time.Now.
+func (c *Client) now() time.Time {
+	if p := c.nowOverride.Load(); p != nil {
+		return (*p)()
+	}
+	return time.Now()
 }
 
 // httpClient builds the *http.Client used for one request. See
@@ -100,6 +142,39 @@ type Client struct {
 // shared underlying Transport, no Client.Timeout).
 func (c *Client) httpClient() *http.Client {
 	return oauthhttp.HTTPClient(c.Transport)
+}
+
+// New validates a Client's required fields at construction time
+// rather than at the first request call. Returns an error if
+// BaseURL, ClientID, DeviceCodePath, or TokenPath is empty — these
+// would otherwise surface as a confusing "POST to :///oauth/token: ..."
+// or "missing client_id" error from the AS at the worst moment (the
+// user is mid-login).
+//
+// Takes a *Client (rather than a Client value) because the struct
+// embeds an atomic.Pointer for the test-clock seam, which can't be
+// copied per the noCopy convention. Returns the same pointer on
+// success.
+//
+// Field-bag construction (`&deviceflow.Client{...}`) is still
+// supported for callers who want to set optional fields piecemeal,
+// but `New` is the recommended path — it makes misconfiguration a
+// startup error rather than a runtime one.
+func New(c *Client) (*Client, error) {
+	if c == nil {
+		return nil, errors.New("deviceflow.New: nil Client")
+	}
+	switch {
+	case c.BaseURL == "":
+		return nil, errors.New("deviceflow.New: BaseURL is required")
+	case c.ClientID == "":
+		return nil, errors.New("deviceflow.New: ClientID is required")
+	case c.DeviceCodePath == "":
+		return nil, errors.New("deviceflow.New: DeviceCodePath is required")
+	case c.TokenPath == "":
+		return nil, errors.New("deviceflow.New: TokenPath is required")
+	}
+	return c, nil
 }
 
 // requestTimeout resolves the effective per-request timeout: the
@@ -209,10 +284,20 @@ func (c *Client) StartDeviceAuth(ctx context.Context) (*DeviceCode, error) {
 // direct credential-harvesting vector.
 var ErrUnsafeVerificationURI = errors.New("unsafe verification_uri")
 
+// maxVerificationURILen is the largest verification_uri (raw bytes)
+// the library will accept before rejecting outright. Real production
+// device-flow URLs are well under 200 chars. Past 2048, the URL is
+// almost certainly an attempt to overflow the user's terminal so a
+// hostile suffix scrolls off-screen — a known glance-attack against
+// device flow. Spec text doesn't require this cap; it's defence-in-
+// depth on top of the control-character + userinfo checks.
+const maxVerificationURILen = 2048
+
 // validateVerificationURI rejects URIs that obviously look like
 // phishing or shell-injection attempts:
 //
 //   - Must parse as an absolute URL.
+//   - Total raw length capped at maxVerificationURILen (2048 bytes).
 //   - Scheme must be https (or http only when allowInsecureHTTP is
 //     set AND the host is loopback — production never qualifies).
 //   - Must not embed userinfo (user:password@host tricks the eye).
@@ -225,6 +310,9 @@ var ErrUnsafeVerificationURI = errors.New("unsafe verification_uri")
 func validateVerificationURI(raw string, allowInsecureHTTP bool) error {
 	if raw == "" {
 		return fmt.Errorf("%w: missing", ErrUnsafeVerificationURI)
+	}
+	if len(raw) > maxVerificationURILen {
+		return fmt.Errorf("%w: too long (%d bytes, max %d)", ErrUnsafeVerificationURI, len(raw), maxVerificationURILen)
 	}
 	for _, r := range raw {
 		if r < 0x20 || r == 0x7f {
@@ -240,6 +328,22 @@ func validateVerificationURI(raw string, allowInsecureHTTP bool) error {
 	}
 	if u.User != nil {
 		return fmt.Errorf("%w: embedded userinfo not permitted", ErrUnsafeVerificationURI)
+	}
+	// Reject non-ASCII hostnames. IDN hostnames must be Punycode-
+	// encoded (xn--...) at the wire layer; a raw-Unicode hostname is
+	// either misconfiguration or a confusable-script attack
+	// (https://аpple.com where 'а' is U+0430 Cyrillic). The library
+	// can't safely tell the two apart, and 2026-era OAuth servers
+	// don't use raw-Unicode hostnames in practice.
+	//
+	// This catches raw-Unicode homographs only. A Punycode-encoded
+	// confusable (xn--pple-43d.com → аpple.com) is pure ASCII and
+	// will pass this check; full IDN homograph defence lives in the
+	// browser's URL bar, not in an OAuth client library.
+	for _, r := range u.Hostname() {
+		if r > 0x7E {
+			return fmt.Errorf("%w: non-ASCII host (IDN hostnames must be Punycode-encoded)", ErrUnsafeVerificationURI)
+		}
 	}
 	switch u.Scheme {
 	case "https":
@@ -315,7 +419,7 @@ func (c *Client) PollDeviceAuth(ctx context.Context, deviceCode string) (*tokens
 		Scope:        raw.Scope,
 	}
 	if raw.ExpiresIn > 0 {
-		t.ExpiresAt = nowFunc().Add(time.Duration(raw.ExpiresIn) * time.Second)
+		t.ExpiresAt = c.now().Add(time.Duration(raw.ExpiresIn) * time.Second)
 	}
 	return t, nil
 }
@@ -481,7 +585,7 @@ func (c *Client) PollUntil(ctx context.Context, dc *DeviceCode) (*tokens.TokenSe
 
 	interval := pollInterval(dc)
 	expiresInSecs, defaulted := pollExpiresIn(dc)
-	deadline := nowFunc().Add(time.Duration(expiresInSecs) * time.Second)
+	deadline := c.now().Add(time.Duration(expiresInSecs) * time.Second)
 
 	for {
 		ts, err := c.PollDeviceAuth(ctx, dc.DeviceCode)
@@ -499,7 +603,7 @@ func (c *Client) PollUntil(ctx context.Context, dc *DeviceCode) (*tokens.TokenSe
 			return nil, err
 		}
 
-		if !nowFunc().Before(deadline) {
+		if !c.now().Before(deadline) {
 			if defaulted {
 				return nil, fmt.Errorf("PollUntil: default expiry (%ds) reached; AS omitted expires_in", expiresInSecs)
 			}
