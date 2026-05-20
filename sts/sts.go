@@ -8,12 +8,9 @@
 package sts
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net/http"
 	"net/url"
 	"strings"
@@ -323,27 +320,13 @@ func resolveURL(baseURL, path string, allowInsecureHTTP bool) (string, error) {
 	return oauthhttp.ResolveURL(baseURL, path, allowInsecureHTTP) //nolint:wrapcheck // pass through with sentinel-preserving semantics
 }
 
-type errorResponse struct {
-	Error            string `json:"error"`
-	ErrorDescription string `json:"error_description"`
-}
-
-// sanitizeDescription is a thin alias kept for in-package readability.
-// The implementation lives in internal/oauthhttp.
-func sanitizeDescription(s string) string { return oauthhttp.SanitizeDescription(s) }
-
 func readAPIError(resp *http.Response) error {
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, oauthhttp.MaxResponseBytes)) //nolint:errcheck // best-effort body read for error message
-	var apiErr errorResponse
-	if err := json.Unmarshal(bytes.TrimSpace(body), &apiErr); err == nil && apiErr.Error != "" {
-		if desc := sanitizeDescription(apiErr.ErrorDescription); desc != "" {
-			return fmt.Errorf("token exchange: status %d: %s: %s", resp.StatusCode, apiErr.Error, desc)
-		}
-		return fmt.Errorf("token exchange: status %d: %s", resp.StatusCode, apiErr.Error)
+	apiErr, parseErr := oauthhttp.ReadOAuthError(resp)
+	if parseErr != nil {
+		return fmt.Errorf("token exchange: %w", parseErr)
 	}
-	text := strings.TrimSpace(string(body))
-	if text != "" {
-		return fmt.Errorf("token exchange: status %d: %s", resp.StatusCode, text)
+	if desc := oauthhttp.SanitizeDescription(apiErr.ErrorDescription); desc != "" {
+		return fmt.Errorf("token exchange: status %d: %s: %s", resp.StatusCode, apiErr.Error, desc)
 	}
-	return fmt.Errorf("token exchange: status %d", resp.StatusCode)
+	return fmt.Errorf("token exchange: status %d: %s", resp.StatusCode, apiErr.Error)
 }

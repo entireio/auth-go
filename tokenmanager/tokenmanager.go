@@ -25,6 +25,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/entireio/auth-go/internal/oauthhttp"
 	"github.com/entireio/auth-go/sts"
 	"github.com/entireio/auth-go/tokens"
 	"github.com/entireio/auth-go/tokenstore"
@@ -80,6 +81,12 @@ type Config struct {
 	// RequestedTokenType is the default RFC 8693 requested_token_type
 	// URI. Empty → DefaultRequestedTokenType.
 	RequestedTokenType string
+
+	// SubjectTokenType is the RFC 8693 subject_token_type sent on
+	// exchanges. Empty → sts.SubjectTokenTypeAccessToken, because the
+	// stored core token is an OAuth access token even when its wire format
+	// happens to be JWT.
+	SubjectTokenType string
 
 	// Scope is the default scope sent on exchanges. Empty → omitted.
 	Scope string
@@ -164,9 +171,12 @@ func New(cfg Config) (*Manager, error) {
 	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
 		return nil, fmt.Errorf("Config.Issuer must be an absolute URL with scheme and host, got %q", cfg.Issuer)
 	}
-	cfg.Issuer = normalizeOriginURL(cfg.Issuer)
+	cfg.Issuer = oauthhttp.NormalizeOriginURL(cfg.Issuer)
 	if cfg.RequestedTokenType == "" {
 		cfg.RequestedTokenType = DefaultRequestedTokenType
+	}
+	if cfg.SubjectTokenType == "" {
+		cfg.SubjectTokenType = sts.SubjectTokenTypeAccessToken
 	}
 	return &Manager{cfg: cfg, cache: map[cacheKey]cachedToken{}}, nil
 }
@@ -280,6 +290,10 @@ func (m *Manager) Token(ctx context.Context, req TokenRequest) (string, error) {
 	if strings.TrimSpace(req.Resource) == "" {
 		return "", errors.New("TokenRequest.Resource is required")
 	}
+	normResource, err := oauthhttp.ValidateOriginURL(req.Resource, m.cfg.AllowInsecureHTTP, "TokenRequest.Resource")
+	if err != nil {
+		return "", err
+	}
 
 	core, err := m.LookupCoreToken()
 	if err != nil {
@@ -297,8 +311,6 @@ func (m *Manager) Token(ctx context.Context, req TokenRequest) (string, error) {
 		return "", ErrNotLoggedIn
 	}
 
-	normResource := normalizeOriginURL(req.Resource)
-
 	// m.cfg.Issuer was normalized at New() time, so no re-normalize here.
 	if req.Audience == "" && m.cfg.Issuer == normResource {
 		return core, nil
@@ -308,6 +320,7 @@ func (m *Manager) Token(ctx context.Context, req TokenRequest) (string, error) {
 	}
 
 	resolved := m.resolve(req)
+	resolved.Resource = normResource
 	key := makeCacheKey(core, resolved, normResource)
 	if hit, ok := m.cacheLookup(key); ok {
 		return hit, nil
@@ -366,57 +379,20 @@ func coreTokenExpired(coreJWT string, now time.Time) bool {
 }
 
 // coreTokenAudienceIncludes reports whether the core JWT's `aud` claim
-// covers target. target is expected to already be in normalised form
-// (see normalizeOriginURL); aud entries are normalised here so a
-// trailing-slash / case difference between the AS and the caller
-// doesn't force a needless STS exchange.
+// covers target. target is expected to already be in normalised form;
+// aud entries are normalised here so a trailing-slash / case difference
+// between the AS and the caller doesn't force a needless STS exchange.
 func coreTokenAudienceIncludes(coreJWT, target string) bool {
 	claims, err := tokens.ParseClaims(coreJWT)
 	if err != nil {
 		return false
 	}
 	for _, aud := range claims.Audience {
-		if normalizeOriginURL(aud) == target {
+		if oauthhttp.NormalizeOriginURL(aud) == target {
 			return true
 		}
 	}
 	return false
-}
-
-// normalizeOriginURL canonicalises an origin URL for equality
-// comparisons. RFC 3986 §6.2.2.1 makes scheme and host case-insensitive
-// and §6.2.3 makes the empty path equivalent to "/" — we collapse to
-// no-trailing-slash. Default ports (80/http, 443/https) are stripped.
-//
-// On parse failure (or when the input lacks a scheme or host — common
-// for non-URL audiences) the input is returned unchanged so callers
-// fall back to byte-exact comparison.
-func normalizeOriginURL(raw string) string {
-	u, err := url.Parse(raw)
-	if err != nil || u.Scheme == "" || u.Host == "" {
-		return raw
-	}
-	u.Scheme = strings.ToLower(u.Scheme)
-
-	hostname := strings.ToLower(u.Hostname())
-	port := u.Port()
-	dropPort := (u.Scheme == "http" && port == "80") ||
-		(u.Scheme == "https" && port == "443") ||
-		port == ""
-
-	switch {
-	case dropPort && strings.Contains(hostname, ":"): // IPv6 without port
-		u.Host = "[" + hostname + "]"
-	case dropPort:
-		u.Host = hostname
-	case strings.Contains(hostname, ":"): // IPv6 with non-default port
-		u.Host = "[" + hostname + "]:" + port
-	default:
-		u.Host = hostname + ":" + port
-	}
-
-	u.Path = strings.TrimRight(u.Path, "/")
-	return u.String()
 }
 
 // maxCachedTokenLifetime bounds entries with an unknown wire-side
@@ -468,7 +444,7 @@ type cacheKey struct {
 // makeCacheKey builds a cacheKey from the (resolved) request. Includes
 // every wire-affecting field so different combinations don't shadow
 // each other. normalizedResource is the caller-supplied Resource after
-// passing through normalizeOriginURL, so https://api.example.com and
+// normalisation, so https://api.example.com and
 // https://api.example.com/ share a single cache entry.
 func makeCacheKey(coreToken string, req TokenRequest, normalizedResource string) cacheKey {
 	return cacheKey{
@@ -509,7 +485,7 @@ func (m *Manager) cacheStore(key cacheKey, t *tokens.TokenSet) {
 func (m *Manager) runExchange(ctx context.Context, coreToken string, req TokenRequest) (*tokens.TokenSet, error) {
 	stsReq := sts.ExchangeRequest{
 		SubjectToken:       coreToken,
-		SubjectTokenType:   sts.SubjectTokenTypeJWT,
+		SubjectTokenType:   m.cfg.SubjectTokenType,
 		RequestedTokenType: req.RequestedTokenType,
 		Audience:           req.Audience,
 		Resource:           req.Resource,

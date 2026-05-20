@@ -363,6 +363,9 @@ func TestToken_ExchangesAndCaches(t *testing.T) {
 	if lastReq.Audience != "" {
 		t.Errorf("Audience = %q, want empty", lastReq.Audience)
 	}
+	if lastReq.SubjectTokenType != sts.SubjectTokenTypeAccessToken {
+		t.Errorf("SubjectTokenType = %q, want %q", lastReq.SubjectTokenType, sts.SubjectTokenTypeAccessToken)
+	}
 	if got := lastReq.Extra.Get("client_id"); got != testClientID {
 		t.Errorf("client_id = %q", got)
 	}
@@ -380,12 +383,12 @@ func TestToken_ExchangeIncludesResource(t *testing.T) {
 		return &tokens.TokenSet{AccessToken: testExchangedTok}, nil
 	})
 
-	if _, err := m.TokenForResource(context.Background(), testResource); err != nil {
+	if _, err := m.TokenForResource(context.Background(), testResource+"/"); err != nil {
 		t.Fatalf("TokenForResource: %v", err)
 	}
 
 	if got.Resource != testResource {
-		t.Fatalf("exchange Resource = %q, want %q", got.Resource, testResource)
+		t.Fatalf("exchange Resource = %q, want normalised %q", got.Resource, testResource)
 	}
 }
 
@@ -497,6 +500,44 @@ func TestToken_RequiresResource(t *testing.T) {
 	_, err := m.Token(context.Background(), TokenRequest{})
 	if err == nil {
 		t.Fatal("expected error for empty Resource")
+	}
+}
+
+func TestToken_RejectsNonOriginResource(t *testing.T) {
+	t.Parallel()
+	core := makeJWTWithAudience(t, []string{testIssuer})
+	store := newMemStore()
+	store.data[testIssuer] = tokens.TokenSet{AccessToken: core}
+	m := newTestManager(t, store, nil)
+
+	cases := []string{
+		"api.example.com",
+		"http://api.example.com",
+		"https://user:pass@api.example.com",
+		"https://api.example.com/path",
+		"https://api.example.com?x=1",
+		"https://api.example.com#frag",
+	}
+	for _, resource := range cases {
+		resource := resource
+		t.Run(resource, func(t *testing.T) {
+			t.Parallel()
+			if _, err := m.TokenForResource(context.Background(), resource); err == nil {
+				t.Fatal("expected error")
+			}
+		})
+	}
+}
+
+func TestToken_ValidatesResourceBeforeLoginLookup(t *testing.T) {
+	t.Parallel()
+	m := newTestManager(t, newMemStore(), nil)
+	_, err := m.TokenForResource(context.Background(), "not-a-url")
+	if err == nil || !strings.Contains(err.Error(), "TokenRequest.Resource") {
+		t.Fatalf("err = %v, want resource validation error", err)
+	}
+	if errors.Is(err, ErrNotLoggedIn) {
+		t.Fatalf("err = %v, should validate resource before login state", err)
 	}
 }
 
@@ -845,39 +886,6 @@ func TestSaveCoreToken_ClearsExchangeCache(t *testing.T) {
 	}
 	if calls != 2 {
 		t.Fatalf("exchange calls after save = %d, want 2 (cache must be cleared on save)", calls)
-	}
-}
-
-// TestNormalizeOriginURL covers the cases where same-host / aud-shortcut
-// equality has historically misfired: trailing slash, scheme/host case,
-// default-port presence. Inputs that don't parse as origin URLs must
-// pass through unchanged so non-URL audiences keep byte-exact compare.
-func TestNormalizeOriginURL(t *testing.T) {
-	t.Parallel()
-	cases := []struct {
-		name string
-		in   string
-		want string
-	}{
-		{"empty", "", ""},
-		{"plain", "https://api.example.com", "https://api.example.com"},
-		{"trailing slash", "https://api.example.com/", "https://api.example.com"},
-		{"upper scheme", "HTTPS://api.example.com", "https://api.example.com"},
-		{"upper host", "https://API.Example.COM", "https://api.example.com"},
-		{"default https port", "https://api.example.com:443", "https://api.example.com"},
-		{"default http port", "http://api.example.com:80/", "http://api.example.com"},
-		{"non-default port preserved", "https://api.example.com:8443", "https://api.example.com:8443"},
-		{"path preserved (sans trailing slash)", "https://api.example.com/v2/", "https://api.example.com/v2"},
-		{"non-URL audience passes through", "urn:example:cli", "urn:example:cli"},
-		{"bare string passes through", "some-audience", "some-audience"},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			t.Parallel()
-			if got := normalizeOriginURL(tc.in); got != tc.want {
-				t.Errorf("normalizeOriginURL(%q) = %q, want %q", tc.in, got, tc.want)
-			}
-		})
 	}
 }
 

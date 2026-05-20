@@ -29,6 +29,12 @@ var ErrNonJSONResponse = errors.New(
 		"response (check VPN, proxy, or firewall — e.g. Cloudflare WARP)",
 )
 
+// ErrResponseTooLarge is returned when an OAuth endpoint returns a
+// response body larger than MaxResponseBytes. The helpers read one byte
+// past the cap so callers get an explicit error instead of silently
+// parsing a truncated response.
+var ErrResponseTooLarge = errors.New("OAuth response body exceeds maximum size")
+
 // ReadAndDecodeJSON reads up to MaxResponseBytes from r and decodes
 // the body as JSON into dest. When strict is true, unknown fields are
 // rejected.
@@ -37,7 +43,7 @@ var ErrNonJSONResponse = errors.New(
 // portal / proxy-interceptor case. Other read or decode failures are
 // wrapped with context.
 func ReadAndDecodeJSON(r io.Reader, dest any, strict bool) error {
-	body, err := io.ReadAll(io.LimitReader(r, MaxResponseBytes))
+	body, err := readLimitedBody(r)
 	if err != nil {
 		return fmt.Errorf("read JSON response: %w", err)
 	}
@@ -51,6 +57,13 @@ func ReadAndDecodeJSON(r io.Reader, dest any, strict bool) error {
 	}
 	if err := dec.Decode(dest); err != nil {
 		return fmt.Errorf("decode JSON response: %w", err)
+	}
+	var trailing any
+	if err := dec.Decode(&trailing); err != io.EOF {
+		if err == nil {
+			return errors.New("decode JSON response: trailing data after JSON value")
+		}
+		return fmt.Errorf("decode JSON response after first JSON value: %w", err)
 	}
 	return nil
 }

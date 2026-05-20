@@ -227,7 +227,7 @@ func TestExchange_ServerErrorWithoutJSON(t *testing.T) {
 
 	c := newTestClient(t, func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusInternalServerError)
-		writeBody(t, w, `something broke`)
+		writeBody(t, w, "something\x00 broke")
 	})
 
 	_, err := c.Exchange(context.Background(), ExchangeRequest{
@@ -236,7 +236,10 @@ func TestExchange_ServerErrorWithoutJSON(t *testing.T) {
 		RequestedTokenType: "urn:example:t",
 	})
 	if err == nil || !strings.Contains(err.Error(), "500") || !strings.Contains(err.Error(), "something broke") {
-		t.Fatalf("error = %v, want status + body text", err)
+		t.Fatalf("error = %v, want status + sanitised body text", err)
+	}
+	if strings.ContainsRune(err.Error(), '\x00') {
+		t.Fatalf("error = %q, contains unsanitised NUL", err.Error())
 	}
 }
 
