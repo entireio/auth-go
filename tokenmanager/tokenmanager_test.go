@@ -529,6 +529,18 @@ func TestToken_RejectsNonOriginResource(t *testing.T) {
 	}
 }
 
+func TestToken_ValidatesResourceBeforeLoginLookup(t *testing.T) {
+	t.Parallel()
+	m := newTestManager(t, newMemStore(), nil)
+	_, err := m.TokenForResource(context.Background(), "not-a-url")
+	if err == nil || !strings.Contains(err.Error(), "TokenRequest.Resource") {
+		t.Fatalf("err = %v, want resource validation error", err)
+	}
+	if errors.Is(err, ErrNotLoggedIn) {
+		t.Fatalf("err = %v, should validate resource before login state", err)
+	}
+}
+
 func TestToken_ExchangeFailureSurfaces(t *testing.T) {
 	t.Parallel()
 	core := makeJWTWithAudience(t, []string{testIssuer})

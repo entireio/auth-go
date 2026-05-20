@@ -277,6 +277,10 @@ func (m *Manager) Token(ctx context.Context, req TokenRequest) (string, error) {
 	if strings.TrimSpace(req.Resource) == "" {
 		return "", errors.New("TokenRequest.Resource is required")
 	}
+	normResource, err := oauthhttp.ValidateOriginURL(req.Resource, m.cfg.AllowInsecureHTTP, "TokenRequest.Resource")
+	if err != nil {
+		return "", err
+	}
 
 	core, err := m.LookupCoreToken()
 	if err != nil {
@@ -294,11 +298,6 @@ func (m *Manager) Token(ctx context.Context, req TokenRequest) (string, error) {
 		return "", ErrNotLoggedIn
 	}
 
-	normResource, err := oauthhttp.ValidateOriginURL(req.Resource, m.cfg.AllowInsecureHTTP, "TokenRequest.Resource")
-	if err != nil {
-		return "", err
-	}
-
 	// m.cfg.Issuer was normalized at New() time, so no re-normalize here.
 	if req.Audience == "" && m.cfg.Issuer == normResource {
 		return core, nil
@@ -308,6 +307,7 @@ func (m *Manager) Token(ctx context.Context, req TokenRequest) (string, error) {
 	}
 
 	resolved := m.resolve(req)
+	resolved.Resource = normResource
 	key := makeCacheKey(core, resolved, normResource)
 	if hit, ok := m.cacheLookup(key); ok {
 		return hit, nil
@@ -448,7 +448,7 @@ func (m *Manager) runExchange(ctx context.Context, coreToken string, req TokenRe
 		SubjectTokenType:   m.cfg.SubjectTokenType,
 		RequestedTokenType: req.RequestedTokenType,
 		Audience:           req.Audience,
-		Resource:           oauthhttp.NormalizeOriginURL(req.Resource),
+		Resource:           req.Resource,
 		Scope:              req.Scope,
 		// Public-client identification per RFC 6749 §2.3.1 / §3.2.1.
 		// Carried via Extra because the sts package is provider-agnostic.
