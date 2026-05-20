@@ -37,6 +37,7 @@ Defense-in-depth checks layered on top of server-side validation:
 ```go
 import (
     "github.com/entireio/auth-go/deviceflow"
+    "github.com/entireio/auth-go/sts"
     "github.com/entireio/auth-go/tokenmanager"
     "github.com/entireio/auth-go/tokenstore"
 )
@@ -55,6 +56,9 @@ mgr, err := tokenmanager.New(tokenmanager.Config{
     STSPath:  "/oauth/token",  // RFC 8693 endpoint; usually the OAuth token endpoint
     Store:    store,
     Scope:    "cli",
+    // Optional: defaults to sts.SubjectTokenTypeAccessToken. If your STS
+    // requires the structural JWT URN instead, uncomment:
+    // SubjectTokenType: sts.SubjectTokenTypeJWT,
 })
 if err != nil { /* misconfiguration */ }
 ```
@@ -114,6 +118,8 @@ The manager picks the right strategy automatically:
 - JWT-`aud`-includes shortcut: same, when the core token's audience already covers the resource (e.g. multi-audience tokens).
 - Otherwise: runs an RFC 8693 exchange against `Issuer + STSPath`, caches the exchanged token by `(core, resource, audience, requested_token_type, scope)` until expiry.
 
+By default, `tokenmanager` sends `subject_token_type=urn:ietf:params:oauth:token-type:access_token` for the stored core bearer. This is the role-based RFC 8693 token type and works for STS endpoints that treat the device-flow result as an OAuth access token even when its wire format is JWT. If your STS requires the structural JWT token type, configure `SubjectTokenType: sts.SubjectTokenTypeJWT`.
+
 ### Logout
 
 ```go
@@ -128,15 +134,16 @@ Deletes the keyring entry first; only clears the in-memory exchange cache on suc
 - **Provider-agnostic.** `deviceflow.Client` and `sts.Client` are field-bag structs; neither knows about your provider's endpoint paths or token-type URIs. Pass them in.
 - **Bearer-presenter, not bearer-validator.** This library is for CLIs that *receive* tokens from an auth server and *present* them to a resource server. JWT signature verification is intentionally not done — the resource server validates. `tokens.ParseClaims` is documented as unverified and used only for routing decisions.
 - **Per-CLI keyring isolation.** Each CLI passes a unique service name to `tokenstore.NewKeyring`. OS keyrings key by `(service, account)`, so consumers naturally get separate credential stores.
-- **Caller controls the wire shape.** Default values (RFC 8693 `requested_token_type`, `scope`, audience-empty) live in the embedding CLI's wiring, not in this library.
+- **Caller controls the wire shape.** Default values for RFC 8693 fields are explicit and overridable. `tokenmanager` defaults `requested_token_type` to the standard access-token URN and `subject_token_type` to `access_token`; callers can set `RequestedTokenType`, `SubjectTokenType`, `scope`, audience, resource, and package-specific `Extra` fields as needed.
 
 ## Embedding checklist
 
 1. Pick a stable service name for `tokenstore.NewKeyring(...)`. **Don't change it later** — renaming orphans every existing user's stored credentials.
 2. Pick a `client_id` that the auth server recognises.
 3. Decide your `STSPath`: typically the OAuth token endpoint per RFC 8693 convention, or a dedicated path if your auth server exposes one.
-4. Construct the `tokenmanager.Manager` once at startup; pass it to your data-API call sites.
-5. For multi-environment users (regions, staging), key the keyring by issuer URL — `Manager.Issuer()` returns the configured value.
+4. Decide whether the STS expects `subject_token_type=access_token` (the `tokenmanager` default) or `jwt` (`SubjectTokenType: sts.SubjectTokenTypeJWT`).
+5. Construct the `tokenmanager.Manager` once at startup; pass it to your data-API call sites.
+6. For multi-environment users (regions, staging), key the keyring by issuer URL — `Manager.Issuer()` returns the configured value.
 
 ## Security
 
