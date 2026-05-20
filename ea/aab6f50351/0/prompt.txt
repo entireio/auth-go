@@ -1,0 +1,75 @@
+ok, do 1+2 next
+
+---
+
+on 3: I guess we need to check what the other side expects to figure out if this is safe to change?
+
+---
+
+na, let's give it a try
+
+---
+
+let's do that
+
+---
+
+anything left
+
+---
+
+yeah let's do 1
+
+---
+
+can you open a pr for me?
+
+---
+
+Issues / concerns
+
+  1. Two behavioural breaks need a CHANGELOG entry (PR body waves at them but doesn't enumerate):
+    - SubjectTokenType default flipped from urn:…:jwt to urn:…:access_token (tokenmanager.go:176-178, runExchange at :448). Any embedder whose STS requires the
+   JWT URN was working before and will break silently with invalid_request or unsupported_token_type after upgrading. The README mentions the override but
+  doesn't call it out as a breaking change. Consider: bump minor + clear release notes, or keep the previous default and require opt-in to access_token.
+    - Non-URL Resource values are rejected. Previously urn:example:cli flowed through normalizeOriginURL byte-exact (existing comment: "non-URL audiences keep
+  byte-exact compare"). ValidateOriginURL now hard-errors. If you ever supported opaque audience strings via Resource, this is a break.
+  2. Validation ordering in Token is debuggability-hostile. tokenmanager.go:277 rejects empty resource immediately, but :296 validates origin shape after
+  LookupCoreToken and coreTokenExpired. A caller passing a malformed Resource while not logged in will see ErrNotLoggedIn instead of the clearer "Resource must
+   be an origin URL". Move the ValidateOriginURL call up next to the empty-string check.
+  3. Redundant normalisation in runExchange. Token already computed normResource via ValidateOriginURL (which calls NormalizeOriginURL), then runExchange
+  re-runs oauthhttp.NormalizeOriginURL(req.Resource) on the raw value (tokenmanager.go:451). They produce the same string, but you've thrown away the
+  validated/normalised value. Pass normResource through into runExchange (e.g., via resolved.Resource = normResource before the call) so the wire value comes
+  from the validated path.
+  4. Trailing-data error message is slightly misleading. In jsonresp.go:62-67, when dec.Decode(&trailing) returns a non-EOF non-nil err, that error could be a
+  JSON syntax error rather than "more data after the first value." Current wrap forces the "trailing data" label onto it. Two clean options: either keep the
+  wrap (caller-friendly) or distinguish — minor.
+  5. .entire/settings.json enables telemetry by default in a public-ish repo. {"enabled": true, "telemetry": true}. Worth confirming this is the intended
+  default for everyone who clones — easy to miss in code review and ships verbatim.
+  6. ReadOAuthError falls through silently on {"error_description":"foo"} (no error field). The OAuth spec requires error, so the fallback to text is fine —
+  but the result is that a server's structured error_description ends up rendered as fallback text (sanitised). Acceptable, just noting.
+  7. Nit: .codex/config.toml has a leading blank line. Cosmetic.
+
+---
+
+New findings on this pass
+
+  1. Loopback host check is case-sensitive (internal/oauthhttp/origin.go:11, also url.go:51, deviceflow.go:249). IsLoopbackHost("LOCALHOST") returns false, so
+  http://LOCALHOST:8080 is rejected as non-loopback even though it resolves to loopback. u.Hostname() preserves case. For an HTTPS URL that doesn't matter
+  (normalisation runs later), but for the explicit-insecure-HTTP opt-in, case-sensitivity gives a misleading error. One-line fix: strings.EqualFold(host,
+  "localhost") || host == "127.0.0.1" || host == "::1" — only localhost needs the fold; numeric forms are case-irrelevant.
+  2. ReadOAuthError has no direct test. internal/oauthhttp/ has tests for jsonresp, origin, sanitize, url — but no error_test.go. Coverage is indirect via
+  sts/sts_test.go and deviceflow/deviceflow_test.go. Two paths worth pinning directly:
+    - oversized error body returns a wrapped ErrResponseTooLarge (so errors.Is(err, oauthhttp.ErrResponseTooLarge) still works through the fmt.Errorf("status
+  %d: %w", …) wrap).
+    - JSON-shaped body with empty error falls through to sanitized text.
+  3. No test asserts the STS wire Resource is the normalised form. TestToken_CacheCollapsesURLEquivalents proves one exchange happens, but doesn't peek at
+  lastReq.Resource. With the new resolved.Resource = normResource plumbing, a small assertion that calling TokenForResource("https://api.example.com/")
+  produces lastReq.Resource == "https://api.example.com" on the wire would lock the contract in place.
+  4. Pi extension mutates event.input in tool_call (.pi/extensions/entire/index.ts:34-40). This works only if Pi reads event.input after the handler resolves —
+   a Pi API contract you can't verify from this file. Worth confirming against the Pi SDK docs, or making the assumption explicit in a comment. The
+  command.includes("GIT_TERMINAL_PROMPT=") guard also matches partial occurrences (e.g., the string appearing inside an arg), which is fine but probably
+  stricter than needed.
+  5. fireHook async error handling (same file, :14-26). The try/catch around execFile only catches synchronous throws from the call itself; failures inside the
+   spawned process never reach the catch. The callback is empty (() => resolve()), so process failures are silently swallowed — consistent with the "best
+  effort — never block" comment, but if you ever want to know that the hook is broken, this hides it.
