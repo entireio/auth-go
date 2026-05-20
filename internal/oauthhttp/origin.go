@@ -9,7 +9,7 @@ import (
 // IsLoopbackHost reports whether host is one of the loopback hostnames this
 // library permits for explicit insecure-http local development.
 func IsLoopbackHost(host string) bool {
-	return host == "localhost" || host == "127.0.0.1" || host == "::1"
+	return strings.EqualFold(host, "localhost") || host == "127.0.0.1" || host == "::1"
 }
 
 // NormalizeOriginURL canonicalises an origin URL for equality comparisons.

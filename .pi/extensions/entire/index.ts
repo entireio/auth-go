@@ -33,6 +33,8 @@ export default function (pi: ExtensionAPI) {
   // Agent-driven bash subprocesses inherit a real TTY but cannot answer
   // hook prompts. Disable git/Entire terminal prompts for bash calls so
   // Entire treats agent-driven commits as non-interactive.
+  // Pi's tool_call contract explicitly allows mutating event.input in place;
+  // those mutations affect the actual tool execution.
   pi.on("tool_call", async (event) => {
     if (event.toolName !== "bash") return;
     const input = event.input as { command?: string };
