@@ -1,0 +1,54 @@
+{
+  "cli_version": "v0.6.2-nightly.202605140709.cc178b53-dev-e69fdc302",
+  "checkpoint_id": "f1c404717fe7",
+  "session_id": "019e44d4-6ecf-7c1d-96ab-582effc13411",
+  "strategy": "manual-commit",
+  "created_at": "2026-05-20T10:35:23.516326Z",
+  "branch": "soph/more-improvements-fixes",
+  "checkpoints_count": 0,
+  "files_touched": [
+    "internal/oauthhttp/jsonresp.go",
+    "internal/oauthhttp/url.go",
+    "sts/sts.go",
+    "deviceflow/deviceflow.go",
+    "tokenmanager/tokenmanager.go",
+    "tokenmanager/tokenmanager_test.go",
+    "internal/oauthhttp/error.go",
+    "internal/oauthhttp/origin.go",
+    "internal/oauthhttp/origin_test.go"
+  ],
+  "agent": "Pi",
+  "model": "",
+  "turn_id": "7aa939a1b228",
+  "token_usage": {
+    "input_tokens": 282121,
+    "cache_creation_tokens": 0,
+    "cache_read_tokens": 5932032,
+    "output_tokens": 22519,
+    "api_call_count": 105
+  },
+  "initial_attribution": {
+    "calculated_at": "2026-05-20T10:35:23.506185Z",
+    "agent_lines": 220,
+    "agent_removed": 169,
+    "human_added": 0,
+    "human_modified": 0,
+    "human_removed": 0,
+    "total_committed": 220,
+    "total_lines_changed": 389,
+    "agent_percentage": 100,
+    "metric_version": 2
+  },
+  "prompt_attributions": [
+    {
+      "checkpoint_number": 1,
+      "user_lines_added": 12,
+      "user_lines_removed": 0,
+      "agent_lines_added": 0,
+      "agent_lines_removed": 0,
+      "user_added_per_file": {
+        ".claude/settings.local.json": 12
+      }
+    }
+  ]
+}

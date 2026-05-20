@@ -1,0 +1,33 @@
+{
+  "cli_version": "v0.6.2-nightly.202605140709.cc178b53-dev-e69fdc302",
+  "checkpoint_id": "f1c404717fe7",
+  "strategy": "manual-commit",
+  "branch": "soph/more-improvements-fixes",
+  "checkpoints_count": 0,
+  "files_touched": [
+    "deviceflow/deviceflow.go",
+    "internal/oauthhttp/error.go",
+    "internal/oauthhttp/jsonresp.go",
+    "internal/oauthhttp/origin.go",
+    "internal/oauthhttp/origin_test.go",
+    "internal/oauthhttp/url.go",
+    "sts/sts.go",
+    "tokenmanager/tokenmanager.go",
+    "tokenmanager/tokenmanager_test.go"
+  ],
+  "sessions": [
+    {
+      "metadata": "/f1/c404717fe7/0/metadata.json",
+      "transcript": "/f1/c404717fe7/0/full.jsonl",
+      "content_hash": "/f1/c404717fe7/0/content_hash.txt",
+      "prompt": "/f1/c404717fe7/0/prompt.txt"
+    }
+  ],
+  "token_usage": {
+    "input_tokens": 282121,
+    "cache_creation_tokens": 0,
+    "cache_read_tokens": 5932032,
+    "output_tokens": 22519,
+    "api_call_count": 105
+  }
+}
