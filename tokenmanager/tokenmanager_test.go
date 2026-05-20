@@ -409,12 +409,12 @@ func TestToken_ExchangeIncludesResource(t *testing.T) {
 		return &tokens.TokenSet{AccessToken: testExchangedTok}, nil
 	})
 
-	if _, err := m.TokenForResource(context.Background(), testResource); err != nil {
+	if _, err := m.TokenForResource(context.Background(), testResource+"/"); err != nil {
 		t.Fatalf("TokenForResource: %v", err)
 	}
 
 	if got.Resource != testResource {
-		t.Fatalf("exchange Resource = %q, want %q", got.Resource, testResource)
+		t.Fatalf("exchange Resource = %q, want normalised %q", got.Resource, testResource)
 	}
 }
 

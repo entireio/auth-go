@@ -62,11 +62,24 @@ func TestValidateOriginURL(t *testing.T) {
 
 func TestValidateOriginURL_AllowsLoopbackHTTPWhenExplicitlyEnabled(t *testing.T) {
 	t.Parallel()
-	got, err := ValidateOriginURL("http://127.0.0.1:8080/", true, "Resource")
-	if err != nil {
-		t.Fatalf("ValidateOriginURL(loopback): %v", err)
+	cases := []struct {
+		raw  string
+		want string
+	}{
+		{"http://127.0.0.1:8080/", "http://127.0.0.1:8080"},
+		{"http://LOCALHOST:8080/", "http://localhost:8080"},
 	}
-	if got != "http://127.0.0.1:8080" {
-		t.Fatalf("ValidateOriginURL(loopback) = %q", got)
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.raw, func(t *testing.T) {
+			t.Parallel()
+			got, err := ValidateOriginURL(tc.raw, true, "Resource")
+			if err != nil {
+				t.Fatalf("ValidateOriginURL(loopback): %v", err)
+			}
+			if got != tc.want {
+				t.Fatalf("ValidateOriginURL(loopback) = %q, want %q", got, tc.want)
+			}
+		})
 	}
 }
