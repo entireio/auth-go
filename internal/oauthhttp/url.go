@@ -48,7 +48,7 @@ func ResolveURL(baseURL, path string, allowInsecureHTTP bool) (string, error) {
 		if !allowInsecureHTTP {
 			return "", ErrInsecureBaseURL
 		}
-		if !isLoopbackHost(base.Hostname()) {
+		if !IsLoopbackHost(base.Hostname()) {
 			return "", fmt.Errorf("%w: http only permitted on loopback hosts", ErrInsecureBaseURL)
 		}
 	default:
@@ -64,8 +64,4 @@ func ResolveURL(baseURL, path string, allowInsecureHTTP bool) (string, error) {
 		return "", fmt.Errorf("%w: got %q", ErrAbsolutePath, path)
 	}
 	return base.ResolveReference(rel).String(), nil
-}
-
-func isLoopbackHost(host string) bool {
-	return host == "localhost" || host == "127.0.0.1" || host == "::1"
 }

@@ -14,10 +14,8 @@ package deviceflow
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net/http"
 	"net/url"
 	"strings"
@@ -352,8 +350,7 @@ func validateVerificationURI(raw string, allowInsecureHTTP bool) error {
 		if !allowInsecureHTTP {
 			return fmt.Errorf("%w: scheme must be https", ErrUnsafeVerificationURI)
 		}
-		host := u.Hostname()
-		if host != "localhost" && host != "127.0.0.1" && host != "::1" {
+		if !oauthhttp.IsLoopbackHost(u.Hostname()) {
 			return fmt.Errorf("%w: http only permitted on loopback hosts", ErrUnsafeVerificationURI)
 		}
 	default:
@@ -475,29 +472,6 @@ func resolveURL(baseURL, path string, allowInsecureHTTP bool) (string, error) {
 	return oauthhttp.ResolveURL(baseURL, path, allowInsecureHTTP) //nolint:wrapcheck // pass through with sentinel-preserving semantics
 }
 
-type errorResponse struct {
-	Error            string `json:"error"`
-	ErrorDescription string `json:"error_description"`
-}
-
-func readAPIErrorResponse(resp *http.Response) (*errorResponse, error) {
-	body, err := io.ReadAll(io.LimitReader(resp.Body, oauthhttp.MaxResponseBytes))
-	if err != nil {
-		return nil, fmt.Errorf("status %d", resp.StatusCode)
-	}
-
-	var apiErr errorResponse
-	if err := json.Unmarshal(body, &apiErr); err == nil && strings.TrimSpace(apiErr.Error) != "" {
-		return &apiErr, nil
-	}
-
-	text := sanitizeDescription(string(body))
-	if text != "" {
-		return nil, fmt.Errorf("status %d: %s", resp.StatusCode, text)
-	}
-	return nil, fmt.Errorf("status %d", resp.StatusCode)
-}
-
 // readAPIError surfaces an error-shaped response. It routes the AS's
 // `error` code through errCodeToSentinel so callers can errors.Is
 // regardless of which endpoint produced the failure, and appends a
@@ -505,7 +479,7 @@ func readAPIErrorResponse(resp *http.Response) (*errorResponse, error) {
 // and stripping control characters that would otherwise let a hostile
 // AS write ANSI escapes / overflow into the user's terminal.
 func readAPIError(resp *http.Response, action string) error {
-	apiErr, parseErr := readAPIErrorResponse(resp)
+	apiErr, parseErr := oauthhttp.ReadOAuthError(resp)
 	if parseErr != nil {
 		return fmt.Errorf("%s: %w", action, parseErr)
 	}
