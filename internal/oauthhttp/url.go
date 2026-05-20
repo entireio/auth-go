@@ -38,12 +38,18 @@ func ResolveURL(baseURL, path string, allowInsecureHTTP bool) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("parse base URL: %w", err)
 	}
+	if base.Host == "" {
+		return "", errors.New("base URL must include a host")
+	}
 	switch base.Scheme {
 	case "https":
 		// fine
 	case "http":
 		if !allowInsecureHTTP {
 			return "", ErrInsecureBaseURL
+		}
+		if !isLoopbackHost(base.Hostname()) {
+			return "", fmt.Errorf("%w: http only permitted on loopback hosts", ErrInsecureBaseURL)
 		}
 	default:
 		return "", fmt.Errorf("unsupported base URL scheme %q (must be http or https)", base.Scheme)
@@ -58,4 +64,8 @@ func ResolveURL(baseURL, path string, allowInsecureHTTP bool) (string, error) {
 		return "", fmt.Errorf("%w: got %q", ErrAbsolutePath, path)
 	}
 	return base.ResolveReference(rel).String(), nil
+}
+
+func isLoopbackHost(host string) bool {
+	return host == "localhost" || host == "127.0.0.1" || host == "::1"
 }

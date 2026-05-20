@@ -389,6 +389,9 @@ func TestToken_ExchangesAndCaches(t *testing.T) {
 	if lastReq.ClientID != testClientID {
 		t.Errorf("ClientID = %q, want %q", lastReq.ClientID, testClientID)
 	}
+	if lastReq.SubjectTokenType != sts.SubjectTokenTypeAccessToken {
+		t.Errorf("SubjectTokenType = %q, want %q", lastReq.SubjectTokenType, sts.SubjectTokenTypeAccessToken)
+	}
 	if got := lastReq.Extra.Get("client_id"); got != testClientID {
 		t.Errorf("form client_id = %q", got)
 	}
@@ -523,6 +526,32 @@ func TestToken_RequiresResource(t *testing.T) {
 	_, err := m.Token(context.Background(), TokenRequest{})
 	if err == nil {
 		t.Fatal("expected error for empty Resource")
+	}
+}
+
+func TestToken_RejectsNonOriginResource(t *testing.T) {
+	t.Parallel()
+	core := makeJWTWithAudience(t, []string{testIssuer})
+	store := newMemStore()
+	store.data[testIssuer] = tokens.TokenSet{AccessToken: core}
+	m := newTestManager(t, store, nil)
+
+	cases := []string{
+		"api.example.com",
+		"http://api.example.com",
+		"https://user:pass@api.example.com",
+		"https://api.example.com/path",
+		"https://api.example.com?x=1",
+		"https://api.example.com#frag",
+	}
+	for _, resource := range cases {
+		resource := resource
+		t.Run(resource, func(t *testing.T) {
+			t.Parallel()
+			if _, err := m.TokenForResource(context.Background(), resource); err == nil {
+				t.Fatal("expected error")
+			}
+		})
 	}
 }
 

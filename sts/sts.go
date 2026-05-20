@@ -446,7 +446,7 @@ func readAPIError(resp *http.Response) error {
 		}
 		return fmt.Errorf("token exchange: status %d: %s", resp.StatusCode, apiErr.Error)
 	}
-	text := strings.TrimSpace(string(body))
+	text := sanitizeDescription(string(body))
 	if text != "" {
 		return fmt.Errorf("token exchange: status %d: %s", resp.StatusCode, text)
 	}
