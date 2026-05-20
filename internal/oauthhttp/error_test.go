@@ -25,15 +25,15 @@ func TestReadOAuthError_EmptyErrorFallsBackToSanitizedText(t *testing.T) {
 	t.Parallel()
 	resp := &http.Response{
 		StatusCode: http.StatusBadRequest,
-		Body:       io.NopCloser(strings.NewReader("{\"error\":\"\",\"error_description\":\"bad\u001b[31m news\"}")),
+		Body:       io.NopCloser(strings.NewReader(`{"error":"","error_description":"bad\u001b[31m news"}`)),
 	}
 
 	apiErr, err := ReadOAuthError(resp)
 	if apiErr != nil {
 		t.Fatalf("apiErr = %+v, want nil", apiErr)
 	}
-	if err == nil || !strings.Contains(err.Error(), "bad[31m news") {
-		t.Fatalf("err = %v, want sanitized fallback text", err)
+	if err == nil || err.Error() != "status 400: bad[31m news" {
+		t.Fatalf("err = %v, want sanitized description-only fallback text", err)
 	}
 	if strings.ContainsRune(err.Error(), '\u001b') {
 		t.Fatalf("err = %q, contains unsanitized escape", err.Error())
