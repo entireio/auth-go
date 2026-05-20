@@ -1,0 +1,6 @@
+#!/bin/sh
+#MISE description="Run govulncheck"
+
+set -eu
+
+govulncheck ./...

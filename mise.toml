@@ -1,0 +1,21 @@
+[tools]
+# Keep this aligned with go.mod.
+go = '1.26.3'
+golangci-lint = '2.12.2'
+"go:golang.org/x/vuln/cmd/govulncheck" = 'latest'
+
+[tasks.fmt]
+description = "Run gofmt"
+run = "gofmt -s -w ."
+
+[tasks.test]
+description = "Run tests"
+run = "go test ./..."
+
+[tasks."test:ci"]
+description = "Run CI tests with the race detector"
+run = "go test -race -coverprofile=coverage.out ./..."
+
+[tasks.check]
+description = "Run formatting, linting, vulnerability checks, and CI tests"
+depends = ["fmt", "lint", "test:ci"]
