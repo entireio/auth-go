@@ -1,0 +1,21 @@
+ok, do 1+2 next
+
+---
+
+on 3: I guess we need to check what the other side expects to figure out if this is safe to change?
+
+---
+
+na, let's give it a try
+
+---
+
+let's do that
+
+---
+
+anything left
+
+---
+
+yeah let's do 1
