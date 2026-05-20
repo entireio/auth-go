@@ -72,7 +72,7 @@ func ValidateOriginURL(raw string, allowInsecureHTTP bool, field string) (string
 	if u.RawQuery != "" || u.Fragment != "" {
 		return "", fmt.Errorf("%s must be an origin URL without query or fragment", field)
 	}
-	if strings.Trim(u.Path, "/") != "" {
+	if u.Path != "" && u.Path != "/" {
 		return "", fmt.Errorf("%s must be an origin URL without a path", field)
 	}
 	return NormalizeOriginURL(raw), nil
