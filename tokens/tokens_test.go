@@ -224,7 +224,6 @@ func TestParseClaims_RejectsUnsignedJWT(t *testing.T) {
 		{"none lowercase", `{"alg":"none","typ":"JWT"}`},
 		{"None capitalised", `{"alg":"None","typ":"JWT"}`},
 		{"NONE uppercase", `{"alg":"NONE","typ":"JWT"}`},
-		{"none with whitespace", `{"alg":"  none  ","typ":"JWT"}`},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -237,6 +236,44 @@ func TestParseClaims_RejectsUnsignedJWT(t *testing.T) {
 			_, err := ParseClaims(jwt)
 			if !errors.Is(err, ErrUnsignedJWT) {
 				t.Fatalf("ParseClaims(alg:%q) error = %v, want ErrUnsignedJWT", tc.header, err)
+			}
+		})
+	}
+}
+
+// TestParseClaims_RejectsAlgBypassAttempts pins the
+// non-alphanumeric-alg defence. A hostile AS that pads "none" with
+// invisible characters (zero-width space, BOM, regular whitespace,
+// non-breaking space, …) must still be rejected, not slipped past
+// the case-fold check. The error here is ErrMalformedJWT rather than
+// ErrUnsignedJWT because the alg value is structurally invalid per
+// RFC 7515 §4.1.1 — the JWS algorithm registry doesn't permit any
+// non-alphanumeric characters.
+func TestParseClaims_RejectsAlgBypassAttempts(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name   string
+		header string
+	}{
+		{"trailing zero-width space", "{\"alg\":\"none\u200B\",\"typ\":\"JWT\"}"},
+		{"leading zero-width space", "{\"alg\":\"\u200Bnone\",\"typ\":\"JWT\"}"},
+		{"BOM padding", "{\"alg\":\"\uFEFFnone\",\"typ\":\"JWT\"}"},
+		{"non-breaking space", "{\"alg\":\"\u00A0none\u00A0\",\"typ\":\"JWT\"}"},
+		{"regular whitespace", `{"alg":"  none  ","typ":"JWT"}`},
+		{"escaped tab in alg", `{"alg":"none\t","typ":"JWT"}`},
+		{"space in middle of alg", `{"alg":"HS 256","typ":"JWT"}`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			jwt := makeJWTWithHeader(t, tc.header, map[string]any{
+				"iss": "https://attacker.example.com",
+				"sub": "account:not-real",
+			})
+			_, err := ParseClaims(jwt)
+			if !errors.Is(err, ErrMalformedJWT) {
+				t.Fatalf("ParseClaims(alg=%q) error = %v, want ErrMalformedJWT", tc.header, err)
 			}
 		})
 	}

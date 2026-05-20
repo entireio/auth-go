@@ -86,10 +86,12 @@ func newTestManager(t *testing.T, store tokenstore.Store, exchange func(context.
 		ClientID: testClientID,
 		STSPath:  testSTSPath,
 		Store:    store,
-		Exchange: exchange,
 	})
 	if err != nil {
 		t.Fatalf("New: %v", err)
+	}
+	if exchange != nil {
+		SetExchangeForTest(t, m, exchange)
 	}
 	return m
 }
@@ -111,6 +113,73 @@ func TestNew_RequiresFields(t *testing.T) {
 				t.Fatal("expected error")
 			}
 		})
+	}
+}
+
+// TestNew_RejectsRelativeIssuer pins that an Issuer without scheme or
+// host is rejected at construction time. Without this, a misconfigured
+// caller's Store profile-key writes go somewhere unpredictable.
+func TestNew_RejectsRelativeIssuer(t *testing.T) {
+	t.Parallel()
+	cases := []string{
+		"auth.example.com",     // no scheme
+		"https:///oauth/token", // no host
+		"://broken",            // invalid scheme syntax
+	}
+	for _, iss := range cases {
+		t.Run(iss, func(t *testing.T) {
+			t.Parallel()
+			_, err := New(Config{
+				Issuer:   iss,
+				ClientID: testClientID,
+				STSPath:  testSTSPath,
+				Store:    newMemStore(),
+			})
+			if err == nil {
+				t.Fatalf("New(Issuer=%q) returned nil error, want absolute-URL error", iss)
+			}
+		})
+	}
+}
+
+// TestNew_NormalizesIssuer pins the keyring/shortcut symmetry. Two
+// Managers configured with cosmetically-different but equivalent
+// issuers must share state — otherwise SaveCoreToken writes to one
+// profile key while Token's same-host shortcut compares against
+// another, and a session-save from one Manager doesn't show up in the
+// other.
+func TestNew_NormalizesIssuer(t *testing.T) {
+	t.Parallel()
+	store := newMemStore()
+
+	withTrailing, err := New(Config{
+		Issuer:   "https://Auth.Example.com/",
+		ClientID: testClientID,
+		STSPath:  testSTSPath,
+		Store:    store,
+	})
+	if err != nil {
+		t.Fatalf("New(trailing slash + uppercase): %v", err)
+	}
+	if err := withTrailing.SaveCoreToken("core-tok"); err != nil {
+		t.Fatalf("SaveCoreToken: %v", err)
+	}
+
+	withoutTrailing, err := New(Config{
+		Issuer:   "https://auth.example.com",
+		ClientID: testClientID,
+		STSPath:  testSTSPath,
+		Store:    store,
+	})
+	if err != nil {
+		t.Fatalf("New(canonical): %v", err)
+	}
+	got, err := withoutTrailing.LookupCoreToken()
+	if err != nil {
+		t.Fatalf("LookupCoreToken: %v", err)
+	}
+	if got != "core-tok" {
+		t.Fatalf("LookupCoreToken from cosmetically-different issuer = %q, want %q", got, "core-tok")
 	}
 }
 
@@ -180,14 +249,14 @@ func TestToken_SameHostShortcut(t *testing.T) {
 
 	m, err := New(Config{
 		Issuer: testIssuer, ClientID: testClientID, STSPath: testSTSPath, Store: store,
-		Exchange: func(_ context.Context, _ sts.ExchangeRequest) (*tokens.TokenSet, error) {
-			t.Fatal("exchange must not run when issuer == resource")
-			return nil, errors.New("unreachable")
-		},
 	})
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
+	SetExchangeForTest(t, m, func(_ context.Context, _ sts.ExchangeRequest) (*tokens.TokenSet, error) {
+		t.Fatal("exchange must not run when issuer == resource")
+		return nil, errors.New("unreachable")
+	})
 
 	got, err := m.TokenForResource(context.Background(), testIssuer)
 	if err != nil {
@@ -206,14 +275,14 @@ func TestToken_AudienceShortcut(t *testing.T) {
 
 	m, err := New(Config{
 		Issuer: testIssuer, ClientID: testClientID, STSPath: testSTSPath, Store: store,
-		Exchange: func(_ context.Context, _ sts.ExchangeRequest) (*tokens.TokenSet, error) {
-			t.Fatal("exchange must not run when core token's aud already covers resource")
-			return nil, errors.New("unreachable")
-		},
 	})
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
+	SetExchangeForTest(t, m, func(_ context.Context, _ sts.ExchangeRequest) (*tokens.TokenSet, error) {
+		t.Fatal("exchange must not run when core token's aud already covers resource")
+		return nil, errors.New("unreachable")
+	})
 
 	got, err := m.TokenForResource(context.Background(), testResource)
 	if err != nil {
@@ -262,15 +331,15 @@ func TestToken_ExchangesAndCaches(t *testing.T) {
 	var lastReq sts.ExchangeRequest
 	m, err := New(Config{
 		Issuer: testIssuer, ClientID: testClientID, STSPath: testSTSPath, Store: store,
-		Exchange: func(_ context.Context, req sts.ExchangeRequest) (*tokens.TokenSet, error) {
-			calls++
-			lastReq = req
-			return &tokens.TokenSet{AccessToken: "exchanged-1", ExpiresAt: time.Now().Add(10 * time.Minute)}, nil
-		},
 	})
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
+	SetExchangeForTest(t, m, func(_ context.Context, req sts.ExchangeRequest) (*tokens.TokenSet, error) {
+		calls++
+		lastReq = req
+		return &tokens.TokenSet{AccessToken: "exchanged-1", ExpiresAt: time.Now().Add(10 * time.Minute)}, nil
+	})
 
 	first, err := m.TokenForResource(context.Background(), testResource)
 	if err != nil {
@@ -400,15 +469,15 @@ func TestToken_CacheExpires(t *testing.T) {
 	var calls int
 	m, err := New(Config{
 		Issuer: testIssuer, ClientID: testClientID, STSPath: testSTSPath, Store: store,
-		Now: func() time.Time { return now },
-		Exchange: func(_ context.Context, _ sts.ExchangeRequest) (*tokens.TokenSet, error) {
-			calls++
-			return &tokens.TokenSet{AccessToken: testExchangedTok, ExpiresAt: now.Add(time.Minute)}, nil
-		},
 	})
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
+	SetNowForTest(t, m, func() time.Time { return now })
+	SetExchangeForTest(t, m, func(_ context.Context, _ sts.ExchangeRequest) (*tokens.TokenSet, error) {
+		calls++
+		return &tokens.TokenSet{AccessToken: testExchangedTok, ExpiresAt: now.Add(time.Minute)}, nil
+	})
 
 	if _, err := m.TokenForResource(context.Background(), testResource); err != nil {
 		t.Fatalf("first: %v", err)
@@ -701,15 +770,15 @@ func TestToken_ExpiredCoreReturnsNotLoggedIn(t *testing.T) {
 
 	m, err := New(Config{
 		Issuer: testIssuer, ClientID: testClientID, STSPath: testSTSPath, Store: store,
-		Now: func() time.Time { return now },
-		Exchange: func(_ context.Context, _ sts.ExchangeRequest) (*tokens.TokenSet, error) {
-			t.Fatal("exchange must not run for an expired core token")
-			return nil, errors.New("unreachable")
-		},
 	})
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
+	SetNowForTest(t, m, func() time.Time { return now })
+	SetExchangeForTest(t, m, func(_ context.Context, _ sts.ExchangeRequest) (*tokens.TokenSet, error) {
+		t.Fatal("exchange must not run for an expired core token")
+		return nil, errors.New("unreachable")
+	})
 
 	_, err = m.TokenForResource(context.Background(), testResource)
 	if !errors.Is(err, ErrNotLoggedIn) {
@@ -727,14 +796,14 @@ func TestToken_OpaqueCorePassesPreflight(t *testing.T) {
 
 	m, err := New(Config{
 		Issuer: testIssuer, ClientID: testClientID, Store: store,
-		Exchange: func(_ context.Context, _ sts.ExchangeRequest) (*tokens.TokenSet, error) {
-			t.Fatal("same-host shortcut should win for opaque core token == issuer")
-			return nil, errors.New("unreachable")
-		},
 	})
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
+	SetExchangeForTest(t, m, func(_ context.Context, _ sts.ExchangeRequest) (*tokens.TokenSet, error) {
+		t.Fatal("same-host shortcut should win for opaque core token == issuer")
+		return nil, errors.New("unreachable")
+	})
 
 	got, err := m.TokenForResource(context.Background(), testIssuer)
 	if err != nil {
@@ -824,14 +893,14 @@ func TestToken_SameHostShortcut_NormalisesURLs(t *testing.T) {
 	m, err := New(Config{
 		Issuer: testIssuer, ClientID: testClientID, // STSPath intentionally empty
 		Store: store,
-		Exchange: func(_ context.Context, _ sts.ExchangeRequest) (*tokens.TokenSet, error) {
-			t.Fatal("exchange must not run when issuer == resource modulo trailing slash / case")
-			return nil, errors.New("unreachable")
-		},
 	})
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
+	SetExchangeForTest(t, m, func(_ context.Context, _ sts.ExchangeRequest) (*tokens.TokenSet, error) {
+		t.Fatal("exchange must not run when issuer == resource modulo trailing slash / case")
+		return nil, errors.New("unreachable")
+	})
 
 	for _, resource := range []string{
 		testIssuer + "/", // trailing slash
@@ -874,5 +943,63 @@ func TestToken_CacheCollapsesURLEquivalents(t *testing.T) {
 	}
 	if calls != 1 {
 		t.Fatalf("exchange calls = %d, want 1 (trailing-slash variant must hit cache)", calls)
+	}
+}
+
+// TestSetSeams_ConcurrentReadDuringWrite pins the test-seam fields as
+// race-free under the Go memory model. Without atomic.Pointer (or a
+// mutex on the read path) a concurrent Token() call hitting m.now() /
+// runExchange while SetNowForTest / SetExchangeForTest stores the
+// override would race — `go test -race` would catch it. Bugbot
+// flagged this in v0.2.0 review.
+func TestSetSeams_ConcurrentReadDuringWrite(t *testing.T) {
+	t.Parallel()
+	core := makeJWTWithAudience(t, []string{testIssuer})
+	store := newMemStore()
+	store.data[testIssuer] = tokens.TokenSet{AccessToken: core}
+
+	m, err := New(Config{
+		Issuer: testIssuer, ClientID: testClientID, STSPath: testSTSPath, Store: store,
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	// Seed an exchange override so runExchange's pointer-load path runs.
+	SetExchangeForTest(t, m, func(_ context.Context, _ sts.ExchangeRequest) (*tokens.TokenSet, error) {
+		return &tokens.TokenSet{AccessToken: "ok", ExpiresAt: time.Now().Add(time.Hour)}, nil
+	})
+
+	// Reader goroutines spin on Token; writer goroutine repeatedly
+	// replaces the seam. With atomic.Pointer this is a no-op for
+	// the race detector; with the previous plain-field implementation
+	// it would have tripped.
+	stop := make(chan struct{})
+	readers := 4
+	done := make(chan struct{}, readers)
+	for i := 0; i < readers; i++ {
+		go func() {
+			defer func() { done <- struct{}{} }()
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+					_, _ = m.TokenForResource(context.Background(), testResource)
+				}
+			}
+		}()
+	}
+
+	// 200 writes are enough to give the race detector ample chances
+	// to find an unsynchronised read; takes <100ms with atomic.Pointer.
+	for i := 0; i < 200; i++ {
+		SetNowForTest(t, m, func() time.Time { return time.Unix(int64(i), 0).UTC() })
+		SetExchangeForTest(t, m, func(_ context.Context, _ sts.ExchangeRequest) (*tokens.TokenSet, error) {
+			return &tokens.TokenSet{AccessToken: "ok", ExpiresAt: time.Now().Add(time.Hour)}, nil
+		})
+	}
+	close(stop)
+	for i := 0; i < readers; i++ {
+		<-done
 	}
 }

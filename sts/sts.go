@@ -81,7 +81,13 @@ const DefaultRequestTimeout = 30 * time.Second
 // All configuration is explicit; the package has no global state and
 // no implicit URLs. Provide BaseURL and Path; the rest is RFC 8693.
 type Client struct {
-	HTTP      *http.Client
+	// Transport supplies the http.RoundTripper used for all calls.
+	// nil → http.DefaultTransport. The library builds its own
+	// *http.Client around this transport so callers can't trivially
+	// pass a *http.Client with TLS verification disabled. See the
+	// deviceflow.Client.Transport doc for the security rationale.
+	Transport http.RoundTripper
+
 	BaseURL   string
 	Path      string
 	UserAgent string
@@ -134,12 +140,7 @@ func (c *Client) Exchange(ctx context.Context, req ExchangeRequest) (*tokens.Tok
 		httpReq.Header.Set("User-Agent", c.UserAgent)
 	}
 
-	httpClient := c.HTTP
-	if httpClient == nil {
-		httpClient = http.DefaultClient
-	}
-
-	resp, err := httpClient.Do(httpReq)
+	resp, err := c.httpClient().Do(httpReq)
 	if err != nil {
 		return nil, fmt.Errorf("token exchange: %w", err)
 	}
@@ -164,16 +165,22 @@ func (c *Client) Exchange(ctx context.Context, req ExchangeRequest) (*tokens.Tok
 		return nil, errors.New("token exchange: response missing access_token")
 	}
 
-	t := &tokens.TokenSet{
+	// Exchanged tokens are short-lived per RFC 8693 §2.2.1's spirit
+	// (the whole point of exchange is to issue narrowly-scoped,
+	// short-lived bearers). A missing or non-positive expires_in is
+	// either misconfiguration or a hostile AS — either way, we refuse
+	// to cache a token of unknown lifetime and force a fresh exchange.
+	if raw.ExpiresIn <= 0 {
+		return nil, fmt.Errorf("token exchange: non-positive expires_in (%d)", raw.ExpiresIn)
+	}
+
+	return &tokens.TokenSet{
 		AccessToken:  raw.AccessToken,
 		RefreshToken: raw.RefreshToken,
 		TokenType:    raw.TokenType,
 		Scope:        raw.Scope,
-	}
-	if raw.ExpiresIn > 0 {
-		t.ExpiresAt = nowFunc().Add(time.Duration(raw.ExpiresIn) * time.Second)
-	}
-	return t, nil
+		ExpiresAt:    nowFunc().Add(time.Duration(raw.ExpiresIn) * time.Second),
+	}, nil
 }
 
 // buildForm renders an ExchangeRequest into the wire form, layering
@@ -202,6 +209,12 @@ func buildForm(req ExchangeRequest) url.Values {
 	return form
 }
 
+// httpClient builds the *http.Client used for one Exchange call. See
+// oauthhttp.HTTPClient for the construction policy.
+func (c *Client) httpClient() *http.Client {
+	return oauthhttp.HTTPClient(c.Transport)
+}
+
 // requestTimeout resolves the effective per-request timeout: the
 // configured RequestTimeout if positive, the package default if zero,
 // or zero (no cap) if negative.
@@ -219,29 +232,19 @@ func (c *Client) requestTimeout() time.Duration {
 // ErrInsecureBaseURL is returned when Exchange is called against an
 // http:// BaseURL without AllowInsecureHTTP set. Token exchange ships
 // a subject_token (typically the user's core bearer) in the request
-// body — over plain HTTP that's a credential in the clear.
-var ErrInsecureBaseURL = errors.New("refusing to perform token exchange over plain HTTP (set Client.AllowInsecureHTTP only for local dev / test)")
+// body — over plain HTTP that's a credential in the clear. Re-exported
+// from internal/oauthhttp so callers can errors.Is uniformly across
+// deviceflow and sts.
+var ErrInsecureBaseURL = oauthhttp.ErrInsecureBaseURL
+
+// ErrAbsolutePath is returned when Path is an absolute or
+// scheme-relative URL rather than a path relative to BaseURL. See
+// oauthhttp.ErrAbsolutePath for the rationale; re-exported here so
+// callers can errors.Is on either package's sentinel.
+var ErrAbsolutePath = oauthhttp.ErrAbsolutePath
 
 func resolveURL(baseURL, path string, allowInsecureHTTP bool) (string, error) {
-	base, err := url.Parse(baseURL)
-	if err != nil {
-		return "", fmt.Errorf("parse base URL: %w", err)
-	}
-	switch base.Scheme {
-	case "https":
-		// fine
-	case "http":
-		if !allowInsecureHTTP {
-			return "", ErrInsecureBaseURL
-		}
-	default:
-		return "", fmt.Errorf("unsupported base URL scheme %q (must be http or https)", base.Scheme)
-	}
-	rel, err := url.Parse(path)
-	if err != nil {
-		return "", fmt.Errorf("parse path: %w", err)
-	}
-	return base.ResolveReference(rel).String(), nil
+	return oauthhttp.ResolveURL(baseURL, path, allowInsecureHTTP) //nolint:wrapcheck // pass through with sentinel-preserving semantics
 }
 
 type errorResponse struct {
@@ -249,12 +252,16 @@ type errorResponse struct {
 	ErrorDescription string `json:"error_description"`
 }
 
+// sanitizeDescription is a thin alias kept for in-package readability.
+// The implementation lives in internal/oauthhttp.
+func sanitizeDescription(s string) string { return oauthhttp.SanitizeDescription(s) }
+
 func readAPIError(resp *http.Response) error {
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, oauthhttp.MaxResponseBytes)) //nolint:errcheck // best-effort body read for error message
 	var apiErr errorResponse
 	if err := json.Unmarshal(bytes.TrimSpace(body), &apiErr); err == nil && apiErr.Error != "" {
-		if apiErr.ErrorDescription != "" {
-			return fmt.Errorf("token exchange: status %d: %s: %s", resp.StatusCode, apiErr.Error, apiErr.ErrorDescription)
+		if desc := sanitizeDescription(apiErr.ErrorDescription); desc != "" {
+			return fmt.Errorf("token exchange: status %d: %s: %s", resp.StatusCode, apiErr.Error, desc)
 		}
 		return fmt.Errorf("token exchange: status %d: %s", resp.StatusCode, apiErr.Error)
 	}

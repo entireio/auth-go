@@ -71,12 +71,19 @@ dfc := &deviceflow.Client{
 }
 
 dc, err := dfc.StartDeviceAuth(ctx)
-// ... show dc.UserCode + dc.VerificationURI to user, then poll ...
-ts, err := dfc.PollDeviceAuth(ctx, dc.DeviceCode)
+// show dc.UserCode + dc.VerificationURI to user, then drive the poll loop:
+ts, err := dfc.PollUntil(ctx, dc)
 if err != nil { /* surface RFC 8628 §3.5 sentinel as needed */ }
 
 if err := mgr.SaveCoreToken(ts.AccessToken); err != nil { /* keyring failed */ }
 ```
+
+`PollUntil` is the helper most embedders want. It honours `dc.Interval`,
+applies the RFC 8628 §3.5 `+5s` bump on `slow_down`, stops at the
+`dc.ExpiresIn` ceiling, and returns terminal sentinels (`ErrAccessDenied`,
+`ErrExpiredToken`, `ErrInvalidGrant`) unwrapped so callers can
+`errors.Is`. Use `PollDeviceAuth` directly only when you need to render
+per-tick state in your own UI.
 
 ### Calling a data API
 
@@ -118,6 +125,48 @@ Deletes the keyring entry first; only clears the in-memory exchange cache on suc
 3. Decide your `STSPath`: typically the OAuth token endpoint per RFC 8693 convention, or a dedicated path if your auth server exposes one.
 4. Construct the `tokenmanager.Manager` once at startup; pass it to your data-API call sites.
 5. For multi-environment users (regions, staging), key the keyring by issuer URL — `Manager.Issuer()` returns the configured value.
+
+## Security
+
+The library is the *client* side of OAuth 2.0 device flow + RFC 8693
+token exchange. It receives bearers from an authorization server and
+presents them to data APIs. The threat model is:
+
+- **The auth server is trusted.** This library does not verify JWT
+  signatures — that's the data API's job. `tokens.ParseClaims` is
+  documented as unverified and is used for routing decisions only.
+- **The data API is trusted.** The library hands it a bearer; what
+  the API does with it is out of scope.
+- **The transport is trusted only when TLS-protected.** Both
+  `deviceflow.Client` and `sts.Client` reject `http://` BaseURLs
+  unless `AllowInsecureHTTP` is set (auto-permitted only on loopback
+  hosts by sensible callers). The `Transport` field is for
+  observability and proxies, not for disabling TLS verification.
+- **OS keyrings are trusted within the user's session.** The
+  `tokenstore.Keyring` impl keys credentials by `(service, account)`;
+  pick a stable, unique service name per CLI and treat anything the
+  keyring returns as untrusted bytes (the impl already rejects
+  JSON-shaped junk and empty access tokens).
+
+Defenses in depth that the library applies regardless:
+
+- Rejects `alg:none` JWTs and any alg containing non-alphanumeric
+  characters (closes whitespace / zero-width-space bypass attempts).
+- Rejects absolute `Path` / `DeviceCodePath` / `TokenPath` values
+  (defeats redirect-via-config attacks against `url.ResolveReference`).
+- Normalises `tokenmanager.Config.Issuer` so cosmetic differences
+  (trailing slash, host case, default port) can't split keyring state
+  across two effective issuers.
+- Sanitises server-supplied `error_description` (strips control chars,
+  caps length) before wrapping into Go errors — so a hostile AS can't
+  paint terminals or balloon logs.
+- Refuses to cache exchanged tokens with non-positive `expires_in`
+  (forces a fresh exchange instead of treating unknown-lifetime
+  bearers as "valid forever").
+- Caps cache entries' lifetime at 1h when `ExpiresAt` is unset.
+
+If you find a security issue, please open an issue or email the
+maintainers privately.
 
 ## Non-goals
 
