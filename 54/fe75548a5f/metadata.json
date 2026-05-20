@@ -1,0 +1,23 @@
+{
+  "cli_version": "v0.6.2-nightly.202605140709.cc178b53-dev-e69fdc302",
+  "checkpoint_id": "54fe75548a5f",
+  "strategy": "manual-commit",
+  "branch": "soph/more-improvements-fixes",
+  "checkpoints_count": 1,
+  "files_touched": null,
+  "sessions": [
+    {
+      "metadata": "/54/fe75548a5f/0/metadata.json",
+      "transcript": "/54/fe75548a5f/0/full.jsonl",
+      "content_hash": "/54/fe75548a5f/0/content_hash.txt",
+      "prompt": "/54/fe75548a5f/0/prompt.txt"
+    }
+  ],
+  "token_usage": {
+    "input_tokens": 322956,
+    "cache_creation_tokens": 0,
+    "cache_read_tokens": 7521792,
+    "output_tokens": 25211,
+    "api_call_count": 122
+  }
+}
