@@ -63,7 +63,7 @@ func ReadAndDecodeJSON(r io.Reader, dest any, strict bool) error {
 		if err == nil {
 			return errors.New("decode JSON response: trailing data after JSON value")
 		}
-		return fmt.Errorf("decode JSON response: trailing data after JSON value: %w", err)
+		return fmt.Errorf("decode JSON response after first JSON value: %w", err)
 	}
 	return nil
 }

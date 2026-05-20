@@ -303,6 +303,10 @@ func (m *Manager) Token(ctx context.Context, req TokenRequest) (string, error) {
 	if strings.TrimSpace(req.Resource) == "" {
 		return "", errors.New("TokenRequest.Resource is required")
 	}
+	normResource, err := oauthhttp.ValidateOriginURL(req.Resource, m.cfg.AllowInsecureHTTP, "TokenRequest.Resource")
+	if err != nil {
+		return "", err
+	}
 
 	core, err := m.LookupCoreToken()
 	if err != nil {
@@ -320,11 +324,6 @@ func (m *Manager) Token(ctx context.Context, req TokenRequest) (string, error) {
 		return "", ErrNotLoggedIn
 	}
 
-	normResource, err := oauthhttp.ValidateOriginURL(req.Resource, m.cfg.AllowInsecureHTTP, "TokenRequest.Resource")
-	if err != nil {
-		return "", err
-	}
-
 	// m.cfg.Issuer was normalized at New() time, so no re-normalize here.
 	if req.Audience == "" && m.cfg.Issuer == normResource {
 		return core, nil
@@ -334,6 +333,7 @@ func (m *Manager) Token(ctx context.Context, req TokenRequest) (string, error) {
 	}
 
 	resolved := m.resolve(req)
+	resolved.Resource = normResource
 	// Default Audience to the normalized resource URI. RFC 8693 §2.1
 	// treats audience and resource as overlapping ways to identify the
 	// target service, but some AS implementations (notably zitadel-OIDC-
@@ -516,7 +516,7 @@ func (m *Manager) runExchange(ctx context.Context, coreToken string, req TokenRe
 		SubjectTokenType:   m.cfg.SubjectTokenType,
 		RequestedTokenType: req.RequestedTokenType,
 		Audience:           req.Audience,
-		Resource:           oauthhttp.NormalizeOriginURL(req.Resource),
+		Resource:           req.Resource,
 		Scope:              req.Scope,
 		// Public-client identification per RFC 6749 §3.2.1 (public
 		// clients SHOULD include client_id on requests; we go further
