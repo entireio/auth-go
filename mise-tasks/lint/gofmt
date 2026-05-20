@@ -1,0 +1,14 @@
+#!/bin/sh
+#MISE description="Check gofmt"
+
+set -eu
+
+files="$(gofmt -l -s .)"
+if [ -n "$files" ]; then
+  echo "These .go files need to be formatted:"
+  echo ""
+  echo "$files"
+  echo ""
+  echo "To fix: mise run fmt"
+  exit 1
+fi
