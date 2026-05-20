@@ -1,0 +1,35 @@
+{
+  "cli_version": "v0.6.2-nightly.202605140709.cc178b53-dev-e69fdc302",
+  "checkpoint_id": "7407a21c1092",
+  "session_id": "019e44d4-6ecf-7c1d-96ab-582effc13411",
+  "strategy": "manual-commit",
+  "created_at": "2026-05-20T12:38:12.004136Z",
+  "branch": "soph/more-improvements-fixes",
+  "checkpoints_count": 1,
+  "files_touched": [],
+  "agent": "Pi",
+  "model": "",
+  "turn_id": "371e1d5eca18",
+  "token_usage": {
+    "input_tokens": 491787,
+    "cache_creation_tokens": 0,
+    "cache_read_tokens": 14469120,
+    "output_tokens": 34299,
+    "api_call_count": 185
+  },
+  "session_metrics": {
+    "turn_count": 10
+  },
+  "prompt_attributions": [
+    {
+      "checkpoint_number": 2,
+      "user_lines_added": 12,
+      "user_lines_removed": 0,
+      "agent_lines_added": 0,
+      "agent_lines_removed": 0,
+      "user_added_per_file": {
+        ".claude/settings.local.json": 12
+      }
+    }
+  ]
+}
