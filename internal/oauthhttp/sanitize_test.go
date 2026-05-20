@@ -18,7 +18,7 @@ func TestSanitizeDescription(t *testing.T) {
 	}{
 		{"plain", "user denied", "user denied"},
 		{"strips CR LF", "hello\r\nworld", "helloworld"},
-		{"strips lone ESC byte (printable CSI bytes survive)", "\x1b[31mred", "[31mred"},
+		{"strips ESC", "\x1b[31mred", "[31mred"},
 		{"strips BEL", "boom\x07", "boom"},
 		{"strips NUL", "a\x00b", "ab"},
 		{"strips DEL", "a\x7fb", "ab"},

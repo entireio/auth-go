@@ -165,9 +165,8 @@ Defenses in depth that the library applies regardless:
   bearers as "valid forever").
 - Caps cache entries' lifetime at 1h when `ExpiresAt` is unset.
 
-If you find a security issue, please email the maintainers privately
-rather than opening a public issue — coordinated disclosure gives a
-window to ship a fix before the report becomes searchable.
+If you find a security issue, please open an issue or email the
+maintainers privately.
 
 ## Non-goals
 
