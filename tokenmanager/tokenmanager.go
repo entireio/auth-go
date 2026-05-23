@@ -514,12 +514,23 @@ func (m *Manager) runExchange(ctx context.Context, coreToken string, req TokenRe
 		Audience:           req.Audience,
 		Resource:           req.Resource,
 		Scope:              req.Scope,
-		// Public-client identification per RFC 6749 §2.3.1 / §3.2.1.
-		// Sent on both surfaces simultaneously: ClientID populates the
-		// HTTP Basic Authorization header (required by zitadel and other
-		// servers that ignore form-body client_id on the token-exchange
-		// grant), while Extra["client_id"] keeps the form-field form
-		// working for servers that read it there instead.
+		// Public-client identification per RFC 6749 §3.2.1 (public
+		// clients SHOULD include client_id on requests; we go further
+		// and ALWAYS include it). Sent on both surfaces simultaneously:
+		//   - ClientID populates HTTP Basic Auth — required by servers
+		//     that read credentials only from the Basic header on the
+		//     token-exchange grant (zitadel-based servers as of
+		//     2026-05 are a known example: pkg/op/token_exchange.go
+		//     reads only from r.BasicAuth()).
+		//   - Extra["client_id"] populates the form body — required by
+		//     servers that read credentials from the form, plus it's
+		//     the §2.3.1 form for confidential clients.
+		// DO NOT delete either line independently. The two surfaces
+		// target different server implementations; the test server
+		// validates both, so passing tests do not prove production
+		// safety against arbitrary auth servers. m.cfg.ClientID is
+		// non-empty by Config.validate, so the resulting request has
+		// at least one credential surface populated.
 		ClientID: m.cfg.ClientID,
 		Extra:    url.Values{"client_id": {m.cfg.ClientID}},
 	}
