@@ -65,21 +65,41 @@ type ExchangeRequest struct {
 	Resource string
 	Scope    string
 
+	// ClientID, when non-empty, is sent as the username component of an
+	// HTTP Basic Authorization header (RFC 6749 §2.3.1). ClientSecret is
+	// the password component; leave empty for public clients. Some
+	// authorization servers (notably zitadel-based) accept client
+	// credentials for the token-exchange grant only via Basic Auth and
+	// ignore form-body client_id, so callers targeting those servers
+	// must populate this field. Callers also free to additionally set
+	// Extra["client_id"] for servers that read from the form — both
+	// surfaces can be populated simultaneously.
+	//
+	// Both values are url.QueryEscape'd before being placed in the
+	// header so servers that round-trip credentials through QueryUnescape
+	// receive the original bytes back.
+	ClientID     string
+	ClientSecret string
+
 	Extra url.Values
 }
 
-// String redacts SubjectToken (the user's core bearer) so accidental
-// log/print-debug exposure doesn't leak it. Other fields are
-// configuration metadata and shown verbatim.
+// String redacts SubjectToken (the user's core bearer) and
+// ClientSecret (bearer-equivalent for confidential clients) so
+// accidental log/print-debug exposure doesn't leak them. ClientID is
+// shown verbatim — it's an identifier, not a credential. Other fields
+// are configuration metadata and shown verbatim.
 func (r ExchangeRequest) String() string {
 	return fmt.Sprintf(
-		"ExchangeRequest{SubjectToken:%s SubjectTokenType:%q RequestedTokenType:%q Audience:%q Resource:%q Scope:%q Extra:%v}",
+		"ExchangeRequest{SubjectToken:%s SubjectTokenType:%q RequestedTokenType:%q Audience:%q Resource:%q Scope:%q ClientID:%q ClientSecret:%s Extra:%v}",
 		tokens.ElideSecret(r.SubjectToken),
 		r.SubjectTokenType,
 		r.RequestedTokenType,
 		r.Audience,
 		r.Resource,
 		r.Scope,
+		r.ClientID,
+		tokens.ElideSecret(r.ClientSecret),
 		r.Extra,
 	)
 }
@@ -186,6 +206,12 @@ func (c *Client) Exchange(ctx context.Context, req ExchangeRequest) (*tokens.Tok
 	httpReq.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	if c.UserAgent != "" {
 		httpReq.Header.Set("User-Agent", c.UserAgent)
+	}
+	if req.ClientID != "" {
+		// QueryEscape on the way out because zitadel runs QueryUnescape
+		// on credentials extracted from the Basic header — anything not
+		// URL-safe would otherwise mangle on the round-trip.
+		httpReq.SetBasicAuth(url.QueryEscape(req.ClientID), url.QueryEscape(req.ClientSecret))
 	}
 
 	resp, err := c.httpClient().Do(httpReq)

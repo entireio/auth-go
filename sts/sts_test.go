@@ -155,6 +155,73 @@ func TestExchange_ExtraFieldsForwarded(t *testing.T) {
 	}
 }
 
+func TestExchange_SendsBasicAuthWhenClientIDSet(t *testing.T) {
+	t.Parallel()
+
+	// Zitadel's RFC 8693 implementation reads client credentials only
+	// from Authorization: Basic for the token-exchange grant, never
+	// from the form body (pkg/op/token_exchange.go: only the
+	// r.BasicAuth() branch reads clientID for this grant). So when a
+	// caller populates ClientID, we must send Basic Auth in addition
+	// to whatever form fields they set via Extra.
+	c := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		mustReadForm(t, r)
+		id, secret, ok := r.BasicAuth()
+		if !ok {
+			t.Fatalf("expected Authorization: Basic header, got %q", r.Header.Get("Authorization"))
+		}
+		// Zitadel calls url.QueryUnescape on extracted credentials, so the
+		// wire value must round-trip through QueryEscape on the way out.
+		// "entire-cli" survives unchanged but the call still has to be there.
+		if id != "entire-cli" {
+			t.Errorf("Basic client_id = %q, want %q", id, "entire-cli")
+		}
+		if secret != "" {
+			t.Errorf("Basic client_secret = %q, want empty", secret)
+		}
+		// Form-body client_id must still flow for servers that read it
+		// from the form instead — belt-and-braces.
+		if got := r.PostForm.Get("client_id"); got != "entire-cli" {
+			t.Errorf("form client_id = %q, want %q", got, "entire-cli")
+		}
+		writeBody(t, w, `{"access_token":"acc","expires_in":300}`)
+	})
+
+	if _, err := c.Exchange(context.Background(), ExchangeRequest{
+		SubjectToken:       "sub",
+		SubjectTokenType:   SubjectTokenTypeJWT,
+		RequestedTokenType: "urn:example:t",
+		ClientID:           "entire-cli",
+		Extra:              url.Values{"client_id": {"entire-cli"}},
+	}); err != nil {
+		t.Fatalf("Exchange() error = %v", err)
+	}
+}
+
+func TestExchange_OmitsBasicAuthWhenClientIDEmpty(t *testing.T) {
+	t.Parallel()
+
+	// Public-client RFC 8628 device flow against servers that don't
+	// require client authentication on the token-exchange grant: no
+	// Basic Auth header at all. (Avoids sending a malformed empty-
+	// credential header that some servers might reject.)
+	c := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		mustReadForm(t, r)
+		if _, _, ok := r.BasicAuth(); ok {
+			t.Errorf("Authorization header should be absent when ClientID is empty, got %q", r.Header.Get("Authorization"))
+		}
+		writeBody(t, w, `{"access_token":"acc","expires_in":300}`)
+	})
+
+	if _, err := c.Exchange(context.Background(), ExchangeRequest{
+		SubjectToken:       "sub",
+		SubjectTokenType:   SubjectTokenTypeJWT,
+		RequestedTokenType: "urn:example:t",
+	}); err != nil {
+		t.Fatalf("Exchange() error = %v", err)
+	}
+}
+
 func TestExchange_StandardFieldsOverrideExtra(t *testing.T) {
 	t.Parallel()
 
@@ -471,12 +538,19 @@ func TestExchangeRequest_StringRedactsSubjectToken(t *testing.T) {
 		Audience:           "https://api.example.com",
 		Resource:           "https://api.example.com",
 		Scope:              "read",
+		ClientID:           "entire-cli",
+		ClientSecret:       "super-secret-client-secret-abc",
 		Extra:              url.Values{"x-tenant": []string{"acme"}},
 	}
 
 	got := req.String()
-	if strings.Contains(got, "super-secret-subject-token-xyz") {
-		t.Fatalf("String() leaked SubjectToken: %q", got)
+	for _, leak := range []string{
+		"super-secret-subject-token-xyz",
+		"super-secret-client-secret-abc",
+	} {
+		if strings.Contains(got, leak) {
+			t.Fatalf("String() leaked %q: %q", leak, got)
+		}
 	}
 	if !strings.Contains(got, "<elided:30 bytes>") {
 		t.Fatalf("String() missing elided placeholder: %q", got)
@@ -485,6 +559,7 @@ func TestExchangeRequest_StringRedactsSubjectToken(t *testing.T) {
 		`SubjectTokenType:"urn:ietf:params:oauth:token-type:jwt"`,
 		`Audience:"https://api.example.com"`,
 		`Scope:"read"`,
+		`ClientID:"entire-cli"`,
 		"x-tenant",
 	} {
 		if !strings.Contains(got, want) {
@@ -492,8 +567,14 @@ func TestExchangeRequest_StringRedactsSubjectToken(t *testing.T) {
 		}
 	}
 
-	// And %#v must redact via GoString.
-	if v := fmt.Sprintf("%#v", req); strings.Contains(v, "super-secret-subject-token-xyz") {
-		t.Fatalf("%%#v leaked SubjectToken: %q", v)
+	// And %#v must redact both bearer-equivalents via GoString.
+	v := fmt.Sprintf("%#v", req)
+	for _, leak := range []string{
+		"super-secret-subject-token-xyz",
+		"super-secret-client-secret-abc",
+	} {
+		if strings.Contains(v, leak) {
+			t.Fatalf("%%#v leaked %q: %q", leak, v)
+		}
 	}
 }

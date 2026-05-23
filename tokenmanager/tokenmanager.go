@@ -515,8 +515,13 @@ func (m *Manager) runExchange(ctx context.Context, coreToken string, req TokenRe
 		Resource:           req.Resource,
 		Scope:              req.Scope,
 		// Public-client identification per RFC 6749 §2.3.1 / §3.2.1.
-		// Carried via Extra because the sts package is provider-agnostic.
-		Extra: url.Values{"client_id": {m.cfg.ClientID}},
+		// Sent on both surfaces simultaneously: ClientID populates the
+		// HTTP Basic Authorization header (required by zitadel and other
+		// servers that ignore form-body client_id on the token-exchange
+		// grant), while Extra["client_id"] keeps the form-field form
+		// working for servers that read it there instead.
+		ClientID: m.cfg.ClientID,
+		Extra:    url.Values{"client_id": {m.cfg.ClientID}},
 	}
 
 	if p := m.exchangeOverride.Load(); p != nil {
