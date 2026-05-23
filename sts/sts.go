@@ -65,21 +65,58 @@ type ExchangeRequest struct {
 	Resource string
 	Scope    string
 
+	// ClientID, when non-empty, is sent as the username component of an
+	// HTTP Basic Authorization header (RFC 6749 §2.3.1). ClientSecret
+	// is the password component; leave empty for public clients
+	// (Exchange will emit Basic base64("id:"), which §2.3.1 permits).
+	//
+	// Why both surfaces. Some authorization servers accept client
+	// credentials for the token-exchange grant only via Basic Auth and
+	// ignore form-body client_id — zitadel-based servers as of
+	// 2026-05 are a known example (pkg/op/token_exchange.go reads only
+	// from r.BasicAuth()). Callers are also free to set
+	// Extra["client_id"] for servers that read from the form body;
+	// both surfaces can be populated simultaneously and validate()
+	// rejects a divergence between them.
+	//
+	// Wire encoding. Both values are url.QueryEscape'd before being
+	// placed in the header — RFC 6749 §2.3.1 mandates that client
+	// credentials are form-urlencoded before going into Basic Auth, so
+	// spec-compliant servers decode via QueryUnescape on the way in.
+	// Without the escape, credentials containing reserved characters
+	// (':', '@', '%', non-ASCII) would not round-trip correctly even
+	// against compliant servers. validate() further rejects ClientID
+	// values that ':' or non-VSCHAR bytes can't reach via this path
+	// (RFC 7617 §2 + RFC 6749 §2.3.1).
+	ClientID     string
+	ClientSecret string
+
 	Extra url.Values
 }
 
-// String redacts SubjectToken (the user's core bearer) so accidental
-// log/print-debug exposure doesn't leak it. Other fields are
-// configuration metadata and shown verbatim.
+// String redacts SubjectToken (the user's core bearer) and
+// ClientSecret (bearer-equivalent for confidential clients) so
+// accidental log/print-debug exposure doesn't leak them. ClientID is
+// shown verbatim — it's an identifier, not a credential. Other fields
+// are configuration metadata and shown verbatim.
+//
+// Redaction here is a log-hygiene defense, not a memory-safety or
+// security boundary. The struct fields remain exported and readable
+// via direct access or reflection; callers handling long-lived
+// credentials are responsible for their own zeroization. When adding
+// new fields to ExchangeRequest, update this method if the field
+// carries bearer-equivalent data.
 func (r ExchangeRequest) String() string {
 	return fmt.Sprintf(
-		"ExchangeRequest{SubjectToken:%s SubjectTokenType:%q RequestedTokenType:%q Audience:%q Resource:%q Scope:%q Extra:%v}",
+		"ExchangeRequest{SubjectToken:%s SubjectTokenType:%q RequestedTokenType:%q Audience:%q Resource:%q Scope:%q ClientID:%q ClientSecret:%s Extra:%v}",
 		tokens.ElideSecret(r.SubjectToken),
 		r.SubjectTokenType,
 		r.RequestedTokenType,
 		r.Audience,
 		r.Resource,
 		r.Scope,
+		r.ClientID,
+		tokens.ElideSecret(r.ClientSecret),
 		r.Extra,
 	)
 }
@@ -95,6 +132,57 @@ func (r ExchangeRequest) validate() error {
 		return errors.New("SubjectTokenType is required")
 	case r.RequestedTokenType == "":
 		return errors.New("RequestedTokenType is required")
+	case r.ClientSecret != "" && r.ClientID == "":
+		// Without this guard the Basic Auth branch in Exchange is
+		// skipped (gated on ClientID != "") and the secret is
+		// silently dropped — a confidential-client misconfiguration
+		// that would otherwise reach the server as anonymous and
+		// either 401 opaquely or, worse, succeed under a permissive
+		// policy. Fail fast at the caller.
+		return errors.New("ClientSecret set without ClientID: credentials would not be sent")
+	}
+	if err := validateClientID(r.ClientID); err != nil {
+		return err
+	}
+	if err := validateClientIDConsistency(r.ClientID, r.Extra); err != nil {
+		return err
+	}
+	return nil
+}
+
+// validateClientID enforces the byte-level constraints RFC 6749 §2.3.1
+// and RFC 7617 §2 place on a client_id traveling via HTTP Basic Auth:
+// VSCHAR (printable ASCII, 0x20–0x7E) and no ':' (the Basic Auth field
+// separator). Without this guard, url.QueryEscape in Exchange would
+// percent-encode forbidden bytes, slip them past the wire validator,
+// and surface as opaque server-side rejections after a QueryUnescape
+// round-trip.
+func validateClientID(id string) error {
+	if strings.ContainsRune(id, ':') {
+		return errors.New("ClientID must not contain ':' (RFC 7617 §2)")
+	}
+	for _, r := range id {
+		if r < 0x20 || r > 0x7E {
+			return fmt.Errorf("ClientID contains non-printable or non-ASCII byte %U (RFC 6749 §2.3.1 requires VSCHAR)", r)
+		}
+	}
+	return nil
+}
+
+// validateClientIDConsistency rejects requests that set client_id on
+// both the typed field and Extra to different values. The two surfaces
+// are populated independently — typed field becomes Basic Auth, Extra
+// becomes form body — and a server reading one but not the other would
+// silently accept the wrong identity. Same-value duplication is the
+// documented belt-and-braces pattern and is allowed.
+func validateClientIDConsistency(id string, extra url.Values) error {
+	if id == "" || extra == nil {
+		return nil
+	}
+	for _, extraID := range extra["client_id"] {
+		if extraID != id {
+			return fmt.Errorf("ClientID (%q) and Extra[\"client_id\"] (%q) disagree", id, extraID)
+		}
 	}
 	return nil
 }
@@ -187,6 +275,23 @@ func (c *Client) Exchange(ctx context.Context, req ExchangeRequest) (*tokens.Tok
 	if c.UserAgent != "" {
 		httpReq.Header.Set("User-Agent", c.UserAgent)
 	}
+	if req.ClientID != "" {
+		// QueryEscape on the way out per RFC 6749 §2.3.1: client
+		// credentials are form-urlencoded before being placed in the
+		// Basic Authorization header. Spec-compliant servers
+		// (zitadel-based servers among them) decode via QueryUnescape
+		// on the way in; without the escape, credentials containing
+		// reserved characters would not round-trip correctly. The
+		// validate() byte-level guards above mean we only ever hand
+		// QueryEscape values it can safely percent-encode.
+		httpReq.SetBasicAuth(url.QueryEscape(req.ClientID), url.QueryEscape(req.ClientSecret))
+	}
+	// Intentional fall-through when ClientID is empty: omit the
+	// Authorization header entirely rather than send Basic Og==
+	// (the encoded ":"). Sending an explicit empty-credential header
+	// flips servers that branch on header presence into credential-
+	// evaluation mode and yields invalid_client; public clients that
+	// don't authenticate at this endpoint expect an absent header.
 
 	resp, err := c.httpClient().Do(httpReq)
 	if err != nil {

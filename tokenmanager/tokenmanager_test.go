@@ -356,15 +356,22 @@ func TestToken_ExchangesAndCaches(t *testing.T) {
 		t.Fatalf("expected cache hit, got calls=%d second=%q", calls, second)
 	}
 
-	// Wire shape: default RequestedTokenType, empty audience, client_id.
+	// Wire shape: default RequestedTokenType, empty audience, client_id
+	// on both surfaces (Basic Auth via ClientID field + form via Extra).
+	// Both are populated so the request works against zitadel-based
+	// servers (Basic-only for token-exchange) and form-reading servers
+	// alike — see sts.ExchangeRequest.ClientID doc for the why.
 	if lastReq.RequestedTokenType != DefaultRequestedTokenType {
 		t.Errorf("RequestedTokenType = %q", lastReq.RequestedTokenType)
 	}
 	if lastReq.Audience != "" {
 		t.Errorf("Audience = %q, want empty", lastReq.Audience)
 	}
+	if lastReq.ClientID != testClientID {
+		t.Errorf("ClientID = %q, want %q", lastReq.ClientID, testClientID)
+	}
 	if got := lastReq.Extra.Get("client_id"); got != testClientID {
-		t.Errorf("client_id = %q", got)
+		t.Errorf("form client_id = %q", got)
 	}
 }
 

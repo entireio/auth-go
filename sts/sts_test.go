@@ -155,6 +155,131 @@ func TestExchange_ExtraFieldsForwarded(t *testing.T) {
 	}
 }
 
+func TestExchange_SendsBasicAuthWhenClientIDSet(t *testing.T) {
+	t.Parallel()
+
+	// Zitadel's RFC 8693 implementation reads client credentials only
+	// from Authorization: Basic for the token-exchange grant, never
+	// from the form body (pkg/op/token_exchange.go: only the
+	// r.BasicAuth() branch reads clientID for this grant). So when a
+	// caller populates ClientID, we must send Basic Auth in addition
+	// to whatever form fields they set via Extra.
+	c := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		mustReadForm(t, r)
+		id, secret, ok := r.BasicAuth()
+		if !ok {
+			t.Fatalf("expected Authorization: Basic header, got %q", r.Header.Get("Authorization"))
+		}
+		// RFC 6749 §2.3.1 mandates form-urlencoded credentials before they
+		// go into the Basic header; spec-compliant servers decode via
+		// url.QueryUnescape on the way in. "entire-cli" is identity
+		// under QueryEscape — the round-trip premise is exercised in
+		// TestExchange_BasicAuthRoundTripsReservedCharacters using a
+		// secret that QueryEscape actually mutates.
+		if id != "entire-cli" {
+			t.Errorf("Basic client_id = %q, want %q", id, "entire-cli")
+		}
+		if secret != "" {
+			t.Errorf("Basic client_secret = %q, want empty", secret)
+		}
+		// Form-body client_id must still flow for servers that read it
+		// from the form instead — belt-and-braces.
+		if got := r.PostForm.Get("client_id"); got != "entire-cli" {
+			t.Errorf("form client_id = %q, want %q", got, "entire-cli")
+		}
+		writeBody(t, w, `{"access_token":"acc","expires_in":300}`)
+	})
+
+	if _, err := c.Exchange(context.Background(), ExchangeRequest{
+		SubjectToken:       "sub",
+		SubjectTokenType:   SubjectTokenTypeJWT,
+		RequestedTokenType: "urn:example:t",
+		ClientID:           "entire-cli",
+		Extra:              url.Values{"client_id": {"entire-cli"}},
+	}); err != nil {
+		t.Fatalf("Exchange() error = %v", err)
+	}
+}
+
+func TestExchange_BasicAuthRoundTripsReservedCharacters(t *testing.T) {
+	t.Parallel()
+
+	// Locks in the QueryEscape↔QueryUnescape contract that the Basic
+	// Auth path depends on (RFC 6749 §2.3.1: client credentials are
+	// form-urlencoded before going into the header). The standard
+	// SendsBasicAuth test uses "entire-cli" — a string that is identity
+	// under QueryEscape — so it would still pass if the escape call
+	// were removed. This test uses a secret with characters that
+	// QueryEscape mutates ('+', '/', '=', space) and asserts the value
+	// the server recovers after Basic-decode + QueryUnescape matches
+	// the originally-supplied bytes.
+	const (
+		clientID = "client-with-id"
+		secret   = "p@ss w/+rd=&extra"
+	)
+
+	c := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		mustReadForm(t, r)
+		id, encSecret, ok := r.BasicAuth()
+		if !ok {
+			t.Fatalf("expected Authorization: Basic header, got %q", r.Header.Get("Authorization"))
+		}
+		// Server-side spec-compliant decode: form-urlencoded values come
+		// off the wire un-escaped via url.QueryUnescape.
+		gotID, err := url.QueryUnescape(id)
+		if err != nil {
+			t.Fatalf("QueryUnescape(id): %v", err)
+		}
+		gotSecret, err := url.QueryUnescape(encSecret)
+		if err != nil {
+			t.Fatalf("QueryUnescape(secret): %v", err)
+		}
+		if gotID != clientID {
+			t.Errorf("id round-trip: got %q, want %q", gotID, clientID)
+		}
+		if gotSecret != secret {
+			t.Errorf("secret round-trip: got %q, want %q", gotSecret, secret)
+		}
+		writeBody(t, w, `{"access_token":"acc","expires_in":300}`)
+	})
+
+	if _, err := c.Exchange(context.Background(), ExchangeRequest{
+		SubjectToken:       "sub",
+		SubjectTokenType:   SubjectTokenTypeJWT,
+		RequestedTokenType: "urn:example:t",
+		ClientID:           clientID,
+		ClientSecret:       secret,
+	}); err != nil {
+		t.Fatalf("Exchange() error = %v", err)
+	}
+}
+
+func TestExchange_OmitsBasicAuthWhenClientIDEmpty(t *testing.T) {
+	t.Parallel()
+
+	// Public-client RFC 8693 token exchange against servers that don't
+	// require client authentication on this grant: no Basic Auth
+	// header at all. Sending Basic Og== (the encoded ":") would flip
+	// servers that branch on header presence into credential-
+	// evaluation mode and yield invalid_client — see the matching
+	// "intentional fall-through" comment in sts.go's Exchange.
+	c := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		mustReadForm(t, r)
+		if _, _, ok := r.BasicAuth(); ok {
+			t.Errorf("Authorization header should be absent when ClientID is empty, got %q", r.Header.Get("Authorization"))
+		}
+		writeBody(t, w, `{"access_token":"acc","expires_in":300}`)
+	})
+
+	if _, err := c.Exchange(context.Background(), ExchangeRequest{
+		SubjectToken:       "sub",
+		SubjectTokenType:   SubjectTokenTypeJWT,
+		RequestedTokenType: "urn:example:t",
+	}); err != nil {
+		t.Fatalf("Exchange() error = %v", err)
+	}
+}
+
 func TestExchange_StandardFieldsOverrideExtra(t *testing.T) {
 	t.Parallel()
 
@@ -196,6 +321,164 @@ func TestExchange_RejectsMissingRequiredFields(t *testing.T) {
 			t.Parallel()
 			if _, err := c.Exchange(context.Background(), tt.req); err == nil {
 				t.Fatal("Exchange() should fail on missing required field")
+			}
+		})
+	}
+}
+
+// TestExchange_RejectsMalformedClientCredentials pins the validate()
+// guards that prevent credentials from being silently mis-sent. Each
+// case is a class of caller mistake that, without validation, would
+// produce a wire shape the server would either reject opaquely or
+// (worse) accept under the wrong identity.
+func TestExchange_RejectsMalformedClientCredentials(t *testing.T) {
+	t.Parallel()
+
+	base := ExchangeRequest{
+		SubjectToken:       "sub",
+		SubjectTokenType:   SubjectTokenTypeJWT,
+		RequestedTokenType: "urn:example:t",
+	}
+
+	withClient := func(id, secret string) ExchangeRequest {
+		req := base
+		req.ClientID = id
+		req.ClientSecret = secret
+		return req
+	}
+	withExtra := func(id string, extra url.Values) ExchangeRequest {
+		req := base
+		req.ClientID = id
+		req.Extra = extra
+		return req
+	}
+
+	tests := []struct {
+		name     string
+		req      ExchangeRequest
+		errMatch string
+	}{
+		{
+			// Most dangerous: caller supplies a secret but no id, the
+			// Basic Auth branch is skipped on the empty id check, and
+			// the secret is silently dropped instead of going on the
+			// wire. Reject explicitly so the misconfiguration fails
+			// fast.
+			name:     "secret without id",
+			req:      withClient("", "shh"),
+			errMatch: "ClientSecret set without ClientID",
+		},
+		{
+			// RFC 7617 §2 forbids ':' in the userid component of the
+			// Basic Auth header. url.QueryEscape would turn ':' into
+			// '%3A' and let it through, but a spec-compliant server
+			// that QueryUnescapes on the way in gets ':' back and may
+			// reject or mis-parse.
+			name:     "id contains colon",
+			req:      withClient("bad:id", ""),
+			errMatch: "ClientID must not contain ':'",
+		},
+		{
+			// RFC 6749 §2.3.1 restricts client_id to VSCHAR
+			// (0x20–0x7E). Anything outside that range silently rides
+			// the wire post-QueryEscape and surfaces as opaque
+			// rejections downstream.
+			name:     "id contains tab",
+			req:      withClient("with\ttab", ""),
+			errMatch: "ClientID contains non-printable",
+		},
+		{
+			name:     "id contains newline",
+			req:      withClient("with\nnewline", ""),
+			errMatch: "ClientID contains non-printable",
+		},
+		{
+			name:     "id contains non-ascii",
+			req:      withClient("café", ""),
+			errMatch: "ClientID contains non-printable",
+		},
+		{
+			// Splitting client_id between the typed field and Extra
+			// with different values produces a request where the
+			// Basic header says one thing and the form body says
+			// another. Whichever surface the server reads from "wins"
+			// non-deterministically — fail fast.
+			name:     "id disagrees with Extra[client_id]",
+			req:      withExtra("a", url.Values{"client_id": {"b"}}),
+			errMatch: `disagree`,
+		},
+		{
+			name:     "id disagrees with Extra[client_id] in a multi-value",
+			req:      withExtra("a", url.Values{"client_id": {"a", "b"}}),
+			errMatch: `disagree`,
+		},
+	}
+
+	c := &Client{BaseURL: "https://example.test", Path: testTokenPath}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			_, err := c.Exchange(context.Background(), tt.req)
+			if err == nil {
+				t.Fatalf("Exchange() should fail for %s", tt.name)
+			}
+			if !strings.Contains(err.Error(), tt.errMatch) {
+				t.Fatalf("error = %v, want to contain %q", err, tt.errMatch)
+			}
+		})
+	}
+}
+
+// TestExchange_AcceptsValidClientCredentials confirms validate() lets
+// the realistic happy-path shapes through unchanged. Counterpart to
+// TestExchange_RejectsMalformedClientCredentials — together they pin
+// the validation boundary in both directions.
+func TestExchange_AcceptsValidClientCredentials(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		req  ExchangeRequest
+	}{
+		{
+			// No credentials at all — server accepts anonymous exchange
+			// or relies on the subject_token's binding. Same wire shape
+			// as the historical caller (no Authorization header).
+			name: "no credentials",
+			req:  ExchangeRequest{},
+		},
+		{
+			// Public client: id, empty secret. SetBasicAuth produces
+			// base64("id:") which RFC 6749 §2.3.1 permits.
+			name: "public client (id only)",
+			req:  ExchangeRequest{ClientID: "entire-cli"},
+		},
+		{
+			// Confidential client: id + secret.
+			name: "confidential client",
+			req:  ExchangeRequest{ClientID: "confidential-app", ClientSecret: "s3cret"},
+		},
+		{
+			// Agreement between typed field and Extra is the documented
+			// belt-and-braces pattern. validate() must let it through.
+			name: "id agrees with Extra[client_id]",
+			req: ExchangeRequest{
+				ClientID: "entire-cli",
+				Extra:    url.Values{"client_id": {"entire-cli"}},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			req := tt.req
+			req.SubjectToken = "sub"
+			req.SubjectTokenType = SubjectTokenTypeJWT
+			req.RequestedTokenType = "urn:example:t"
+			if err := req.validate(); err != nil {
+				t.Fatalf("validate() = %v, want nil", err)
 			}
 		})
 	}
@@ -471,12 +754,19 @@ func TestExchangeRequest_StringRedactsSubjectToken(t *testing.T) {
 		Audience:           "https://api.example.com",
 		Resource:           "https://api.example.com",
 		Scope:              "read",
+		ClientID:           "entire-cli",
+		ClientSecret:       "super-secret-client-secret-abc",
 		Extra:              url.Values{"x-tenant": []string{"acme"}},
 	}
 
 	got := req.String()
-	if strings.Contains(got, "super-secret-subject-token-xyz") {
-		t.Fatalf("String() leaked SubjectToken: %q", got)
+	for _, leak := range []string{
+		"super-secret-subject-token-xyz",
+		"super-secret-client-secret-abc",
+	} {
+		if strings.Contains(got, leak) {
+			t.Fatalf("String() leaked %q: %q", leak, got)
+		}
 	}
 	if !strings.Contains(got, "<elided:30 bytes>") {
 		t.Fatalf("String() missing elided placeholder: %q", got)
@@ -485,6 +775,7 @@ func TestExchangeRequest_StringRedactsSubjectToken(t *testing.T) {
 		`SubjectTokenType:"urn:ietf:params:oauth:token-type:jwt"`,
 		`Audience:"https://api.example.com"`,
 		`Scope:"read"`,
+		`ClientID:"entire-cli"`,
 		"x-tenant",
 	} {
 		if !strings.Contains(got, want) {
@@ -492,8 +783,14 @@ func TestExchangeRequest_StringRedactsSubjectToken(t *testing.T) {
 		}
 	}
 
-	// And %#v must redact via GoString.
-	if v := fmt.Sprintf("%#v", req); strings.Contains(v, "super-secret-subject-token-xyz") {
-		t.Fatalf("%%#v leaked SubjectToken: %q", v)
+	// And %#v must redact both bearer-equivalents via GoString.
+	v := fmt.Sprintf("%#v", req)
+	for _, leak := range []string{
+		"super-secret-subject-token-xyz",
+		"super-secret-client-secret-abc",
+	} {
+		if strings.Contains(v, leak) {
+			t.Fatalf("%%#v leaked %q: %q", leak, v)
+		}
 	}
 }
