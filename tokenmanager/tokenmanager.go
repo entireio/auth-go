@@ -508,8 +508,23 @@ func (m *Manager) cacheStore(key cacheKey, t *tokens.TokenSet) {
 // a freshly built sts.Client pointing at m.cfg.Issuer + m.cfg.STSPath.
 func (m *Manager) runExchange(ctx context.Context, coreToken string, req TokenRequest) (*tokens.TokenSet, error) {
 	stsReq := sts.ExchangeRequest{
-		SubjectToken:       coreToken,
-		SubjectTokenType:   sts.SubjectTokenTypeJWT,
+		SubjectToken: coreToken,
+		// :access_token is the RFC 8693 §3 URI for "OAuth 2.0 access
+		// token issued by the given authorization server" — exactly
+		// what the device-code grant returns into m.cfg.Store. The
+		// distinction from :jwt matters at the server: zitadel-oidc's
+		// STS validator (pkg/op/token_exchange.go's
+		// GetTokenIDAndSubjectFromToken) only switches on
+		// :access_token / :refresh_token / :id_token; :jwt passes the
+		// IsSupported() check upstream but silently falls through to
+		// the not-handled branch and surfaces as the (uninformative)
+		// "subject_token is invalid" error_description. Other servers
+		// generally treat :jwt and :access_token interchangeably for
+		// OAuth access tokens, so this URI is the safer default. A
+		// caller who genuinely needs :jwt semantics (RFC 7519 JWT-as-
+		// credential rather than OAuth-issued bearer) can bypass
+		// tokenmanager and call sts.Client.Exchange directly.
+		SubjectTokenType:   sts.SubjectTokenTypeAccessToken,
 		RequestedTokenType: req.RequestedTokenType,
 		Audience:           req.Audience,
 		Resource:           req.Resource,

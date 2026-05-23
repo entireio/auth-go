@@ -356,13 +356,26 @@ func TestToken_ExchangesAndCaches(t *testing.T) {
 		t.Fatalf("expected cache hit, got calls=%d second=%q", calls, second)
 	}
 
-	// Wire shape: default RequestedTokenType, empty audience, client_id
-	// on both surfaces (Basic Auth via ClientID field + form via Extra).
-	// Both are populated so the request works against zitadel-based
-	// servers (Basic-only for token-exchange) and form-reading servers
-	// alike — see sts.ExchangeRequest.ClientID doc for the why.
+	// Wire shape: default RequestedTokenType, default SubjectTokenType,
+	// empty audience, client_id on both surfaces (Basic Auth via
+	// ClientID field + form via Extra). Both are populated so the
+	// request works against zitadel-based servers (Basic-only for
+	// token-exchange) and form-reading servers alike — see
+	// sts.ExchangeRequest.ClientID doc for the why.
 	if lastReq.RequestedTokenType != DefaultRequestedTokenType {
 		t.Errorf("RequestedTokenType = %q", lastReq.RequestedTokenType)
+	}
+	// SubjectTokenType is :access_token rather than :jwt because the
+	// core token we exchange is the OAuth access_token returned from
+	// the device-code grant, and RFC 8693 §3 reserves :jwt for
+	// callers that genuinely want JWT-as-credential semantics. The
+	// distinction matters in practice — zitadel-oidc's STS validator
+	// only handles :access_token / :refresh_token / :id_token in
+	// GetTokenIDAndSubjectFromToken and silently rejects :jwt as
+	// "subject_token is invalid", even when the underlying token is
+	// a perfectly valid JWS access token.
+	if lastReq.SubjectTokenType != sts.SubjectTokenTypeAccessToken {
+		t.Errorf("SubjectTokenType = %q, want %q", lastReq.SubjectTokenType, sts.SubjectTokenTypeAccessToken)
 	}
 	if lastReq.Audience != "" {
 		t.Errorf("Audience = %q, want empty", lastReq.Audience)
