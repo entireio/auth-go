@@ -308,6 +308,21 @@ func (m *Manager) Token(ctx context.Context, req TokenRequest) (string, error) {
 	}
 
 	resolved := m.resolve(req)
+	// Default Audience to the normalized resource URI. RFC 8693 §2.1
+	// treats audience and resource as overlapping ways to identify the
+	// target service, but some AS implementations (notably zitadel-OIDC-
+	// backed servers — entire-core as of 2026-05) require audience to
+	// be populated and reject the request with
+	// "invalid_target: audience is required" when only resource is
+	// present. Applying the default here, AFTER the same-host and
+	// JWT-aud shortcuts above, means single-host deployments still
+	// return the core token unchanged without setting audience — only
+	// requests that actually go to the STS endpoint get the populated
+	// audience. Callers that explicitly set Audience to something
+	// different are preserved verbatim.
+	if resolved.Audience == "" {
+		resolved.Audience = normResource
+	}
 	key := makeCacheKey(core, resolved, normResource)
 	if hit, ok := m.cacheLookup(key); ok {
 		return hit, nil

@@ -377,8 +377,14 @@ func TestToken_ExchangesAndCaches(t *testing.T) {
 	if lastReq.SubjectTokenType != sts.SubjectTokenTypeAccessToken {
 		t.Errorf("SubjectTokenType = %q, want %q", lastReq.SubjectTokenType, sts.SubjectTokenTypeAccessToken)
 	}
-	if lastReq.Audience != "" {
-		t.Errorf("Audience = %q, want empty", lastReq.Audience)
+	// Audience defaults to the normalized resource URI when the caller
+	// didn't set it explicitly. RFC 8693 §2.1 treats audience and
+	// resource as overlapping identifiers, but some AS implementations
+	// (notably zitadel-OIDC-backed servers such as entire-core) gate
+	// token exchange on audience being populated and return
+	// "invalid_target: audience is required" when it's missing.
+	if lastReq.Audience != testResource {
+		t.Errorf("Audience = %q, want %q (defaulted from Resource)", lastReq.Audience, testResource)
 	}
 	if lastReq.ClientID != testClientID {
 		t.Errorf("ClientID = %q, want %q", lastReq.ClientID, testClientID)
