@@ -1,0 +1,25 @@
+{
+  "cli_version": "v0.6.3-nightly.202605210728.73db6f8c-dev-80fc8099a",
+  "checkpoint_id": "45fcef4b6ece",
+  "strategy": "manual-commit",
+  "branch": "soph/more-improvements-fixes",
+  "checkpoints_count": 1,
+  "files_touched": [
+    "tokenmanager/tokenmanager.go"
+  ],
+  "sessions": [
+    {
+      "metadata": "/45/fcef4b6ece/0/metadata.json",
+      "transcript": "/45/fcef4b6ece/0/full.jsonl",
+      "content_hash": "/45/fcef4b6ece/0/content_hash.txt",
+      "prompt": "/45/fcef4b6ece/0/prompt.txt"
+    }
+  ],
+  "token_usage": {
+    "input_tokens": 134,
+    "cache_creation_tokens": 265967,
+    "cache_read_tokens": 8557587,
+    "output_tokens": 38855,
+    "api_call_count": 91
+  }
+}
