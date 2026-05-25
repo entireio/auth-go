@@ -207,6 +207,17 @@ window to ship a fix before the report becomes searchable.
 
 Used in production by [`entireio/cli`](https://github.com/entireio/cli). Issues and PRs welcome.
 
+## Releasing
+
+Every user-visible change must land with a [`CHANGELOG.md`](./CHANGELOG.md) entry in the same PR, under the top `## Unreleased` heading. Tagging a release is then a two-step move:
+
+1. Rename `## Unreleased` to `## vX.Y.Z — YYYY-MM-DD`, commit, and merge through a regular PR.
+2. Tag that merge commit with `git tag -a vX.Y.Z -m "..."` and `git push --tags`.
+
+Each `## Unreleased` bullet must describe behaviour that changed *since the last tag* — not since some earlier point. When a CHANGELOG entry survives a release without being moved under a version header, the next release inherits stale claims (e.g. v0.3.4's draft initially still listed v0.3.2's `:access_token` default as "new").
+
+Version bumps follow 0.x SemVer with one local convention: while pre-1.0, breaking changes may ship as patch bumps when the surface is narrow and well-documented (`v0.3.2` changed the default `subject_token_type` as a patch).
+
 ## License
 
 MIT — see [LICENSE](./LICENSE).
