@@ -1,0 +1,574 @@
+let's bring this branch up to date with origin/main please
+
+---
+
+/pr-review-toolkit:review-pr
+
+---
+
+<task-notification>
+<task-id>a801627597dde992f</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-alex-workspace-auth-go/8d7d7d1c-1d44-45f0-8ee8-831c86c18fdb/tasks/a801627597dde992f.output</output-file>
+<status>completed</status>
+<summary>Agent "Comment accuracy review" completed</summary>
+<result>Note line 66 says "Sent on STS exchanges via the client_id form field" — but per the comment at lines 521-537, client_id is now sent via *both* HTTP Basic Auth *and* the form body. This is a minor inconsistency — the field doc undersells what's actually sent.
+
+Let me also double-check on the comment at lines 84-102 (SubjectTokenType doc):
+
+The comment states the field defaults to `sts.SubjectTokenTypeAccessToken` in `New()`. Confirmed at line 191-193. The value is passed through to `runExchange` at line 516. Confirmed. Accurate.
+
+Now I have enough information to compile a thorough review.
+
+---
+
+## Summary
+
+Reviewed comments added/modified on branch `soph/more-improvements-fixes` vs `origin/main`, focused on `tokenmanager/tokenmanager.go`, `internal/oauthhttp/*.go`, `sts/sts.go`, and `deviceflow/deviceflow.go`. Most comments earn their keep — the `SubjectTokenType` doc block, the audience defaulting comment, and the client-id surfaces comment all accurately document non-obvious behavior with concrete RFC references. A handful of issues below.
+
+## Critical Issues
+
+None. No comments materially misdescribe runtime behavior.
+
+## Improvement Opportunities
+
+**Location:** `/Users/alex/workspace/auth-go/tokenmanager/tokenmanager.go:288-301` (`Token` doc — Resolution rules)
+- Issue: Rule 3 reads `Core token's aud claim already includes req.Resource → use the core token directly`. The actual code at line 331 is gated by `req.Audience == ""` too — if the caller passes an explicit Audience, this shortcut does NOT fire even when the aud claim matches. Rule 2 documents this `Audience == ""` precondition; rule 3 silently drops it.
+- Suggestion: Add `(and req.Audience is empty)` to rule 3 to match rule 2's phrasing.
+
+**Location:** `/Users/alex/workspace/auth-go/tokenmanager/tokenmanager.go:65-67` (`ClientID` field doc)
+- Issue: Says `Sent on STS exchanges via the client_id form field`. Per the longer comment at lines 521-537, ClientID is now sent on TWO surfaces — HTTP Basic Auth header AND the form `client_id` field. The field doc undersells what's actually transmitted. A reader checking "where does my ClientID go on the wire?" will be misled into thinking the Basic header is unset.
+- Suggestion: `Sent on STS exchanges via both HTTP Basic Auth and the client_id form field (see runExchange for the rationale).`
+
+**Location:** `/Users/alex/workspace/auth-go/internal/oauthhttp/jsonresp.go:1-3` (package doc)
+- Issue: Package doc says `shared HTTP-response helpers used by the auth subpackages`. After this branch, the package also exposes URL origin normalization/validation (`origin.go`), URL resolution (`url.go`), and OAuth error parsing (`error.go`). The "HTTP-response helpers" framing now under-describes the package — a maintainer searching for where URL-normalization lives won't find it via the package doc.
+- Suggestion: Broaden to `shared HTTP helpers (response parsing, OAuth error decoding, origin URL normalisation/validation, base+path resolution) used by the auth subpackages`.
+
+**Location:** `/Users/alex/workspace/auth-go/internal/oauthhttp/origin.go:48-51` (`ValidateOriginURL` doc)
+- Issue: Doc says it "validates that raw is an origin URL. HTTPS is required unless allowInsecureHTTP is true and the host is loopback." It omits FOUR documented rejection cases enforced in the body: userinfo (line 56-58), unsupported schemes other than http/https (line 69-71), query/fragment (line 72-74), non-empty path (line 75-77). The function name "ValidateOriginURL" hints at "origin" semantics but the doc doesn't list what counts as non-origin. For a security-sensitive validator (resource path/query is the classic CSRF/redirect handle), explicit doc of what's rejected helps reviewers reason about coverage.
+- Suggestion: Add a short rejection list ("rejects userinfo, query, fragment, non-`/` paths, and schemes other than http/https") so the function's security contract is visible at the doc.
+
+**Location:** `/Users/alex/workspace/auth-go/internal/oauthhttp/jsonresp.go:61-67` (trailing-data check)
+- Issue: No comment. The added `dec.Decode(&amp;trailing) != io.EOF` block guards against responses with trailing data after the first JSON value (test pinned at `jsonresp_test.go:116`). The "why" isn't obvious — naive readers will see "first decode succeeded, why bother running it again?" and may delete the block as redundant.
+- Suggestion: One-line `// Reject trailing data after the first JSON value: catches concatenated/streaming responses a server might emit by mistake, where the first object decodes fine but the wire actually carried more.` (or whatever the real motivating case was).
+
+**Location:** `/Users/alex/workspace/auth-go/internal/oauthhttp/error.go:48-57` (`readLimitedBody`)
+- Issue: No comment on the `+1` and the post-read length check. The "read one byte past the cap so callers get an explicit error instead of silently parsing a truncated response" rationale is already captured in the `ErrResponseTooLarge` doc (jsonresp.go:32-36), but the implementation doesn't reference that and the +1 trick is non-obvious. A maintainer "cleaning up" might trim the `+1` and break the cap-detection.
+- Suggestion: One-line `// +1 so a body that exactly fills the cap reads its true length; if io.ReadAll returns &gt;MaxResponseBytes we know the body overran rather than just hit the limit.` Or, alternatively, lift the rationale from `ErrResponseTooLarge`'s doc into a comment here so the function-local invariant is visible at the call site.
+
+**Location:** `/Users/alex/workspace/auth-go/deviceflow/deviceflow.go:493-495` (`sanitizeDescription` alias)
+- Issue: The comment says "thin alias kept for in-package readability". Sister package `sts/sts.go` (after this branch) calls `oauthhttp.SanitizeDescription` directly with no alias, demonstrating the alias isn't load-bearing for readability. The alias has exactly one call site (line 487). The "kept for readability" rationale becomes weaker when you can see the qualified name is what other consumers use.
+- Suggestion: Either drop the alias and call `oauthhttp.SanitizeDescription` directly (matches sts.go), or — if the alias is genuinely preferred — strengthen the comment to a "why" beyond "readability" (e.g. "deviceflow's error paths historically called this; aliased to avoid touching every call site"). The current `kept for in-package readability` reads like a vestige.
+
+## Recommended Removals
+
+**Location:** `/Users/alex/workspace/auth-go/tokenmanager/tokenmanager.go:327`
+- Comment: `// m.cfg.Issuer was normalized at New() time, so no re-normalize here.`
+- Rationale: This is correct and accurate, but borderline tautological — the equivalent comment doesn't appear at any of the other call sites (e.g. lines 187, 198, 234, 253) that also rely on the same invariant. If we keep it here we should keep it everywhere; otherwise it's noise that future maintainers will copy. Marginal removal candidate. (Keep if you regard the equality check as the riskiest spot.)
+
+## Positive Findings
+
+- **`tokenmanager/tokenmanager.go:85-102`** (`SubjectTokenType` doc): Strong example. Names the specific zitadel-oidc file (`pkg/op/token_exchange.go`), names the function (`GetTokenIDAndSubjectFromToken`), explains the exact failure mode (`"subject_token is invalid"`), and tells the reader how to escape via `sts.Client.Exchange` directly. Cross-checked: defaulted in `New()` line 191-193, passed through at line 516. Accurate.
+
+- **`tokenmanager/tokenmanager.go:337-348`** (audience defaulting): Documents WHY (zitadel-OIDC's `invalid_target` rejection) with the specific dated observation (entire-core as of 2026-05) and walks through exactly which control-flow paths reach the default vs which bypass it. Cross-checked against lines 328, 331, 349 — accurate.
+
+- **`tokenmanager/tokenmanager.go:521-537`** (Public-client identification): Excellent — calls out RFC 6749 §3.2.1, names the upstream file (`pkg/op/token_exchange.go`) and the constraint (`r.BasicAuth()` only), and is explicit that "DO NOT delete either line independently" because the test server validates both surfaces. The terminal sentence ("m.cfg.ClientID is non-empty by Config.validate") was cross-checked against line 127-128 — accurate.
+
+- **`internal/oauthhttp/sanitize.go:14-31`** (`SanitizeDescription`): Lists each rejected Unicode range with the threat (`ESC`, `CSI U+009B`), notes rune-boundary truncation. Useful, accurate, and the threat model is named.
+
+- **`internal/oauthhttp/url.go:17-24`** (`ErrAbsolutePath`): Explains the `url.ResolveReference` host-replacement attack precisely. Captures the "why" a maintainer would otherwise need to discover by reading url.URL source.</result>
+<usage><total_tokens>67308</total_tokens><tool_uses>28</tool_uses><duration_ms>174750</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>aaa2fd942cd4fa0bc</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-alex-workspace-auth-go/8d7d7d1c-1d44-45f0-8ee8-831c86c18fdb/tasks/aaa2fd942cd4fa0bc.output</output-file>
+<status>completed</status>
+<summary>Agent "Type design review" completed</summary>
+<result>Now I have full context. Here is the analysis.
+
+---
+
+# Type Design Analysis — `soph/more-improvements-fixes`
+
+Reviewed against `origin/main`. PR #5: "Harden OAuth client security checks". Findings are organized by type; ratings use the 1–10 rubric.
+
+---
+
+## Type: `oauthhttp.OAuthErrorResponse`
+
+File: `/Users/alex/workspace/auth-go/internal/oauthhttp/error.go:14-17`
+
+### Invariants Identified
+- `Error` is the OAuth-defined error code (RFC 6749 §5.2 token strings).
+- `ErrorDescription` is server-supplied free text that is **explicitly unsanitised** — callers must run it through `SanitizeDescription` before logging/printing.
+- Returned non-nil only when `Error` is non-empty after `TrimSpace` (enforced inside `ReadOAuthError`, `error.go:33-34`).
+
+### Ratings
+- **Encapsulation**: 4/10. Both fields are exported and mutable; nothing stops a caller from constructing or mutating an instance with control characters in `Error`. The only construction path inside this package goes through `ReadOAuthError`, but the type itself doesn't enforce that.
+- **Invariant Expression**: 3/10. The "ErrorDescription is unsanitised, you must sanitise before printing" rule lives in doc comments only (`error.go:20-24`). Two callers (`deviceflow.go:487`, `sts/sts.go:433`) get this right today, but the type has no way to express "this is a tainted string". The shared `string` shape between `Error` (well-defined small enum-ish set) and `ErrorDescription` (hostile-controlled free text) is exactly the case typed string aliases handle well.
+- **Invariant Usefulness**: 7/10. The shape mirrors the wire and is what callers want. The "trim error code, return nil if empty" rule in `ReadOAuthError` is a useful guard against a server returning `{"error":"  "}`.
+- **Invariant Enforcement**: 5/10. Construction is funneled through `ReadOAuthError`, but the struct is exported with public fields — any package importing `oauthhttp` could materialize one bypassing the constructor. The sanitisation requirement is **not** enforced on the type; it lives in documentation only, and one stale call site can leak ANSI escape sequences into terminals (which is the bug class this PR is otherwise trying to close).
+
+### Strengths
+- Bounded body read via `readLimitedBody` (`error.go:48-57`) hardens the constructor against memory exhaustion.
+- Empty-error fallback (`error.go:36-38`) handles real-world auth servers that return `{"error":"","error_description":"..."}` shapes without surfacing a confusing empty-code error.
+
+### Concerns
+1. **The "unsanitised" invariant is documentation-only.** This is the highest-risk concern given that the entire PR is about hardening OAuth error handling. If someone writes a third call site and forgets `SanitizeDescription`, terminal escape injection is back. A type that documents "callers must sanitise" is exactly the anti-pattern flagged in the rubric.
+2. **`Error` field name shadows the `error` interface concept.** Calling `apiErr.Error()` would be confusing if the type ever grew an `Error()` method (e.g. to make it satisfy `error`). Not blocking, but a smell.
+3. **No `Error()` method.** The type carries error semantics but isn't an `error`. Callers wrap it manually via `fmt.Errorf` at each site (`sts.go:433`, `deviceflow.go:487`) and reproduce the "status N: desc" template. Drift hazard.
+
+### Recommended Improvements
+- Make `ErrorDescription` a typed alias to bake the taint into the type system:
+  ```go
+  type UnsafeDescription string  // unsanitised; pass through SanitizeDescription
+  type OAuthErrorResponse struct {
+      Error            string
+      ErrorDescription UnsafeDescription `json:"error_description"`
+  }
+  func (d UnsafeDescription) Sanitized() string { return SanitizeDescription(string(d)) }
+  ```
+  Callers then write `apiErr.ErrorDescription.Sanitized()` and the requirement is impossible to miss. Low complexity, high payoff.
+- Consider giving `OAuthErrorResponse` an `Error() string` method that uses the sanitised description, then return it as `error` from `ReadOAuthError` (drop the parallel `error` return). Removes the duplicate templating at the two call sites and prevents future callers from formatting the raw description directly.
+
+---
+
+## Type: `tokenmanager.Config` (with new `SubjectTokenType`)
+
+File: `/Users/alex/workspace/auth-go/tokenmanager/tokenmanager.go:58-121` (field at `:85-102`)
+
+### Invariants Identified
+- `Issuer` is a normalised absolute URL with scheme + host. Enforced in `New` at `:183-187`.
+- `ClientID` non-empty. Enforced in `validate` at `:127-128`.
+- `Store` non-nil. Enforced at `:129-130`.
+- `STSPath` may be empty; runtime guard in `runExchange` (`:546-548`) returns `ErrNoSTSPath`.
+- `RequestedTokenType`, `SubjectTokenType`, `Scope`, `UserAgent` — empty is meaningful, defaults applied at construction (`:188-193`).
+- After `New`, the held `cfg` is a value-copy; callers can't mutate it post-construction.
+
+### Ratings
+- **Encapsulation**: 8/10. `Manager` holds `cfg Config` by value (`:146`), so post-construction mutation of the caller's `Config` doesn't affect the manager. Good. The fields are exported so the caller can construct it conveniently.
+- **Invariant Expression**: 5/10. The required-vs-optional distinction lives in doc comments; the zero value is *not* a valid `Config` (Store, Issuer, ClientID are required). Go's standard "struct with optional fields" idiom is being used, which is fine — but `SubjectTokenType string` accepting any string is the specific concern raised in the prompt. The sibling `sts` package defines two URI constants (`sts.SubjectTokenTypeJWT`, `sts.SubjectTokenTypeAccessToken`) but the field is plain `string`, so a typo (`"urn:ietf:params:oauth:token-type:acces_token"`) compiles cleanly and only fails at the server with the exact uninformative error the comment block warns about.
+- **Invariant Usefulness**: 8/10. The default of `:access_token` and the long explanatory comment about zitadel-oidc's behaviour (`:88-100`) are excellent and prevent a real production failure mode.
+- **Invariant Enforcement**: 6/10. Required fields are validated at construction. But `SubjectTokenType` is **not** validated to be one of the RFC 8693 URIs (or even a URI at all). The downstream `sts.ExchangeRequest.validate()` (`sts.go:128-129`) only checks non-empty. A misconfigured value silently flows to the wire.
+
+### Strengths
+- The decision to surface `SubjectTokenType` on `Config` rather than per-request is the right call: it's a deployment-wide property, not a call-site choice.
+- Default applied at `New` (`:191-193`) rather than at the call site means downstream code can rely on a non-empty value.
+- The comment block (`:85-102`) is genuinely production-grade documentation of an interop quirk.
+
+### Concerns
+1. **Stringly-typed `SubjectTokenType`.** This is the exact pattern the rubric flags. The sts package already declares the two valid RFC 8693 URIs as constants — but as plain `string` constants, not as values of a typed alias. A caller writing `cfg.SubjectTokenType = "urn:ietf:params:oauth:token-type:jwt"` (typo or not) compiles fine.
+2. **No validation that the value is one of the known URIs.** Even with a typed alias, runtime values come from config files / env vars. Validating against the set of known RFC 8693 URIs at `New` would surface typos at construction rather than at the first STS call.
+3. **`Transport http.RoundTripper` is mutable on the consumed copy** — but the `*http.Client` built from it is freshly allocated per call (`oauthhttp.HTTPClient`, `httpclient.go:18-23`), so the deep mutation surface is at the Transport, which is documented as shared and safe. Fine.
+
+### Recommended Improvements
+- In `sts/sts.go:34-39`, define a typed alias and migrate the constants:
+  ```go
+  type SubjectTokenType string
+  const (
+      SubjectTokenTypeJWT         SubjectTokenType = "urn:ietf:params:oauth:token-type:jwt"
+      SubjectTokenTypeAccessToken SubjectTokenType = "urn:ietf:params:oauth:token-type:access_token"
+  )
+  ```
+  Then change `tokenmanager.Config.SubjectTokenType` and `sts.ExchangeRequest.SubjectTokenType` to that type. Callers passing a string literal need a conversion; callers using the constants are unchanged. Catches typos at compile time.
+- Either (a) **don't validate against an allowlist** (the RFC defines extensibility via additional URIs, and the comment block explicitly says "a caller who genuinely needs :jwt … can set this field explicitly"), or (b) at minimum, validate that the value parses as a URI (currently anything non-empty is accepted). Option (a) is probably right given the extensibility intent — but the typed alias still helps because most callers use the package constants.
+- The `validate` method at `:123-133` is a method on value receiver and is private. Consider documenting that the zero value is **not** a valid Config — the field-by-field docs say each one is "Required" but the type-level doc doesn't.
+
+---
+
+## Type: `tokenmanager.TokenRequest`
+
+File: `/Users/alex/workspace/auth-go/tokenmanager/tokenmanager.go:264-281`
+
+### Invariants Identified
+- `Resource` non-empty (checked at `:303-305`).
+- `Resource` is an origin URL (no path/query/fragment, no userinfo, https unless `AllowInsecureHTTP`). Enforced via `oauthhttp.ValidateOriginURL` at `:306-309`.
+- Empty fields fall through to `Config` defaults via `resolve` (`:366-374`).
+- After normalisation, `Resource` is in canonical form for cache-key equality.
+
+### Ratings
+- **Encapsulation**: 5/10. Plain struct with public fields, no methods. That's typical Go and fine for a parameter object, but the field doing "raw input → normalised output" double duty (per the prompt's question) muddies the contract.
+- **Invariant Expression**: 4/10. The field doc says "Resource is the origin where the bearer will be presented. Required." It doesn't say "Resource must be an https origin URL with no path/query/fragment, or http if AllowInsecureHTTP." A caller reading the type definition has to read three files (`tokenmanager.go`, `oauthhttp/origin.go`, and the `Config.AllowInsecureHTTP` docs) to know what's actually accepted. This is a doc-only invariant.
+- **Invariant Usefulness**: 9/10. The normalisation + validation prevents real bugs: trailing-slash differences shadowing cache entries, accidentally sending bearers over HTTP to a non-loopback host, accepting `https://api.example.com/path/with/query?bad=true` as a "resource".
+- **Invariant Enforcement**: 8/10. Validation happens at the entry of `Token` (`:306-309`), before any side effects. Good. The new `multi-slash` guard (commit `dcfefbe`) in `ValidateOriginURL` is the right place for it. Caching key uses the normalised value (`:336, :352`), so the post-normalisation form is what flows through.
+
+### Strengths
+- Single validation point in `Token`; no scattered re-validation.
+- The "default Audience to normalised Resource" rule at `:349-351` is well-commented and explains the zitadel quirk.
+
+### Concerns
+1. **`resolved.Resource = normResource` (line 336) is the exact pattern flagged in the prompt.** `TokenRequest` is being used as both the caller's input AND the manager's internal "resolved" representation. `resolve` (`:366-374`) takes a `TokenRequest` and returns a `TokenRequest`; the type doesn't distinguish "what the caller asked for" from "what we're going to send". This is the classic anemic-data-class-doing-two-jobs anti-pattern from the rubric.
+   - The mutation works correctly today, but a reader has to trace `req` vs `resolved` vs `normResource` to understand which copy holds which form. The diff shows `normResource` is now derived earlier (`:306`) than before — which is correct for the security check — but means the variable lives across more lines, with `req.Resource` and `resolved.Resource` and `normResource` all in scope simultaneously between `:306` and `:357`.
+   - `runExchange` reads `req.Resource` (`:519`) where `req` is the resolved-and-normalised copy. If a future refactor moves the normalisation, this implicit "Resource in stsReq is always normalised" invariant could silently break.
+
+2. **Zero value is invalid** (Resource required). Same Go idiom as `Config`. Acceptable but worth noting.
+
+3. **No constructor.** `TokenRequest{Resource: "..."}` is the only construction path. For a public type with this many invariants, a `NewTokenRequest(resource string) (TokenRequest, error)` would let callers fail-fast at construction rather than at `Token()`.
+
+### Recommended Improvements
+- **Introduce a separate `resolvedRequest` (unexported) for the internal normalised form.** Keep `TokenRequest` as the user-facing input type. Roughly:
+  ```go
+  type resolvedRequest struct {
+      Resource           string // normalised
+      Audience           string
+      RequestedTokenType string
+      Scope              string
+  }
+  ```
+  Then `resolve(req TokenRequest, normResource string) resolvedRequest` returns a distinct type. The line-336 mutation goes away. `makeCacheKey` and `runExchange` take a `resolvedRequest`, making "this Resource is normalised" a type-level guarantee. Modest code cost; eliminates the "same field, two meanings" confusion.
+- Alternative low-cost option: rename the internal variable from `resolved` to something like `wireReq` or `outboundReq` to make the dual-purpose explicit, and reassign all four fields rather than just `Resource` so it's clear this is the outbound form. Cheaper than a new type; less guarantee.
+- Field doc for `Resource` should mention the validation contract directly — at minimum: "Must be an https origin URL (or http if Config.AllowInsecureHTTP). Path, query, fragment, and userinfo are rejected. Normalised via RFC 3986 §6.2.2 before use."
+
+---
+
+## Type: `oauthhttp.ResolveURL` parameters (function, not type, but contractually relevant)
+
+File: `/Users/alex/workspace/auth-go/internal/oauthhttp/url.go:36-67`
+
+### Concerns
+- `allowInsecureHTTP bool` is the classic [boolean trap](https://ariya.io/2011/08/hall-of-api-shame-boolean-trap). Three call sites (`sts.go:425`, `deviceflow.go:472`, `tokenmanager.go:306` via `ValidateOriginURL`) thread it through. A caller flipping the sense by accident silently disables the TLS guard.
+- Recommendation: introduce `type InsecureHTTPPolicy int` with `RequireHTTPS` / `AllowInsecureLoopback` constants. The two-state nature is preserved, but `ResolveURL(base, path, false)` becomes `ResolveURL(base, path, RequireHTTPS)`, which reads correctly. Optional; the boolean is widely understood and the call sites are few.
+
+---
+
+## Type: `oauthhttp.ErrNonJSONResponse` / `ErrResponseTooLarge` (sentinel errors)
+
+Files: `/Users/alex/workspace/auth-go/internal/oauthhttp/jsonresp.go:27-36`
+
+Sentinel errors are well-suited to Go's `errors.Is`. The doc on `ErrNonJSONResponse` (`:23-29`) explicitly describes the matching pattern. `ErrResponseTooLarge` (newly added at `:32-36`) is also tested via `errors.Is` (`error_test.go:19`). Good. Rating: 9/10 across the board for sentinel types.
+
+One nit: the `ReadAndDecodeJSON` "trailing data after JSON value" check at `jsonresp.go:62-67` returns a plain `errors.New(...)`. If callers want to distinguish "trailing data" from "decode failure" for telemetry, a sentinel would help. Probably overkill given how rare this is in practice.
+
+---
+
+## Cross-cutting recommendations (ranked by leverage)
+
+1. **Promote `SubjectTokenType` from `string` to a typed alias** (`type SubjectTokenType string` in `sts/sts.go`). Closes the literal stringly-typed-config concern from the prompt with one declaration plus a few callsite annotations. Low cost.
+
+2. **Tag `OAuthErrorResponse.ErrorDescription` with a sanitisation-required type** (e.g. `type UnsafeDescription string`). Bakes the taint into the type system instead of relying on every caller remembering to sanitise. Closes the highest-risk doc-only invariant in this PR.
+
+3. **Split `TokenRequest` (input) from a `resolvedRequest` (internal)** to remove the "Resource field doing double duty" confusion. Modest refactor, clearer invariants, makes the cache-key + STS-call paths self-evidently safe.
+
+4. **Add a one-line validation that `cfg.SubjectTokenType` is at least URI-shaped at `tokenmanager.New`** (or punt entirely — the field is intentionally open per the comment block; document the trade-off either way).
+
+5. **Optional: replace `allowInsecureHTTP bool` with a typed enum** across `oauthhttp.ResolveURL` / `ValidateOriginURL`. Removes the boolean trap. Low blast radius; touches three call sites.
+
+---
+
+## Files referenced
+
+- `/Users/alex/workspace/auth-go/internal/oauthhttp/error.go` — `OAuthErrorResponse`, `ReadOAuthError`
+- `/Users/alex/workspace/auth-go/internal/oauthhttp/origin.go` — `NormalizeOriginURL`, `ValidateOriginURL`, `IsLoopbackHost`
+- `/Users/alex/workspace/auth-go/internal/oauthhttp/url.go` — `ResolveURL`, sentinel errors
+- `/Users/alex/workspace/auth-go/internal/oauthhttp/jsonresp.go` — `ReadAndDecodeJSON`, `ErrResponseTooLarge`
+- `/Users/alex/workspace/auth-go/internal/oauthhttp/sanitize.go` — `SanitizeDescription`
+- `/Users/alex/workspace/auth-go/internal/oauthhttp/httpclient.go` — `HTTPClient`
+- `/Users/alex/workspace/auth-go/tokenmanager/tokenmanager.go` — `Config`, `TokenRequest`, `Manager`
+- `/Users/alex/workspace/auth-go/sts/sts.go` — `SubjectTokenTypeJWT`/`SubjectTokenTypeAccessToken` constants, `ExchangeRequest`
+- `/Users/alex/workspace/auth-go/deviceflow/deviceflow.go` — current consumer call sites</result>
+<usage><total_tokens>58485</total_tokens><tool_uses>25</tool_uses><duration_ms>166031</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>a0906840b7ee506fa</task-id>
+<tool-use-id>toolu_01BF3cAtfvbbUejRjzdFAobw</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-alex-workspace-auth-go/8d7d7d1c-1d44-45f0-8ee8-831c86c18fdb/tasks/a0906840b7ee506fa.output</output-file>
+<status>completed</status>
+<summary>Agent "General code review" completed</summary>
+<result>Wait — significant behavior change to verify here. In `oauthhttp.ReadOAuthError`, when `Error == ""` but `error_description` is set (the "empty error" branch), the function returns `(nil, fmt.Errorf("status %d: %s", ..., desc))`. The deviceflow caller `readAPIError` will treat that as `parseErr` and return `"%s: status N: &lt;desc&gt;"` without routing through `errCodeToSentinel`.
+
+That's potentially a subtle change: with the old behavior, even when the error code was empty, the AS body went into the error message but `errCodeToSentinel` was never called (since the code-path only triggered when `apiErr.Error != ""`). So functionally equivalent — when `code == ""`, you wouldn't get a sentinel either way. ✓
+
+Now I have all I need. Let me write up the review.
+
+---
+
+## Review: PR #5 "Harden OAuth client security checks"
+
+**Reviewed:** 10 commits on `soph/more-improvements-fixes` vs `origin/main` (~600 net LOC across `tokenmanager/`, `sts/`, `deviceflow/`, new `internal/oauthhttp/`, README, CHANGELOG, CI config).
+
+Verified: `go test ./...` passes, `gofmt -l .` clean. Post-rebase tokenmanager.go logic correctly merges both upstream intents (configurable `Config.SubjectTokenType` with `:access_token` default + audience defaulting to normalised resource).
+
+---
+
+### Critical (90-100)
+
+**None found.**
+
+The two highest-risk areas — the post-rebase resolution flow in `tokenmanager.Token` (lines 302–363) and the new `ReadOAuthError` contract — both check out:
+
+- The cache key (`/Users/alex/workspace/auth-go/tokenmanager/tokenmanager.go:352`) uses `normResource` for the `Resource` field and `resolved.Audience` (which is either user-supplied or defaulted to `normResource`). Same-input requests collapse to one entry. `TestToken_ExchangeIncludesResource` (passing `testResource+"/"`) confirms the normalisation reaches both the wire and the key.
+- `oauthhttp.ReadOAuthError` upholds its implicit contract that `(parseErr == nil) ⇒ (apiErr != nil)`. All call sites (`sts/sts.go:428`, `deviceflow/deviceflow.go:481`) check `parseErr` first, so no NPE risk.
+- `url.Parse("https://api.example.com//")` produces `Path == "//"`, which `ValidateOriginURL` correctly rejects via the `u.Path != "" &amp;&amp; u.Path != "/"` branch. The new "Reject multi-slash" test passes.
+
+---
+
+### Important (80-89)
+
+**1. Asymmetric origin-URL hardening between `Issuer` and `TokenRequest.Resource`** — confidence 82
+File: `/Users/alex/workspace/auth-go/tokenmanager/tokenmanager.go:183-187`
+
+`Token` now runs `oauthhttp.ValidateOriginURL` on `req.Resource`, which rejects userinfo, paths, query, fragment, and (for HTTP) non-loopback hosts. `New` does not apply the same checks to `Config.Issuer` — it only requires `Scheme != "" &amp;&amp; Host != ""`. An issuer like `REDACTED` would pass `New`, then get `NormalizeOriginURL`'d (which preserves userinfo and path), then become the same-host shortcut comparison target. The shortcut comparison would silently mis-fire for any `req.Resource` that the user genuinely wants — because the strict-validated normalised resource will never byte-equal an issuer that still carries userinfo or a path.
+
+This is most likely operator-misconfiguration only (Issuer is process-startup config, not per-call input), but the asymmetry is worth either tightening or documenting. Suggested fix: have `New` also run `oauthhttp.ValidateOriginURL(cfg.Issuer, cfg.AllowInsecureHTTP, "Config.Issuer")` and use that as both the validation and the normalisation step.
+
+**2. `ErrResponseTooLarge` exported but not surfaced via package-level re-export from `sts`/`deviceflow`** — confidence 80
+File: `/Users/alex/workspace/auth-go/internal/oauthhttp/jsonresp.go:36`
+
+`ErrInsecureBaseURL` and `ErrAbsolutePath` are deliberately re-exported from `sts` (`/Users/alex/workspace/auth-go/sts/sts.go:416,422`) and `deviceflow` (`/Users/alex/workspace/auth-go/deviceflow/deviceflow.go:469`) so external callers can `errors.Is`. `ErrResponseTooLarge` and `ErrNonJSONResponse` are not — but they are wrapped into the errors that `sts.Exchange` and `deviceflow` return to callers (via `fmt.Errorf("...: %w", ...)`). External callers therefore can't `errors.Is` against an oversized-response error without depending on the internal package, which Go won't allow.
+
+This is a UX gap: the README advertises "oversized response rejection" as a security feature, but callers can't programmatically distinguish that case from a generic "status 502" error. Either re-export both sentinels from `sts`/`deviceflow` the same way as the URL sentinels, or document the limitation.
+
+---
+
+### Suggestion (lower than 80, kept for the author's information)
+
+- `/Users/alex/workspace/auth-go/internal/oauthhttp/error.go:36-38`: when `apiErr.Error == ""` but `error_description != ""`, the function returns the sanitised description as an error. The `apiErr` is dropped, so the caller can't access whatever fields were parsed. Today nobody needs that, but it's a quiet shape change vs the previous per-package implementations (which always returned `(*errorResponse, nil)` on parse success). Worth a one-line comment on the function noting that callers will never see a partial `OAuthErrorResponse`. (Confidence 60.)
+
+- The `validateVerificationURI` change at `/Users/alex/workspace/auth-go/deviceflow/deviceflow.go:353` now accepts `LOCALHOST` (case-insensitive via `IsLoopbackHost`'s `strings.EqualFold`) where it previously only accepted lowercase `localhost`. That's almost certainly fine — DNS is case-insensitive — but is a behaviour widening worth a CHANGELOG line if you're being thorough. (Confidence 55.)
+
+---
+
+### Verified clean
+
+- Cache key behaviour post-rebase: `Resource` uses normalised form, `Audience` reflects the wire value (user-supplied or `normResource` default), so same intent → same key.
+- The new `SubjectTokenType` plumbing (`Config.SubjectTokenType` → `runExchange` → `sts.ExchangeRequest.SubjectTokenType`) is wired correctly; `TestToken_ExchangesAndCaches` asserts the default at `tokenmanager_test.go:392`.
+- All `internal/oauthhttp` helpers have focused tests covering oversized-body, trailing-data, HTML detection, multi-slash rejection, control-char sanitisation, absolute-path rejection, and non-loopback-HTTP rejection.
+- No public API surface is widened unnecessarily: `Config.SubjectTokenType` is the only new exported field, with a reasonable default and documented escape hatch.
+- README and CHANGELOG accurately describe both the breaking changes (default `SubjectTokenType`, strict `Resource` validation) and the security hardening.</result>
+<usage><total_tokens>83453</total_tokens><tool_uses>37</tool_uses><duration_ms>213417</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>a82a7b29240f2703f</task-id>
+<tool-use-id>toolu_01ECkh53UiH1pvrLxvxuLeTe</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-alex-workspace-auth-go/8d7d7d1c-1d44-45f0-8ee8-831c86c18fdb/tasks/a82a7b29240f2703f.output</output-file>
+<status>completed</status>
+<summary>Agent "Silent failure hunt" completed</summary>
+<result>Edge case: if `id == ""` (no Basic Auth) but Extra has `client_id`, the check returns nil. That's fine — Extra's client_id is the only identity.
+
+OK I have enough. Let me also check whether the new file `internal/oauthhttp/origin.go` `NormalizeOriginURL` mishandles errors silently. Looking at lines 21-23:
+
+```go
+u, err := url.Parse(raw)
+if err != nil || u.Scheme == "" || u.Host == "" {
+    return raw   // &lt;-- silent fallback
+}
+```
+
+This is **silent**: if the input doesn't parse, it's returned unchanged. The doc comment says "On parse failure ... raw is returned unchanged so non-URL audience values still compare byte-for-byte." Fair, but if a typo in an aud claim like `https//api.example.com` (missing colon) reaches here, it silently passes through without normalization. The user is none the wiser.
+
+But this is intentional because aud can be any URI/URN. OK.
+
+Let me confirm my final list by re-examining `ReadAndDecodeJSON` one more time:
+
+Line 50-52: `looksLikeHTML(body)` returns `ErrNonJSONResponse`. But if the body is, say, `text/plain` content like `"OK\n"` (not JSON, not HTML), it falls through to `dec.Decode(dest)` which fails with a JSON parse error — wrapped as "decode JSON response: ...". That's correct, but the user doesn't get the actionable "check VPN/proxy" hint.
+
+This is a real silent-style ambiguity. A text/plain body from a misconfigured proxy returning `OK 200` won't trigger ErrNonJSONResponse. Probably fine.
+
+Now let me check one more important thing - I want to check if SaveCoreToken's cache-clear logic surfaces partial-success state to the user. Actually, the comment says explicitly to clear cache AFTER successful save. So no partial-success leak. Good.
+
+OK I have comprehensive findings. Let me also check the JSON decoder strict mode for sts (it's false):
+
+sts/sts.go:311 uses `strict=false`. RFC 8693 §2.2 allows servers to add fields. OK.
+deviceflow.go:404 uses `strict=false` for the token poll. OK.
+deviceflow.go:263 uses `strict=true` for StartDeviceAuth. That's stricter. Inconsistent but documented choice.
+
+Let me now write up findings.
+
+---
+
+# Error Handling Audit: PR #5 (soph/more-improvements-fixes)
+
+Overall: error handling on this branch is meaningfully better than what it replaces — `oauthhttp.ReadOAuthError` and `ReadAndDecodeJSON` consolidate previously scattered, partly silent code (e.g., the old `io.ReadAll` with `_` discard in `sts/sts.go`). I have **no critical** silent-failure findings; the remaining issues are bounded leaks of unsanitised AS content into the user's terminal, one piece of implicit `nil` contract, and a couple of UX/diagnostic gaps.
+
+## Important
+
+**1. `apiErr.Error` echoed unsanitised into terminal-bound errors** — `sts/sts.go:434, 436` and `deviceflow/deviceflow.go:488, 490` (via `errCodeToSentinel` → `deviceflow/deviceflow.go:232`)
+- What's silent: `apiErr.ErrorDescription` is run through `oauthhttp.SanitizeDescription`, but `apiErr.Error` (the OAuth error *code*) is interpolated raw with `%s`. RFC 6749 §4.1.2.1 limits the code to ASCII-printable, but the AS is the only enforcer — a buggy/hostile server can ship `"error":"invalid_grant\u001b[31m"` and the bytes reach the terminal.
+- Why it matters: `ReadOAuthError` was added precisely to keep terminal-toxic content out of error chains; this is the matching hole on the sibling field. CSI (U+009B) in particular slips through any "low-byte" filter and is interpreted by 8-bit-aware terminals.
+- Fix: sanitise the code the same way: `code := oauthhttp.SanitizeDescription(apiErr.Error)`. For `deviceflow.errCodeToSentinel`'s `default:` arm at `deviceflow/deviceflow.go:232`, sanitise `code` before interpolation: `fmt.Errorf("oauth error: %s", oauthhttp.SanitizeDescription(code))`.
+
+**2. `validateVerificationURI` does not block C1 control bytes** — `deviceflow/deviceflow.go:315-319`
+- What's silent: The loop rejects `r &lt; 0x20 || r == 0x7f` but lets U+0080–U+009F through. U+009B (CSI) is the 8-bit-equivalent of `ESC [`; printing the raw verification_uri opens ANSI on terminals that decode C1. `oauthhttp.SanitizeDescription` already blocks this same range (`internal/oauthhttp/sanitize.go:46-47`); the verification URI is held to a weaker bar even though it gets echoed verbatim to the user and (per the doc) is exactly the surface the validation is meant to harden against terminal-glance attacks.
+- Why it matters: the function's whole stated purpose is "must not contain control characters … that could break terminal output." A 600-byte `https://example.com/path&lt;U+009B&gt;[31m…` payload passes today.
+- Fix: extend the range check to include C1 controls: `if r &lt; 0x20 || r == 0x7f || (r &gt;= 0x80 &amp;&amp; r &lt;= 0x9f)`. Or factor out a shared `isTerminalControlRune` from `sanitize.go`.
+
+**3. `ReadOAuthError`'s nil-vs-non-nil return contract is implicit** — `internal/oauthhttp/error.go:25-46`
+- What's silent (today): nothing — by construction the only path that returns `(*OAuthErrorResponse, nil)` is `apiErr.Error != ""`, so callers in `sts.readAPIError`/`deviceflow.readAPIError` are safe to dereference. But the function signature offers no static guarantee, the godoc doesn't state it, and a future refactor that re-enables (say) "return apiErr even with empty `error` field" would yield `(nil-deref, nil)` panics at the call sites.
+- Why it matters: caller code at `sts/sts.go:433-436` and `deviceflow/deviceflow.go:486-490` dereferences `apiErr.Error` immediately after the `parseErr != nil` early-return. A single edit to `ReadOAuthError`'s middle branch could turn this into a nil-pointer panic deep inside an error path that's exercised only on AS failures.
+- Fix: either (a) document the invariant in `ReadOAuthError`'s godoc ("returns `(*OAuthErrorResponse, nil)` only when `Error` is non-empty"), or (b) defend at the call sites with `if apiErr == nil { return fmt.Errorf("token exchange: status %d", resp.StatusCode) }`. (a) is cheaper.
+
+**4. `Extra["client_id"]` with multiple entries: only the first divergent value surfaces** — `sts/sts.go:179-183`
+- What's silent: `validateClientIDConsistency` loops over `extra["client_id"]` and returns on the first mismatch. If the slice has `["a", "b"]` (already weird) and the typed ClientID is `"a"`, only `"a"` is checked; `"b"` is silently accepted. More importantly, when `Extra["client_id"] = ["a", "b"]` with no typed ClientID, the function returns nil because of the `id == ""` short-circuit at line 176, even though `Extra` itself is internally inconsistent — and `buildForm` will then write both values to the wire.
+- Why it matters: zitadel and other servers parsing `r.PostFormValue("client_id")` take only the first; servers parsing `r.PostForm["client_id"]` see both. A misconfigured caller could end up sending two different client IDs on the same request and have it succeed against one server and fail opaquely against another.
+- Fix: reject `len(extra["client_id"]) &gt; 1` outright (single-value invariant), and run the typed-vs-Extra mismatch check on the canonical first element only after that guard. Both branches are misconfiguration, not user error.
+
+## Nits
+
+**5. Inconsistent `strict` JSON decoding between device-auth start and poll** — `deviceflow/deviceflow.go:263` uses `strict=true`, `deviceflow/deviceflow.go:404` and `sts/sts.go:311` use `strict=false`.
+- Why it matters: only `StartDeviceAuth` breaks when an AS adds a new optional field; subsequent `PollDeviceAuth` and `sts.Exchange` calls silently ignore the same shape. Pick one. Strict-on-poll would catch e.g. a server starting to return `id_token` on the token endpoint, which is currently silently dropped — probably what you want, since dropping `id_token` is a behavioural change worth surfacing.
+
+**6. `text/plain` response bodies don't get the actionable VPN/proxy hint** — `internal/oauthhttp/jsonresp.go:50-52, 27-30`
+- `looksLikeHTML` only checks for a leading `&lt;`. A captive-portal or proxy returning `text/plain` (`"OK"`, `"Forbidden"`, `"Authentication required to access this resource"`, …) falls through to `dec.Decode` and surfaces as a bare JSON parse error, missing the carefully-worded `ErrNonJSONResponse` text.
+- Fix: optionally also flag responses whose first non-whitespace byte is alphabetic (not `{`/`[`/`"`/digit/`-`/`t`/`f`/`n`) as `ErrNonJSONResponse`, or sniff the `Content-Type` header at the call site and route through `ErrNonJSONResponse` when it's not `application/json` and not `application/problem+json`.
+
+**7. `NormalizeOriginURL` parse failures are silently invisible to callers** — `internal/oauthhttp/origin.go:20-24`
+- The doc says "on parse failure … raw is returned unchanged so non-URL audience values still compare byte-for-byte." That's deliberate for JWT `aud` claim entries, but `NormalizeOriginURL` is also used at `tokenmanager.go:187` to normalise `cfg.Issuer` — which has *already* been validated as parseable just two lines earlier. The fallback path here can never fire for issuer, but it does mean that a future caller invoking `NormalizeOriginURL` on user-controlled input (without prior `ValidateOriginURL`) gets a silent no-op on garbage input.
+- Fix: either split into `MustNormalize` (panics on parse failure) and `Normalize` (today's behaviour), or document that callers must validate first. Cheap doc-only nit; no current bug.
+
+**8. `coreTokenAudienceIncludes` and `coreTokenExpired` swallow `tokens.ParseClaims` errors** — `tokenmanager/tokenmanager.go:395-407, 413-424`
+- Both functions return `false` on parse failure, by design (opaque tokens are treated as "no claim info" rather than "broken"). This is documented, intentional, and correct for opaque tokens — but it also means a *structurally-broken JWT* (three segments, malformed payload) silently degrades to "exchange every time" rather than surfacing the corruption.
+- Fix: distinguish "not a JWT at all" from "JWT-shaped but unparseable" — the former is fine, the latter is worth at least a debug-log breadcrumb. This is below the bar for the current PR; flag for follow-up if you ever add structured logging.
+
+## Files referenced
+- `/Users/alex/workspace/auth-go/internal/oauthhttp/error.go`
+- `/Users/alex/workspace/auth-go/internal/oauthhttp/jsonresp.go`
+- `/Users/alex/workspace/auth-go/internal/oauthhttp/origin.go`
+- `/Users/alex/workspace/auth-go/internal/oauthhttp/sanitize.go`
+- `/Users/alex/workspace/auth-go/internal/oauthhttp/url.go`
+- `/Users/alex/workspace/auth-go/sts/sts.go`
+- `/Users/alex/workspace/auth-go/deviceflow/deviceflow.go`
+- `/Users/alex/workspace/auth-go/tokenmanager/tokenmanager.go`</result>
+<usage><total_tokens>91853</total_tokens><tool_uses>38</tool_uses><duration_ms>271429</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>a95339d5d30a4813c</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-alex-workspace-auth-go/8d7d7d1c-1d44-45f0-8ee8-831c86c18fdb/tasks/a95339d5d30a4813c.output</output-file>
+<status>completed</status>
+<summary>Agent "Test coverage analysis" completed</summary>
+<result>`Issuer()` is exported, used by callers (probably the CLI), but **never tested**. Minor gap.
+
+Now I have full picture. Let me compose my analysis.
+
+---
+
+# Test Coverage Analysis: PR #5 (`soph/more-improvements-fixes`)
+
+## Summary
+
+The PR has **strong overall test quality** with deliberate, behavior-focused tests across all touched packages. Coverage is 83–95% with most gaps in error-handling fallback branches or peripheral methods, not core logic. Test code reads as written by someone who understood the production constraints (RFC 8693 quirks, zitadel server behavior, terminal escape attacks) rather than chasing line coverage. The newly merged `Audience` defaulting, multi-slash rejection, and concurrent test-seams are all pinned by explicit, named tests. The most material gap is **no test exercises overriding `Config.SubjectTokenType`** — the default path is tested twice but the new override surface has zero coverage.
+
+---
+
+## Critical Gaps (rated 8-10)
+
+**None.** Every safety-critical path (URL validation rules, multi-slash rejection, exchange-cache invalidation on save/delete, redirect protection, sanitisation of terminal escapes, audience defaulting on STS path) has at least one targeted test that would fail loudly on regression.
+
+---
+
+## Important Gaps (rated 5-7)
+
+### 1. `Config.SubjectTokenType` override is untested (rating: 7)
+- File: `/Users/alex/workspace/auth-go/tokenmanager/tokenmanager_test.go`
+- Production change: `tokenmanager.go:85-102` (new field) and `tokenmanager.go:191-193` (default), `tokenmanager.go:516` (propagated to wire).
+- Existing tests verify the default propagates twice (`tokenmanager_test.go:377-379` and a redundant duplicate at `tokenmanager_test.go:392-394`) but **no test sets `Config.SubjectTokenType` to anything else and asserts it reaches the wire**.
+- Failure caught: a future refactor that drops `m.cfg.SubjectTokenType = sts.SubjectTokenTypeAccessToken` (line 192) and instead hard-codes `:access_token` in `runExchange` would still pass all current tests but silently break any caller who genuinely needs `:jwt` semantics.
+- Suggested test shape: same as `TestToken_ExchangesAndCaches` but build the Manager with `Config{SubjectTokenType: sts.SubjectTokenTypeJWT, ...}` and assert `lastReq.SubjectTokenType == sts.SubjectTokenTypeJWT`.
+- Bonus: the duplicate assertion at `tokenmanager_test.go:392-394` is dead weight (asserts the same field-equality as `377-379`); replacing one of them with the override test would tighten the contract without growing the file.
+
+### 2. Same-host shortcut path does not pin that audience stays unset (rating: 6)
+- File: `/Users/alex/workspace/auth-go/tokenmanager/tokenmanager_test.go:245-268` (`TestToken_SameHostShortcut`).
+- The test correctly asserts the shortcut returns the core verbatim and the exchange never fires (good). But the user's stated concern was specifically: "the same-host shortcut still returns the core token unchanged WITHOUT setting audience." The current test proves the exchange never runs at all, which is a stronger property — but doesn't directly observe `resolved.Audience`. That's defensible (the shortcut returns before `resolved.Audience` is assigned, see `tokenmanager.go:328-330`), so this is a low-priority documentation/clarity gap rather than a coverage hole.
+- Optional improvement: rename or add a comment in the test pinning the intent ("audience defaulting must not run before the shortcut") so a future refactor that moves the audience assignment above the shortcut breaks a test with a descriptive name.
+
+### 3. `ReadOAuthError` status-only fallback (line 45) is not unit-tested anywhere (rating: 5)
+- File: `/Users/alex/workspace/auth-go/internal/oauthhttp/error.go:45`
+- Coverage shows `error.go:45.2,45.54 1 0` — no test triggers `ReadOAuthError` with a response whose body parses to `{}` (or is entirely empty / whitespace) so all three fallbacks fail and we return `status %d` only.
+- Failure caught: a regression where this final fallback returns a nil error instead of a status-bearing error (silent 4xx/5xx — most damaging in production).
+- Suggested test: add to `error_test.go` a case with `Body: strings.NewReader("")` and `StatusCode: 502`, assert the error mentions `502`.
+
+### 4. `ValidateOriginURL` unsupported-scheme branch is unreached (rating: 5)
+- File: `/Users/alex/workspace/auth-go/internal/oauthhttp/origin.go:69-71`
+- Coverage shows lines 69-70 at 0 hits. The bad-list at `origin_test.go:44-52` covers no-scheme, http (without allowInsecureHTTP), userinfo, path, multi-slash, query, fragment — but not e.g. `"ftp://api.example.com"`, `"data:..."`, `"javascript:..."`.
+- Failure caught: a regression that accepts non-http(s) schemes for resource URLs, which would let a misconfigured caller (or environment) point the bearer at an unexpected scheme.
+- Suggested test: extend the `bad` slice with `"ftp://api.example.com"` and `"javascript:alert(1)"`.
+
+### 5. `ReadOAuthError` non-JSON body text fallback only covered indirectly (rating: 4)
+- File: `/Users/alex/workspace/auth-go/internal/oauthhttp/error.go:41-43`
+- Coverage shows lines 41-43 at 0 hits inside the `oauthhttp` package. The path **is** exercised via `sts/sts_test.go:508 TestExchange_ServerErrorWithoutJSON`, which sends `"something\x00 broke"` and asserts NUL is stripped. That's fine — covers the behavior — but the unit-package coverage report misses it. A direct unit test in `error_test.go` would isolate the dependency.
+
+---
+
+## Suggestions (rated 3-4)
+
+### 6. `NormalizeOriginURL` IPv6 branches untested (rating: 4)
+- File: `/Users/alex/workspace/auth-go/internal/oauthhttp/origin.go:34-39`
+- Two IPv6-specific branches (drop-port-with-IPv6, keep-port-with-IPv6) have no coverage. Edge cases like `https://[::1]:443` → `https://[::1]` and `https://[::1]:8443` → `https://[::1]:8443` are easy table entries to add to `TestNormalizeOriginURL` and would lock down the bracket handling.
+
+### 7. `m.Issuer()` accessor is not directly tested (rating: 3)
+- File: `/Users/alex/workspace/auth-go/tokenmanager/tokenmanager.go:198`
+- Single-line accessor. Already indirectly used by the normalisation tests' set-up, so technically reachable, but coverage shows 0%. Bottom of the priority list; one assertion on the return value of `m.Issuer()` in `TestNew_NormalizesIssuer` would close it.
+
+### 8. `runExchange`'s real-`sts.Client` construction path is uncovered (rating: 4)
+- File: `/Users/alex/workspace/auth-go/tokenmanager/tokenmanager.go:550-557`
+- Every test goes through `SetExchangeForTest`, so the actual STS client builder runs only in production. One end-to-end test with an `httptest.NewServer` STS endpoint would close this gap and pin the field-by-field plumbing (Transport, BaseURL, Path, UserAgent, AllowInsecureHTTP). Lower priority since each individual field is already tested at the `sts.Client` level.
+
+### 9. `readAPIError`'s "no description" branch in sts (rating: 3)
+- File: `/Users/alex/workspace/auth-go/sts/sts.go:436`
+- Existing `TestExchange_ServerError` covers the description-present branch. The "error code only, no description" branch is uncovered. Deviceflow has the analogous test (`TestPollDeviceAuth_NoDescription_NoTrailingColon`); sts could use one.
+
+### 10. `tokenmanager_test.go:377-379` and `:392-394` are duplicate assertions (rating: 3, code hygiene)
+- Same field (`lastReq.SubjectTokenType`) asserted twice with the same expected value within `TestToken_ExchangesAndCaches`. Drop one or repurpose one as the override test (gap #1).
+
+---
+
+## Test Quality Issues
+
+**None significant.** A few observations on quality, not problems:
+
+- `tokenmanager_test.go:983-1039` (`TestSetSeams_ConcurrentReadDuringWrite`) is exactly the right shape for a race-detector regression test — readers in a tight loop, writers replacing the seam, no time-based assertions. This kind of test is rare and welcome.
+- `tokenmanager_test.go:1276-1303` (`TestMakeCacheKey_HashesCoreToken`) is mildly implementation-coupled (it asserts the field name `CoreTokenHash` and SHA-256 size), but the property being asserted (no raw bearer in the key) is genuinely security-relevant, so the coupling is justified. Same for the test of cache-key determinism.
+- `sts_test.go:204-255` (`TestExchange_BasicAuthRoundTripsReservedCharacters`) is a model of what to do when a trivial happy-path test would silently keep passing if the production code dropped a critical call (`QueryEscape`). The comment explicitly calls out that the standard test uses an identity-under-escape string, so this one provides the real backstop.
+
+---
+
+## Particularly Strong Tests
+
+- `/Users/alex/workspace/auth-go/sts/sts_test.go:204-255` — Round-trip QueryEscape/QueryUnescape test. Pins a single-line production behavior (`url.QueryEscape(req.ClientID)`) that would otherwise silently degrade.
+- `/Users/alex/workspace/auth-go/sts/sts_test.go:257-281` — `TestExchange_OmitsBasicAuthWhenClientIDEmpty`. Pins the "intentional fall-through" comment in production code with an actual assertion; without this, a "tidy-up" refactor that always calls `SetBasicAuth("", "")` would break public-client flows silently.
+- `/Users/alex/workspace/auth-go/tokenmanager/tokenmanager_test.go:659-690` — `TestDeleteCoreToken_PreservesCacheOnStoreFailure`. Pins the order-of-operations invariant; the failure mode (CLI thinks logged out while keyring still has token) is exactly the kind of distributed-state bug that's hard to discover in production.
+- `/Users/alex/workspace/auth-go/tokenmanager/tokenmanager_test.go:781-802` — `TestCoreTokenAudienceShortcut_FallsThroughOnMalformedJWT`. Security-critical contract pinned with a one-line assertion ("must not return verbatim").
+- `/Users/alex/workspace/auth-go/tokenmanager/tokenmanager_test.go:1129-1155` — `TestCoreTokenExpired_AppliesExchangeSkew`. Table test with named boundary cases ("just outside skew", "inside skew window", "exactly at exp") — exactly the right granularity for a 30-second window.
+- `/Users/alex/workspace/auth-go/internal/oauthhttp/jsonresp_test.go:52-75` — `TestReadAndDecodeJSON_DetectsHTMLBody`. Cases include leading-whitespace HTML, XML, and DOCTYPE — would catch a regression that simplified `looksLikeHTML` to `bytes.HasPrefix(body, []byte("&lt;"))` without `TrimSpace`.
+
+---
+
+## Verification on User's Specific Concerns
+
+| Concern | Status |
+|---|---|
+| Multi-slash rejection (commit `da94c52`) | ✓ `origin_test.go:49` (`"https://api.example.com//"` in the `bad` list) |
+| Userinfo rejection | ✓ `origin_test.go:47` |
+| Scheme/path/fragment/query rejection | ✓ `origin_test.go:46-51` |
+| Same-host shortcut returns core unchanged WITHOUT setting audience | ✓ `tokenmanager_test.go:245-268` (shortcut wins before audience defaulting at `tokenmanager.go:349`) |
+| STS-bound requests get audience populated | ✓ `tokenmanager_test.go:386-388` |
+| `Config.SubjectTokenType` default path | ✓ `tokenmanager_test.go:377-379` (and redundant duplicate at `:392-394`) |
+| `Config.SubjectTokenType` override | ✗ **No test sets the field to a non-default value** (gap #1) |
+| Error-handling in `error.go` / `jsonresp.go` | Largely covered; only the final status-only fallback (gap #3) and unit-level body-text fallback (gap #5) missing |</result>
+<usage><total_tokens>117792</total_tokens><tool_uses>49</tool_uses><duration_ms>285005</duration_ms></usage>
+</task-notification>
+
+---
+
+yep, let's do this in 3 commits
+
+---
+
+ok, merged. can we tag it please?
+
+---
+
+ehh, didn't we already change it to access_token in a previous version bump?

@@ -1,0 +1,23 @@
+{
+  "cli_version": "v0.6.3-nightly.202605210728.73db6f8c-dev-80fc8099a",
+  "checkpoint_id": "c3e870840354",
+  "strategy": "manual-commit",
+  "branch": "alex/v0.3.4-changelog-and-release-docs",
+  "checkpoints_count": 1,
+  "files_touched": null,
+  "sessions": [
+    {
+      "metadata": "/c3/e870840354/0/metadata.json",
+      "transcript": "/c3/e870840354/0/full.jsonl",
+      "content_hash": "/c3/e870840354/0/content_hash.txt",
+      "prompt": "/c3/e870840354/0/prompt.txt"
+    }
+  ],
+  "token_usage": {
+    "input_tokens": 190,
+    "cache_creation_tokens": 301965,
+    "cache_read_tokens": 16503519,
+    "output_tokens": 59543,
+    "api_call_count": 137
+  }
+}
