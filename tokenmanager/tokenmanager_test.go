@@ -420,11 +420,44 @@ func TestToken_ExchangesAndCaches(t *testing.T) {
 	if lastReq.ClientID != testClientID {
 		t.Errorf("ClientID = %q, want %q", lastReq.ClientID, testClientID)
 	}
-	if lastReq.SubjectTokenType != sts.SubjectTokenTypeAccessToken {
-		t.Errorf("SubjectTokenType = %q, want %q", lastReq.SubjectTokenType, sts.SubjectTokenTypeAccessToken)
-	}
 	if got := lastReq.Extra.Get("client_id"); got != testClientID {
 		t.Errorf("form client_id = %q", got)
+	}
+}
+
+// TestToken_SubjectTokenTypeOverride pins the override surface on the
+// new Config.SubjectTokenType field. Without this, a regression that
+// drops the cfg.SubjectTokenType default and hard-codes :access_token
+// at the call site still passes the default-path tests but silently
+// breaks callers who genuinely want :jwt semantics (RFC 7519 JWT-as-
+// credential, not OAuth-issued bearer).
+func TestToken_SubjectTokenTypeOverride(t *testing.T) {
+	t.Parallel()
+	core := makeJWTWithAudience(t, []string{testIssuer})
+	store := newMemStore()
+	store.data[testIssuer] = tokens.TokenSet{AccessToken: core}
+
+	var lastReq sts.ExchangeRequest
+	m, err := New(Config{
+		Issuer:           testIssuer,
+		ClientID:         testClientID,
+		STSPath:          testSTSPath,
+		Store:            store,
+		SubjectTokenType: sts.SubjectTokenTypeJWT,
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	SetExchangeForTest(t, m, func(_ context.Context, req sts.ExchangeRequest) (*tokens.TokenSet, error) {
+		lastReq = req
+		return &tokens.TokenSet{AccessToken: testExchangedTok}, nil
+	})
+
+	if _, err := m.Token(context.Background(), TokenRequest{Resource: testResource}); err != nil {
+		t.Fatalf("Token: %v", err)
+	}
+	if lastReq.SubjectTokenType != sts.SubjectTokenTypeJWT {
+		t.Fatalf("SubjectTokenType = %q, want %q (override)", lastReq.SubjectTokenType, sts.SubjectTokenTypeJWT)
 	}
 }
 

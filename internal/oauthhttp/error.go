@@ -22,6 +22,12 @@ type OAuthErrorResponse struct {
 // SanitizeDescription before formatting it for logs or terminals. If the body
 // is not an OAuth JSON error, the returned error contains a bounded, sanitised
 // fallback message suitable for logs and terminals.
+//
+// Return-shape contract: a non-nil *OAuthErrorResponse is returned only
+// when its Error field is non-empty. Callers are safe to dereference
+// apiErr.Error immediately after a nil-error check, but a future change
+// that returns a partial apiErr would break that — keep the invariant
+// when editing this function.
 func ReadOAuthError(resp *http.Response) (*OAuthErrorResponse, error) {
 	body, err := readLimitedBody(resp.Body)
 	if err != nil {

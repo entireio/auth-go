@@ -172,14 +172,25 @@ func validateClientID(id string) error {
 // becomes form body — and a server reading one but not the other would
 // silently accept the wrong identity. Same-value duplication is the
 // documented belt-and-braces pattern and is allowed.
+//
+// Multiple Extra["client_id"] entries are always rejected, even when
+// ClientID is unset: servers that read via r.PostFormValue see only
+// the first; servers that read via r.PostForm["client_id"] see all,
+// so a slice like ["a","b"] succeeds against one and fails against
+// the other in ways the caller can't predict.
 func validateClientIDConsistency(id string, extra url.Values) error {
-	if id == "" || extra == nil {
+	if extra == nil {
 		return nil
 	}
-	for _, extraID := range extra["client_id"] {
-		if extraID != id {
-			return fmt.Errorf("ClientID (%q) and Extra[\"client_id\"] (%q) disagree", id, extraID)
-		}
+	extras := extra["client_id"]
+	if len(extras) > 1 {
+		return fmt.Errorf("extra %q must hold at most one value, got %d", "client_id", len(extras))
+	}
+	if id == "" || len(extras) == 0 {
+		return nil
+	}
+	if extras[0] != id {
+		return fmt.Errorf("ClientID (%q) and Extra[\"client_id\"] (%q) disagree", id, extras[0])
 	}
 	return nil
 }

@@ -408,9 +408,22 @@ func TestExchange_RejectsMalformedClientCredentials(t *testing.T) {
 			errMatch: `disagree`,
 		},
 		{
-			name:     "id disagrees with Extra[client_id] in a multi-value",
+			// Multi-valued Extra["client_id"] is always rejected: servers
+			// parsing via r.PostFormValue see only the first, servers
+			// parsing via r.PostForm[...] see all, and which one wins is
+			// invisible to the caller. Holds even when the typed
+			// ClientID matches the first entry.
+			name:     "Extra[client_id] holds multiple values",
 			req:      withExtra("a", url.Values{"client_id": {"a", "b"}}),
-			errMatch: `disagree`,
+			errMatch: `must hold at most one value`,
+		},
+		{
+			// Same guard as above, but with the typed ClientID unset —
+			// the multi-value Extra is internally inconsistent on its
+			// own, before any cross-surface check kicks in.
+			name:     "Extra[client_id] multi-value without typed ClientID",
+			req:      withExtra("", url.Values{"client_id": {"a", "b"}}),
+			errMatch: `must hold at most one value`,
 		},
 	}
 
