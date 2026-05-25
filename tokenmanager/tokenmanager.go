@@ -25,6 +25,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/entireio/auth-go/internal/oauthhttp"
 	"github.com/entireio/auth-go/sts"
 	"github.com/entireio/auth-go/tokens"
 	"github.com/entireio/auth-go/tokenstore"
@@ -80,6 +81,25 @@ type Config struct {
 	// RequestedTokenType is the default RFC 8693 requested_token_type
 	// URI. Empty → DefaultRequestedTokenType.
 	RequestedTokenType string
+
+	// SubjectTokenType is the RFC 8693 subject_token_type sent on
+	// exchanges. Empty → sts.SubjectTokenTypeAccessToken.
+	//
+	// :access_token is the RFC 8693 §3 URI for "OAuth 2.0 access token
+	// issued by the given authorization server" — exactly what the
+	// device-code grant returns into Store. The distinction from :jwt
+	// matters at the server: zitadel-oidc's STS validator (pkg/op/
+	// token_exchange.go's GetTokenIDAndSubjectFromToken) only switches on
+	// :access_token / :refresh_token / :id_token; :jwt passes the
+	// IsSupported() check upstream but silently falls through to the
+	// not-handled branch and surfaces as the (uninformative)
+	// "subject_token is invalid" error_description. Other servers
+	// generally treat :jwt and :access_token interchangeably for OAuth
+	// access tokens, so :access_token is the safer default. A caller who
+	// genuinely needs :jwt semantics (RFC 7519 JWT-as-credential rather
+	// than OAuth-issued bearer) can set this field explicitly, or bypass
+	// tokenmanager and call sts.Client.Exchange directly.
+	SubjectTokenType string
 
 	// Scope is the default scope sent on exchanges. Empty → omitted.
 	Scope string
@@ -160,13 +180,21 @@ func New(cfg Config) (*Manager, error) {
 	if err := cfg.validate(); err != nil {
 		return nil, err
 	}
-	parsed, err := url.Parse(cfg.Issuer)
-	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
-		return nil, fmt.Errorf("Config.Issuer must be an absolute URL with scheme and host, got %q", cfg.Issuer)
+	// Hold Issuer to the same origin-URL contract as TokenRequest.Resource:
+	// userinfo, path, query, fragment all forbidden. The same-host shortcut
+	// (Token) byte-compares the normalised Resource against cfg.Issuer; an
+	// Issuer that still carries userinfo or a path silently fails that
+	// equality even when the caller's Resource is the "same" origin.
+	normIssuer, err := oauthhttp.ValidateOriginURL(cfg.Issuer, cfg.AllowInsecureHTTP, "Config.Issuer")
+	if err != nil {
+		return nil, err //nolint:wrapcheck // pass through with field-named message
 	}
-	cfg.Issuer = normalizeOriginURL(cfg.Issuer)
+	cfg.Issuer = normIssuer
 	if cfg.RequestedTokenType == "" {
 		cfg.RequestedTokenType = DefaultRequestedTokenType
+	}
+	if cfg.SubjectTokenType == "" {
+		cfg.SubjectTokenType = sts.SubjectTokenTypeAccessToken
 	}
 	return &Manager{cfg: cfg, cache: map[cacheKey]cachedToken{}}, nil
 }
@@ -280,6 +308,10 @@ func (m *Manager) Token(ctx context.Context, req TokenRequest) (string, error) {
 	if strings.TrimSpace(req.Resource) == "" {
 		return "", errors.New("TokenRequest.Resource is required")
 	}
+	normResource, err := oauthhttp.ValidateOriginURL(req.Resource, m.cfg.AllowInsecureHTTP, "TokenRequest.Resource")
+	if err != nil {
+		return "", err
+	}
 
 	core, err := m.LookupCoreToken()
 	if err != nil {
@@ -297,8 +329,6 @@ func (m *Manager) Token(ctx context.Context, req TokenRequest) (string, error) {
 		return "", ErrNotLoggedIn
 	}
 
-	normResource := normalizeOriginURL(req.Resource)
-
 	// m.cfg.Issuer was normalized at New() time, so no re-normalize here.
 	if req.Audience == "" && m.cfg.Issuer == normResource {
 		return core, nil
@@ -308,6 +338,7 @@ func (m *Manager) Token(ctx context.Context, req TokenRequest) (string, error) {
 	}
 
 	resolved := m.resolve(req)
+	resolved.Resource = normResource
 	// Default Audience to the normalized resource URI. RFC 8693 §2.1
 	// treats audience and resource as overlapping ways to identify the
 	// target service, but some AS implementations (notably zitadel-OIDC-
@@ -381,57 +412,20 @@ func coreTokenExpired(coreJWT string, now time.Time) bool {
 }
 
 // coreTokenAudienceIncludes reports whether the core JWT's `aud` claim
-// covers target. target is expected to already be in normalised form
-// (see normalizeOriginURL); aud entries are normalised here so a
-// trailing-slash / case difference between the AS and the caller
-// doesn't force a needless STS exchange.
+// covers target. target is expected to already be in normalised form;
+// aud entries are normalised here so a trailing-slash / case difference
+// between the AS and the caller doesn't force a needless STS exchange.
 func coreTokenAudienceIncludes(coreJWT, target string) bool {
 	claims, err := tokens.ParseClaims(coreJWT)
 	if err != nil {
 		return false
 	}
 	for _, aud := range claims.Audience {
-		if normalizeOriginURL(aud) == target {
+		if oauthhttp.NormalizeOriginURL(aud) == target {
 			return true
 		}
 	}
 	return false
-}
-
-// normalizeOriginURL canonicalises an origin URL for equality
-// comparisons. RFC 3986 §6.2.2.1 makes scheme and host case-insensitive
-// and §6.2.3 makes the empty path equivalent to "/" — we collapse to
-// no-trailing-slash. Default ports (80/http, 443/https) are stripped.
-//
-// On parse failure (or when the input lacks a scheme or host — common
-// for non-URL audiences) the input is returned unchanged so callers
-// fall back to byte-exact comparison.
-func normalizeOriginURL(raw string) string {
-	u, err := url.Parse(raw)
-	if err != nil || u.Scheme == "" || u.Host == "" {
-		return raw
-	}
-	u.Scheme = strings.ToLower(u.Scheme)
-
-	hostname := strings.ToLower(u.Hostname())
-	port := u.Port()
-	dropPort := (u.Scheme == "http" && port == "80") ||
-		(u.Scheme == "https" && port == "443") ||
-		port == ""
-
-	switch {
-	case dropPort && strings.Contains(hostname, ":"): // IPv6 without port
-		u.Host = "[" + hostname + "]"
-	case dropPort:
-		u.Host = hostname
-	case strings.Contains(hostname, ":"): // IPv6 with non-default port
-		u.Host = "[" + hostname + "]:" + port
-	default:
-		u.Host = hostname + ":" + port
-	}
-
-	u.Path = strings.TrimRight(u.Path, "/")
-	return u.String()
 }
 
 // maxCachedTokenLifetime bounds entries with an unknown wire-side
@@ -483,7 +477,7 @@ type cacheKey struct {
 // makeCacheKey builds a cacheKey from the (resolved) request. Includes
 // every wire-affecting field so different combinations don't shadow
 // each other. normalizedResource is the caller-supplied Resource after
-// passing through normalizeOriginURL, so https://api.example.com and
+// normalisation, so https://api.example.com and
 // https://api.example.com/ share a single cache entry.
 func makeCacheKey(coreToken string, req TokenRequest, normalizedResource string) cacheKey {
 	return cacheKey{
@@ -523,23 +517,8 @@ func (m *Manager) cacheStore(key cacheKey, t *tokens.TokenSet) {
 // a freshly built sts.Client pointing at m.cfg.Issuer + m.cfg.STSPath.
 func (m *Manager) runExchange(ctx context.Context, coreToken string, req TokenRequest) (*tokens.TokenSet, error) {
 	stsReq := sts.ExchangeRequest{
-		SubjectToken: coreToken,
-		// :access_token is the RFC 8693 §3 URI for "OAuth 2.0 access
-		// token issued by the given authorization server" — exactly
-		// what the device-code grant returns into m.cfg.Store. The
-		// distinction from :jwt matters at the server: zitadel-oidc's
-		// STS validator (pkg/op/token_exchange.go's
-		// GetTokenIDAndSubjectFromToken) only switches on
-		// :access_token / :refresh_token / :id_token; :jwt passes the
-		// IsSupported() check upstream but silently falls through to
-		// the not-handled branch and surfaces as the (uninformative)
-		// "subject_token is invalid" error_description. Other servers
-		// generally treat :jwt and :access_token interchangeably for
-		// OAuth access tokens, so this URI is the safer default. A
-		// caller who genuinely needs :jwt semantics (RFC 7519 JWT-as-
-		// credential rather than OAuth-issued bearer) can bypass
-		// tokenmanager and call sts.Client.Exchange directly.
-		SubjectTokenType:   sts.SubjectTokenTypeAccessToken,
+		SubjectToken:       coreToken,
+		SubjectTokenType:   m.cfg.SubjectTokenType,
 		RequestedTokenType: req.RequestedTokenType,
 		Audience:           req.Audience,
 		Resource:           req.Resource,

@@ -8,12 +8,9 @@
 package sts
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net/http"
 	"net/url"
 	"strings"
@@ -175,14 +172,25 @@ func validateClientID(id string) error {
 // becomes form body — and a server reading one but not the other would
 // silently accept the wrong identity. Same-value duplication is the
 // documented belt-and-braces pattern and is allowed.
+//
+// Multiple Extra["client_id"] entries are always rejected, even when
+// ClientID is unset: servers that read via r.PostFormValue see only
+// the first; servers that read via r.PostForm["client_id"] see all,
+// so a slice like ["a","b"] succeeds against one and fails against
+// the other in ways the caller can't predict.
 func validateClientIDConsistency(id string, extra url.Values) error {
-	if id == "" || extra == nil {
+	if extra == nil {
 		return nil
 	}
-	for _, extraID := range extra["client_id"] {
-		if extraID != id {
-			return fmt.Errorf("ClientID (%q) and Extra[\"client_id\"] (%q) disagree", id, extraID)
-		}
+	extras := extra["client_id"]
+	if len(extras) > 1 {
+		return fmt.Errorf("extra %q must hold at most one value, got %d", "client_id", len(extras))
+	}
+	if id == "" || len(extras) == 0 {
+		return nil
+	}
+	if extras[0] != id {
+		return fmt.Errorf("ClientID (%q) and Extra[\"client_id\"] (%q) disagree", id, extras[0])
 	}
 	return nil
 }
@@ -428,27 +436,17 @@ func resolveURL(baseURL, path string, allowInsecureHTTP bool) (string, error) {
 	return oauthhttp.ResolveURL(baseURL, path, allowInsecureHTTP) //nolint:wrapcheck // pass through with sentinel-preserving semantics
 }
 
-type errorResponse struct {
-	Error            string `json:"error"`
-	ErrorDescription string `json:"error_description"`
-}
-
-// sanitizeDescription is a thin alias kept for in-package readability.
-// The implementation lives in internal/oauthhttp.
-func sanitizeDescription(s string) string { return oauthhttp.SanitizeDescription(s) }
-
 func readAPIError(resp *http.Response) error {
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, oauthhttp.MaxResponseBytes)) //nolint:errcheck // best-effort body read for error message
-	var apiErr errorResponse
-	if err := json.Unmarshal(bytes.TrimSpace(body), &apiErr); err == nil && apiErr.Error != "" {
-		if desc := sanitizeDescription(apiErr.ErrorDescription); desc != "" {
-			return fmt.Errorf("token exchange: status %d: %s: %s", resp.StatusCode, apiErr.Error, desc)
-		}
-		return fmt.Errorf("token exchange: status %d: %s", resp.StatusCode, apiErr.Error)
+	apiErr, parseErr := oauthhttp.ReadOAuthError(resp)
+	if parseErr != nil {
+		return fmt.Errorf("token exchange: %w", parseErr)
 	}
-	text := strings.TrimSpace(string(body))
-	if text != "" {
-		return fmt.Errorf("token exchange: status %d: %s", resp.StatusCode, text)
+	// RFC 6749 §4.1.2.1 constrains the error code to a small ASCII
+	// alphabet, but the AS is its only enforcer — sanitise to neutralise
+	// a hostile/buggy server painting the terminal via the code field.
+	code := oauthhttp.SanitizeDescription(apiErr.Error)
+	if desc := oauthhttp.SanitizeDescription(apiErr.ErrorDescription); desc != "" {
+		return fmt.Errorf("token exchange: status %d: %s: %s", resp.StatusCode, code, desc)
 	}
-	return fmt.Errorf("token exchange: status %d", resp.StatusCode)
+	return fmt.Errorf("token exchange: status %d: %s", resp.StatusCode, code)
 }

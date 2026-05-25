@@ -466,6 +466,7 @@ func TestStartDeviceAuth_RejectsUnsafeVerificationURI(t *testing.T) {
 		{"embedded userinfo", "https://entire.io@evil.example.com/cli"},
 		{"newline injection", "https://example.com/cli\nGET /steal"},
 		{"control character", "https://example.com/\x07cli"},
+		{"C1 control CSI", "https://example.com/\u009b[31mcli"},
 		{"javascript scheme", "javascript:alert(1)"},
 		{"data scheme", "data:text/html,<script>"},
 	}
@@ -804,6 +805,30 @@ func TestPollDeviceAuth_SanitisesErrorDescription(t *testing.T) {
 	}
 	if strings.Contains(err.Error(), "\x1b") || strings.Contains(err.Error(), "\r") || strings.Contains(err.Error(), "\n") {
 		t.Fatalf("err = %q, control characters not stripped", err.Error())
+	}
+}
+
+// TestPollDeviceAuth_SanitisesUnknownErrorCode pins that an unknown
+// AS-supplied error code carrying control bytes is sanitised before
+// being interpolated into the returned error. Known codes route to
+// a sentinel and the AS code never enters the message, so this only
+// matters on the fall-through path. CSI (U+009B) is the canonical
+// 8-bit terminal-escape bypass.
+func TestPollDeviceAuth_SanitisesUnknownErrorCode(t *testing.T) {
+	t.Parallel()
+	c := newTestClient(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+		writeBody(t, w, "{\"error\":\"weird_unknown\\u009b[31m\"}")
+	})
+	_, err := c.PollDeviceAuth(context.Background(), "dev-x")
+	if err == nil {
+		t.Fatal("PollDeviceAuth with unknown error code should fail")
+	}
+	if strings.ContainsRune(err.Error(), '\u009b') || strings.ContainsRune(err.Error(), '\x1b') {
+		t.Fatalf("err = %q, error code carried control bytes through", err.Error())
+	}
+	if !strings.Contains(err.Error(), "weird_unknown") {
+		t.Fatalf("err = %q, expected sanitised code remnant", err.Error())
 	}
 }
 

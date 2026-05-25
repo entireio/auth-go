@@ -408,9 +408,22 @@ func TestExchange_RejectsMalformedClientCredentials(t *testing.T) {
 			errMatch: `disagree`,
 		},
 		{
-			name:     "id disagrees with Extra[client_id] in a multi-value",
+			// Multi-valued Extra["client_id"] is always rejected: servers
+			// parsing via r.PostFormValue see only the first, servers
+			// parsing via r.PostForm[...] see all, and which one wins is
+			// invisible to the caller. Holds even when the typed
+			// ClientID matches the first entry.
+			name:     "Extra[client_id] holds multiple values",
 			req:      withExtra("a", url.Values{"client_id": {"a", "b"}}),
-			errMatch: `disagree`,
+			errMatch: `must hold at most one value`,
+		},
+		{
+			// Same guard as above, but with the typed ClientID unset —
+			// the multi-value Extra is internally inconsistent on its
+			// own, before any cross-surface check kicks in.
+			name:     "Extra[client_id] multi-value without typed ClientID",
+			req:      withExtra("", url.Values{"client_id": {"a", "b"}}),
+			errMatch: `must hold at most one value`,
 		},
 	}
 
@@ -505,12 +518,42 @@ func TestExchange_ServerError(t *testing.T) {
 	}
 }
 
+// TestExchange_SanitisesErrorCode pins that the server-supplied
+// `error` field is sanitised before being interpolated into the
+// returned error. RFC 6749 §4.1.2.1 limits the code to an ASCII
+// alphabet, but the AS is the only enforcer — a buggy or hostile
+// server returning embedded escape bytes must not paint the user's
+// terminal via the code field even though we sanitise the description.
+func TestExchange_SanitisesErrorCode(t *testing.T) {
+	t.Parallel()
+
+	c := newTestClient(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+		writeBody(t, w, "{\"error\":\"invalid_grant\\u009b[31m\",\"error_description\":\"clean\"}")
+	})
+
+	_, err := c.Exchange(context.Background(), ExchangeRequest{
+		SubjectToken:       "sub",
+		SubjectTokenType:   SubjectTokenTypeJWT,
+		RequestedTokenType: "urn:example:t",
+	})
+	if err == nil {
+		t.Fatal("Exchange() with sanitised-code body should still fail")
+	}
+	if strings.ContainsRune(err.Error(), '\u009b') || strings.ContainsRune(err.Error(), '\x1b') {
+		t.Fatalf("error = %q, error code carried control bytes through", err.Error())
+	}
+	if !strings.Contains(err.Error(), "invalid_grant") {
+		t.Fatalf("error = %q, expected sanitised code remnant to remain", err.Error())
+	}
+}
+
 func TestExchange_ServerErrorWithoutJSON(t *testing.T) {
 	t.Parallel()
 
 	c := newTestClient(t, func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusInternalServerError)
-		writeBody(t, w, `something broke`)
+		writeBody(t, w, "something\x00 broke")
 	})
 
 	_, err := c.Exchange(context.Background(), ExchangeRequest{
@@ -519,7 +562,10 @@ func TestExchange_ServerErrorWithoutJSON(t *testing.T) {
 		RequestedTokenType: "urn:example:t",
 	})
 	if err == nil || !strings.Contains(err.Error(), "500") || !strings.Contains(err.Error(), "something broke") {
-		t.Fatalf("error = %v, want status + body text", err)
+		t.Fatalf("error = %v, want status + sanitised body text", err)
+	}
+	if strings.ContainsRune(err.Error(), '\x00') {
+		t.Fatalf("error = %q, contains unsanitised NUL", err.Error())
 	}
 }
 

@@ -142,6 +142,37 @@ func TestNew_RejectsRelativeIssuer(t *testing.T) {
 	}
 }
 
+// TestNew_RejectsNonOriginIssuer pins that Issuer is held to the same
+// origin-URL contract as TokenRequest.Resource. The same-host shortcut
+// in Token byte-compares a normalised Resource against cfg.Issuer; an
+// Issuer that still carries userinfo or a path would silently fail
+// that equality and force every "same origin" call through the STS.
+func TestNew_RejectsNonOriginIssuer(t *testing.T) {
+	t.Parallel()
+	cases := []string{
+		"https://user:pass@auth.example.com", // userinfo
+		"https://auth.example.com/oauth",     // path
+		"https://auth.example.com?x=1",       // query
+		"https://auth.example.com#frag",      // fragment
+		"http://auth.example.com",            // non-loopback http
+		"ftp://auth.example.com",             // unsupported scheme
+	}
+	for _, iss := range cases {
+		t.Run(iss, func(t *testing.T) {
+			t.Parallel()
+			_, err := New(Config{
+				Issuer:   iss,
+				ClientID: testClientID,
+				STSPath:  testSTSPath,
+				Store:    newMemStore(),
+			})
+			if err == nil {
+				t.Fatalf("New(Issuer=%q) returned nil error, want origin-URL rejection", iss)
+			}
+		})
+	}
+}
+
 // TestNew_NormalizesIssuer pins the keyring/shortcut symmetry. Two
 // Managers configured with cosmetically-different but equivalent
 // issuers must share state — otherwise SaveCoreToken writes to one
@@ -394,6 +425,42 @@ func TestToken_ExchangesAndCaches(t *testing.T) {
 	}
 }
 
+// TestToken_SubjectTokenTypeOverride pins the override surface on the
+// new Config.SubjectTokenType field. Without this, a regression that
+// drops the cfg.SubjectTokenType default and hard-codes :access_token
+// at the call site still passes the default-path tests but silently
+// breaks callers who genuinely want :jwt semantics (RFC 7519 JWT-as-
+// credential, not OAuth-issued bearer).
+func TestToken_SubjectTokenTypeOverride(t *testing.T) {
+	t.Parallel()
+	core := makeJWTWithAudience(t, []string{testIssuer})
+	store := newMemStore()
+	store.data[testIssuer] = tokens.TokenSet{AccessToken: core}
+
+	var lastReq sts.ExchangeRequest
+	m, err := New(Config{
+		Issuer:           testIssuer,
+		ClientID:         testClientID,
+		STSPath:          testSTSPath,
+		Store:            store,
+		SubjectTokenType: sts.SubjectTokenTypeJWT,
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	SetExchangeForTest(t, m, func(_ context.Context, req sts.ExchangeRequest) (*tokens.TokenSet, error) {
+		lastReq = req
+		return &tokens.TokenSet{AccessToken: testExchangedTok}, nil
+	})
+
+	if _, err := m.Token(context.Background(), TokenRequest{Resource: testResource}); err != nil {
+		t.Fatalf("Token: %v", err)
+	}
+	if lastReq.SubjectTokenType != sts.SubjectTokenTypeJWT {
+		t.Fatalf("SubjectTokenType = %q, want %q (override)", lastReq.SubjectTokenType, sts.SubjectTokenTypeJWT)
+	}
+}
+
 func TestToken_ExchangeIncludesResource(t *testing.T) {
 	t.Parallel()
 	core := makeJWTWithAudience(t, []string{testIssuer})
@@ -406,12 +473,12 @@ func TestToken_ExchangeIncludesResource(t *testing.T) {
 		return &tokens.TokenSet{AccessToken: testExchangedTok}, nil
 	})
 
-	if _, err := m.TokenForResource(context.Background(), testResource); err != nil {
+	if _, err := m.TokenForResource(context.Background(), testResource+"/"); err != nil {
 		t.Fatalf("TokenForResource: %v", err)
 	}
 
 	if got.Resource != testResource {
-		t.Fatalf("exchange Resource = %q, want %q", got.Resource, testResource)
+		t.Fatalf("exchange Resource = %q, want normalised %q", got.Resource, testResource)
 	}
 }
 
@@ -523,6 +590,44 @@ func TestToken_RequiresResource(t *testing.T) {
 	_, err := m.Token(context.Background(), TokenRequest{})
 	if err == nil {
 		t.Fatal("expected error for empty Resource")
+	}
+}
+
+func TestToken_RejectsNonOriginResource(t *testing.T) {
+	t.Parallel()
+	core := makeJWTWithAudience(t, []string{testIssuer})
+	store := newMemStore()
+	store.data[testIssuer] = tokens.TokenSet{AccessToken: core}
+	m := newTestManager(t, store, nil)
+
+	cases := []string{
+		"api.example.com",
+		"http://api.example.com",
+		"https://user:pass@api.example.com",
+		"https://api.example.com/path",
+		"https://api.example.com?x=1",
+		"https://api.example.com#frag",
+	}
+	for _, resource := range cases {
+		resource := resource
+		t.Run(resource, func(t *testing.T) {
+			t.Parallel()
+			if _, err := m.TokenForResource(context.Background(), resource); err == nil {
+				t.Fatal("expected error")
+			}
+		})
+	}
+}
+
+func TestToken_ValidatesResourceBeforeLoginLookup(t *testing.T) {
+	t.Parallel()
+	m := newTestManager(t, newMemStore(), nil)
+	_, err := m.TokenForResource(context.Background(), "not-a-url")
+	if err == nil || !strings.Contains(err.Error(), "TokenRequest.Resource") {
+		t.Fatalf("err = %v, want resource validation error", err)
+	}
+	if errors.Is(err, ErrNotLoggedIn) {
+		t.Fatalf("err = %v, should validate resource before login state", err)
 	}
 }
 
@@ -871,39 +976,6 @@ func TestSaveCoreToken_ClearsExchangeCache(t *testing.T) {
 	}
 	if calls != 2 {
 		t.Fatalf("exchange calls after save = %d, want 2 (cache must be cleared on save)", calls)
-	}
-}
-
-// TestNormalizeOriginURL covers the cases where same-host / aud-shortcut
-// equality has historically misfired: trailing slash, scheme/host case,
-// default-port presence. Inputs that don't parse as origin URLs must
-// pass through unchanged so non-URL audiences keep byte-exact compare.
-func TestNormalizeOriginURL(t *testing.T) {
-	t.Parallel()
-	cases := []struct {
-		name string
-		in   string
-		want string
-	}{
-		{"empty", "", ""},
-		{"plain", "https://api.example.com", "https://api.example.com"},
-		{"trailing slash", "https://api.example.com/", "https://api.example.com"},
-		{"upper scheme", "HTTPS://api.example.com", "https://api.example.com"},
-		{"upper host", "https://API.Example.COM", "https://api.example.com"},
-		{"default https port", "https://api.example.com:443", "https://api.example.com"},
-		{"default http port", "http://api.example.com:80/", "http://api.example.com"},
-		{"non-default port preserved", "https://api.example.com:8443", "https://api.example.com:8443"},
-		{"path preserved (sans trailing slash)", "https://api.example.com/v2/", "https://api.example.com/v2"},
-		{"non-URL audience passes through", "urn:example:cli", "urn:example:cli"},
-		{"bare string passes through", "some-audience", "some-audience"},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			t.Parallel()
-			if got := normalizeOriginURL(tc.in); got != tc.want {
-				t.Errorf("normalizeOriginURL(%q) = %q, want %q", tc.in, got, tc.want)
-			}
-		})
 	}
 }
 

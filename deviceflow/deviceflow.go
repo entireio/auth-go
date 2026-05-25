@@ -14,10 +14,8 @@ package deviceflow
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net/http"
 	"net/url"
 	"strings"
@@ -217,7 +215,9 @@ var (
 )
 
 // errCodeToSentinel maps an RFC 8628 §3.5 error code string to the
-// matching sentinel. Unknown codes fall through to a generic error.
+// matching sentinel. Unknown codes fall through to a generic error;
+// the AS-supplied code is sanitised before being interpolated, since
+// only the server enforces the §3.5 ASCII alphabet on the wire.
 func errCodeToSentinel(code string) error {
 	switch code {
 	case "authorization_pending":
@@ -231,7 +231,7 @@ func errCodeToSentinel(code string) error {
 	case "invalid_grant":
 		return ErrInvalidGrant
 	default:
-		return fmt.Errorf("oauth error: %s", code)
+		return fmt.Errorf("oauth error: %s", oauthhttp.SanitizeDescription(code))
 	}
 }
 
@@ -315,7 +315,10 @@ func validateVerificationURI(raw string, allowInsecureHTTP bool) error {
 		return fmt.Errorf("%w: too long (%d bytes, max %d)", ErrUnsafeVerificationURI, len(raw), maxVerificationURILen)
 	}
 	for _, r := range raw {
-		if r < 0x20 || r == 0x7f {
+		// C0 (<0x20), DEL (0x7f), and C1 (0x80–0x9f). C1 in particular
+		// includes CSI (U+009B), which 8-bit-aware terminals interpret
+		// as ESC[ — bypassing any naive "low byte" filter.
+		if r < 0x20 || r == 0x7f || (r >= 0x80 && r <= 0x9f) {
 			return fmt.Errorf("%w: contains control character", ErrUnsafeVerificationURI)
 		}
 	}
@@ -352,8 +355,7 @@ func validateVerificationURI(raw string, allowInsecureHTTP bool) error {
 		if !allowInsecureHTTP {
 			return fmt.Errorf("%w: scheme must be https", ErrUnsafeVerificationURI)
 		}
-		host := u.Hostname()
-		if host != "localhost" && host != "127.0.0.1" && host != "::1" {
+		if !oauthhttp.IsLoopbackHost(u.Hostname()) {
 			return fmt.Errorf("%w: http only permitted on loopback hosts", ErrUnsafeVerificationURI)
 		}
 	default:
@@ -475,29 +477,6 @@ func resolveURL(baseURL, path string, allowInsecureHTTP bool) (string, error) {
 	return oauthhttp.ResolveURL(baseURL, path, allowInsecureHTTP) //nolint:wrapcheck // pass through with sentinel-preserving semantics
 }
 
-type errorResponse struct {
-	Error            string `json:"error"`
-	ErrorDescription string `json:"error_description"`
-}
-
-func readAPIErrorResponse(resp *http.Response) (*errorResponse, error) {
-	body, err := io.ReadAll(io.LimitReader(resp.Body, oauthhttp.MaxResponseBytes))
-	if err != nil {
-		return nil, fmt.Errorf("status %d", resp.StatusCode)
-	}
-
-	var apiErr errorResponse
-	if err := json.Unmarshal(body, &apiErr); err == nil && strings.TrimSpace(apiErr.Error) != "" {
-		return &apiErr, nil
-	}
-
-	text := strings.TrimSpace(string(body))
-	if text != "" {
-		return nil, fmt.Errorf("status %d: %s", resp.StatusCode, text)
-	}
-	return nil, fmt.Errorf("status %d", resp.StatusCode)
-}
-
 // readAPIError surfaces an error-shaped response. It routes the AS's
 // `error` code through errCodeToSentinel so callers can errors.Is
 // regardless of which endpoint produced the failure, and appends a
@@ -505,7 +484,7 @@ func readAPIErrorResponse(resp *http.Response) (*errorResponse, error) {
 // and stripping control characters that would otherwise let a hostile
 // AS write ANSI escapes / overflow into the user's terminal.
 func readAPIError(resp *http.Response, action string) error {
-	apiErr, parseErr := readAPIErrorResponse(resp)
+	apiErr, parseErr := oauthhttp.ReadOAuthError(resp)
 	if parseErr != nil {
 		return fmt.Errorf("%s: %w", action, parseErr)
 	}

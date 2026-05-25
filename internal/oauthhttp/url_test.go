@@ -41,13 +41,18 @@ func TestResolveURL_RejectsInsecureHTTP(t *testing.T) {
 	if !errors.Is(err, ErrInsecureBaseURL) {
 		t.Fatalf("err = %v, want ErrInsecureBaseURL", err)
 	}
-	// Opt-in path works.
-	got, err := ResolveURL("http://auth.example.com", "/path", true)
-	if err != nil {
-		t.Fatalf("ResolveURL(http, allowInsecure) err = %v", err)
+	// Opt-in still only permits loopback hosts.
+	_, err = ResolveURL("http://auth.example.com", "/path", true)
+	if !errors.Is(err, ErrInsecureBaseURL) {
+		t.Fatalf("err = %v, want ErrInsecureBaseURL for non-loopback http", err)
 	}
-	if !strings.HasPrefix(got, "http://auth.example.com/") {
-		t.Fatalf("got = %q, want http://auth.example.com/...", got)
+
+	got, err := ResolveURL("http://127.0.0.1:8080", "/path", true)
+	if err != nil {
+		t.Fatalf("ResolveURL(loopback http, allowInsecure) err = %v", err)
+	}
+	if !strings.HasPrefix(got, "http://127.0.0.1:8080/") {
+		t.Fatalf("got = %q, want http://127.0.0.1:8080/...", got)
 	}
 }
 

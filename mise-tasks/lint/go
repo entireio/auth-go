@@ -1,0 +1,16 @@
+#!/bin/sh
+#MISE description="Lint Go"
+
+set -eu
+
+golangci-lint version
+golangci-lint config verify
+
+# In CI, golangci/golangci-lint-action provides inline annotations, so
+# this task only verifies the binary/config there. Locally we run the
+# linter directly, matching ../cli's workflow.
+if [ "${CI:-}" = "true" ]; then
+  echo "skipped because CI=true"
+else
+  golangci-lint run --timeout=5m --fix ./...
+fi
