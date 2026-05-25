@@ -430,8 +430,12 @@ func readAPIError(resp *http.Response) error {
 	if parseErr != nil {
 		return fmt.Errorf("token exchange: %w", parseErr)
 	}
+	// RFC 6749 §4.1.2.1 constrains the error code to a small ASCII
+	// alphabet, but the AS is its only enforcer — sanitise to neutralise
+	// a hostile/buggy server painting the terminal via the code field.
+	code := oauthhttp.SanitizeDescription(apiErr.Error)
 	if desc := oauthhttp.SanitizeDescription(apiErr.ErrorDescription); desc != "" {
-		return fmt.Errorf("token exchange: status %d: %s: %s", resp.StatusCode, apiErr.Error, desc)
+		return fmt.Errorf("token exchange: status %d: %s: %s", resp.StatusCode, code, desc)
 	}
-	return fmt.Errorf("token exchange: status %d: %s", resp.StatusCode, apiErr.Error)
+	return fmt.Errorf("token exchange: status %d: %s", resp.StatusCode, code)
 }

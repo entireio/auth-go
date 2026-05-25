@@ -505,6 +505,36 @@ func TestExchange_ServerError(t *testing.T) {
 	}
 }
 
+// TestExchange_SanitisesErrorCode pins that the server-supplied
+// `error` field is sanitised before being interpolated into the
+// returned error. RFC 6749 §4.1.2.1 limits the code to an ASCII
+// alphabet, but the AS is the only enforcer — a buggy or hostile
+// server returning embedded escape bytes must not paint the user's
+// terminal via the code field even though we sanitise the description.
+func TestExchange_SanitisesErrorCode(t *testing.T) {
+	t.Parallel()
+
+	c := newTestClient(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+		writeBody(t, w, "{\"error\":\"invalid_grant\\u009b[31m\",\"error_description\":\"clean\"}")
+	})
+
+	_, err := c.Exchange(context.Background(), ExchangeRequest{
+		SubjectToken:       "sub",
+		SubjectTokenType:   SubjectTokenTypeJWT,
+		RequestedTokenType: "urn:example:t",
+	})
+	if err == nil {
+		t.Fatal("Exchange() with sanitised-code body should still fail")
+	}
+	if strings.ContainsRune(err.Error(), '\u009b') || strings.ContainsRune(err.Error(), '\x1b') {
+		t.Fatalf("error = %q, error code carried control bytes through", err.Error())
+	}
+	if !strings.Contains(err.Error(), "invalid_grant") {
+		t.Fatalf("error = %q, expected sanitised code remnant to remain", err.Error())
+	}
+}
+
 func TestExchange_ServerErrorWithoutJSON(t *testing.T) {
 	t.Parallel()
 

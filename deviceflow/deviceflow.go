@@ -215,7 +215,9 @@ var (
 )
 
 // errCodeToSentinel maps an RFC 8628 §3.5 error code string to the
-// matching sentinel. Unknown codes fall through to a generic error.
+// matching sentinel. Unknown codes fall through to a generic error;
+// the AS-supplied code is sanitised before being interpolated, since
+// only the server enforces the §3.5 ASCII alphabet on the wire.
 func errCodeToSentinel(code string) error {
 	switch code {
 	case "authorization_pending":
@@ -229,7 +231,7 @@ func errCodeToSentinel(code string) error {
 	case "invalid_grant":
 		return ErrInvalidGrant
 	default:
-		return fmt.Errorf("oauth error: %s", code)
+		return fmt.Errorf("oauth error: %s", oauthhttp.SanitizeDescription(code))
 	}
 }
 
@@ -313,7 +315,10 @@ func validateVerificationURI(raw string, allowInsecureHTTP bool) error {
 		return fmt.Errorf("%w: too long (%d bytes, max %d)", ErrUnsafeVerificationURI, len(raw), maxVerificationURILen)
 	}
 	for _, r := range raw {
-		if r < 0x20 || r == 0x7f {
+		// C0 (<0x20), DEL (0x7f), and C1 (0x80–0x9f). C1 in particular
+		// includes CSI (U+009B), which 8-bit-aware terminals interpret
+		// as ESC[ — bypassing any naive "low byte" filter.
+		if r < 0x20 || r == 0x7f || (r >= 0x80 && r <= 0x9f) {
 			return fmt.Errorf("%w: contains control character", ErrUnsafeVerificationURI)
 		}
 	}
