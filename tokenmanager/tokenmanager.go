@@ -180,11 +180,16 @@ func New(cfg Config) (*Manager, error) {
 	if err := cfg.validate(); err != nil {
 		return nil, err
 	}
-	parsed, err := url.Parse(cfg.Issuer)
-	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
-		return nil, fmt.Errorf("Config.Issuer must be an absolute URL with scheme and host, got %q", cfg.Issuer)
+	// Hold Issuer to the same origin-URL contract as TokenRequest.Resource:
+	// userinfo, path, query, fragment all forbidden. The same-host shortcut
+	// (Token) byte-compares the normalised Resource against cfg.Issuer; an
+	// Issuer that still carries userinfo or a path silently fails that
+	// equality even when the caller's Resource is the "same" origin.
+	normIssuer, err := oauthhttp.ValidateOriginURL(cfg.Issuer, cfg.AllowInsecureHTTP, "Config.Issuer")
+	if err != nil {
+		return nil, err //nolint:wrapcheck // pass through with field-named message
 	}
-	cfg.Issuer = oauthhttp.NormalizeOriginURL(cfg.Issuer)
+	cfg.Issuer = normIssuer
 	if cfg.RequestedTokenType == "" {
 		cfg.RequestedTokenType = DefaultRequestedTokenType
 	}

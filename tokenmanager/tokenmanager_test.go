@@ -142,6 +142,37 @@ func TestNew_RejectsRelativeIssuer(t *testing.T) {
 	}
 }
 
+// TestNew_RejectsNonOriginIssuer pins that Issuer is held to the same
+// origin-URL contract as TokenRequest.Resource. The same-host shortcut
+// in Token byte-compares a normalised Resource against cfg.Issuer; an
+// Issuer that still carries userinfo or a path would silently fail
+// that equality and force every "same origin" call through the STS.
+func TestNew_RejectsNonOriginIssuer(t *testing.T) {
+	t.Parallel()
+	cases := []string{
+		"https://user:pass@auth.example.com", // userinfo
+		"https://auth.example.com/oauth",     // path
+		"https://auth.example.com?x=1",       // query
+		"https://auth.example.com#frag",      // fragment
+		"http://auth.example.com",            // non-loopback http
+		"ftp://auth.example.com",             // unsupported scheme
+	}
+	for _, iss := range cases {
+		t.Run(iss, func(t *testing.T) {
+			t.Parallel()
+			_, err := New(Config{
+				Issuer:   iss,
+				ClientID: testClientID,
+				STSPath:  testSTSPath,
+				Store:    newMemStore(),
+			})
+			if err == nil {
+				t.Fatalf("New(Issuer=%q) returned nil error, want origin-URL rejection", iss)
+			}
+		})
+	}
+}
+
 // TestNew_NormalizesIssuer pins the keyring/shortcut symmetry. Two
 // Managers configured with cosmetically-different but equivalent
 // issuers must share state — otherwise SaveCoreToken writes to one
