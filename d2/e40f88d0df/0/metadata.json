@@ -1,0 +1,23 @@
+{
+  "cli_version": "v0.6.3-nightly.202605210728.73db6f8c-dev-80fc8099a",
+  "checkpoint_id": "d2e40f88d0df",
+  "session_id": "8d7d7d1c-1d44-45f0-8ee8-831c86c18fdb",
+  "strategy": "manual-commit",
+  "created_at": "2026-05-25T01:21:25.538194Z",
+  "branch": "soph/more-improvements-fixes",
+  "checkpoints_count": 1,
+  "files_touched": [],
+  "agent": "Claude Code",
+  "model": "claude-opus-4-7[1m]",
+  "turn_id": "30564307fc39",
+  "token_usage": {
+    "input_tokens": 155,
+    "cache_creation_tokens": 281465,
+    "cache_read_tokens": 11995245,
+    "output_tokens": 47332,
+    "api_call_count": 112
+  },
+  "session_metrics": {
+    "turn_count": 7
+  }
+}
