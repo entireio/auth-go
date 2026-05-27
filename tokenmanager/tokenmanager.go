@@ -297,6 +297,19 @@ func (m *Manager) LookupCoreToken() (string, error) {
 	return t.AccessToken, nil
 }
 
+// Refresh ensures a fresh login JWT, re-minting it from the stored refresh
+// token when the current one is expired or near expiry, and returns it.
+// It is idempotent when the token is already fresh (a cheap store read, no
+// grant). Returns ErrNotLoggedIn when no credential is stored (or an
+// expired one carries no refresh token), and ErrReauthRequired when the
+// refresh token is revoked/expired.
+//
+// Callers can use this to warm the session at startup and surface a
+// re-login prompt before the first data call rather than mid-request.
+func (m *Manager) Refresh(ctx context.Context) (string, error) {
+	return m.ensureFreshLogin(ctx)
+}
+
 // DeleteCoreToken removes the stored core token and any cached
 // exchanges derived from it.
 //
@@ -364,20 +377,9 @@ func (m *Manager) Token(ctx context.Context, req TokenRequest) (string, error) {
 		return "", err
 	}
 
-	core, err := m.LookupCoreToken()
+	core, err := m.ensureFreshLogin(ctx)
 	if err != nil {
 		return "", err
-	}
-	if core == "" {
-		return "", ErrNotLoggedIn
-	}
-	// Preflight expiry: a long-stored core token would otherwise hit the
-	// resource (or STS) and surface as a confusing "invalid_grant" /
-	// "401". Parse-failure is intentionally not treated as expired —
-	// opaque (non-JWT) access tokens have no client-visible expiry, so
-	// we let them flow and trust the server to reject if necessary.
-	if coreTokenExpired(core, m.now()) {
-		return "", ErrNotLoggedIn
 	}
 
 	// m.cfg.Issuer was normalized at New() time, so no re-normalize here.

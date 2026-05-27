@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/entireio/auth-go/refresh"
+	"github.com/entireio/auth-go/sts"
 	"github.com/entireio/auth-go/tokens"
 )
 
@@ -393,5 +394,128 @@ func TestEnsureFreshLogin_CoalescesConcurrentCallers(t *testing.T) {
 	}
 	if lock.acquired != 1 {
 		t.Fatalf("cross-process lock acquired = %d, want 1 (only one goroutine should reach the gate)", lock.acquired)
+	}
+}
+
+// TestToken_RefreshesExpiredThenExchanges pins the end-to-end path: an
+// expired login JWT is re-minted before the exchange runs, and the exchange
+// cache is cleared by the re-mint so a fresh exchange fires against the new
+// login JWT.
+func TestToken_RefreshesExpiredThenExchanges(t *testing.T) {
+	t.Parallel()
+	now := time.Date(2026, 5, 27, 12, 0, 0, 0, time.UTC)
+	// Start with a fresh login JWT (aud = issuer only, so testResource
+	// needs an exchange) plus a refresh token.
+	liveCore := makeJWTWithExp(t, now.Add(time.Hour), []string{testIssuer})
+	store := newMemStore()
+	store.data[testIssuer] = tokens.TokenSet{AccessToken: liveCore, RefreshToken: "rt-1"}
+
+	m, err := New(Config{Issuer: testIssuer, ClientID: testClientID, STSPath: testSTSPath, RefreshPath: "/p", Store: store})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	SetNowForTest(t, m, func() time.Time { return now })
+
+	var exchanges int
+	SetExchangeForTest(t, m, func(_ context.Context, _ sts.ExchangeRequest) (*tokens.TokenSet, error) {
+		exchanges++
+		return &tokens.TokenSet{AccessToken: "exchanged", ExpiresAt: now.Add(5 * time.Minute)}, nil
+	})
+
+	var grants int
+	newCore := makeJWTWithExp(t, now.Add(8*time.Hour), []string{testIssuer})
+	SetRefreshForTest(t, m, func(_ context.Context, _ refresh.Request) (*tokens.TokenSet, error) {
+		grants++
+		return &tokens.TokenSet{AccessToken: newCore, RefreshToken: "rt-2"}, nil
+	})
+
+	// First call: core live → exchange fires once, cached.
+	if _, err := m.TokenForResource(context.Background(), testResource); err != nil {
+		t.Fatalf("first: %v", err)
+	}
+	if exchanges != 1 || grants != 0 {
+		t.Fatalf("after first: exchanges=%d grants=%d, want 1/0", exchanges, grants)
+	}
+
+	// Advance past the login JWT's exp; the next call must refresh first,
+	// which clears the exchange cache, then re-exchange.
+	now = now.Add(2 * time.Hour)
+	if _, err := m.TokenForResource(context.Background(), testResource); err != nil {
+		t.Fatalf("second: %v", err)
+	}
+	if grants != 1 {
+		t.Fatalf("grants = %d, want 1 (refresh on expiry)", grants)
+	}
+	if exchanges != 2 {
+		t.Fatalf("exchanges = %d, want 2 (cache cleared by refresh)", exchanges)
+	}
+	if store.data[testIssuer].RefreshToken != "rt-2" {
+		t.Fatalf("stored RT = %q, want rotated rt-2", store.data[testIssuer].RefreshToken)
+	}
+}
+
+// TestToken_RefreshExhaustedSurfacesReauth pins that a terminal refresh
+// failure surfaces as ErrReauthRequired through Token.
+func TestToken_RefreshExhaustedSurfacesReauth(t *testing.T) {
+	t.Parallel()
+	now := time.Date(2026, 5, 27, 12, 0, 0, 0, time.UTC)
+	store := newMemStore()
+	store.data[testIssuer] = tokens.TokenSet{AccessToken: makeJWTWithExp(t, now.Add(-time.Hour), nil), RefreshToken: "rt-1"}
+
+	m, _ := New(Config{Issuer: testIssuer, ClientID: testClientID, STSPath: testSTSPath, RefreshPath: "/p", Store: store})
+	SetNowForTest(t, m, func() time.Time { return now })
+	SetRefreshForTest(t, m, func(_ context.Context, _ refresh.Request) (*tokens.TokenSet, error) {
+		return nil, refresh.ErrInvalidGrant
+	})
+
+	if _, err := m.TokenForResource(context.Background(), testResource); !errors.Is(err, ErrReauthRequired) {
+		t.Fatalf("err = %v, want ErrReauthRequired", err)
+	}
+}
+
+// TestToken_RefreshNeededWithoutPathSurfacesNoRefreshPath pins that the
+// missing-config error propagates through Token.
+func TestToken_RefreshNeededWithoutPathSurfacesNoRefreshPath(t *testing.T) {
+	t.Parallel()
+	now := time.Date(2026, 5, 27, 12, 0, 0, 0, time.UTC)
+	store := newMemStore()
+	store.data[testIssuer] = tokens.TokenSet{AccessToken: makeJWTWithExp(t, now.Add(-time.Hour), nil), RefreshToken: "rt-1"}
+	// No RefreshPath, no refresh override.
+	m, _ := New(Config{Issuer: testIssuer, ClientID: testClientID, STSPath: testSTSPath, Store: store})
+	SetNowForTest(t, m, func() time.Time { return now })
+
+	if _, err := m.TokenForResource(context.Background(), testResource); !errors.Is(err, ErrNoRefreshPath) {
+		t.Fatalf("err = %v, want ErrNoRefreshPath", err)
+	}
+}
+
+func TestRefresh_ExportedIdempotentWhenFresh(t *testing.T) {
+	t.Parallel()
+	store := newMemStore()
+	fresh := freshJWT(t)
+	store.data[testIssuer] = tokens.TokenSet{AccessToken: fresh, RefreshToken: "rt-1"}
+	m, _ := New(Config{Issuer: testIssuer, ClientID: testClientID, RefreshPath: "/p", Store: store})
+	SetRefreshForTest(t, m, func(_ context.Context, _ refresh.Request) (*tokens.TokenSet, error) {
+		t.Fatal("Refresh must not grant when token is fresh")
+		return nil, errors.New("unreachable")
+	})
+	got, err := m.Refresh(context.Background())
+	if err != nil || got != fresh {
+		t.Fatalf("Refresh = (%q, %v), want fresh / nil", got, err)
+	}
+}
+
+func TestRefresh_ExportedReMintsWhenExpired(t *testing.T) {
+	t.Parallel()
+	store := newMemStore()
+	store.data[testIssuer] = tokens.TokenSet{AccessToken: expiredJWT(t), RefreshToken: "rt-1"}
+	m, _ := New(Config{Issuer: testIssuer, ClientID: testClientID, RefreshPath: "/p", Store: store})
+	fresh := freshJWT(t)
+	SetRefreshForTest(t, m, func(_ context.Context, _ refresh.Request) (*tokens.TokenSet, error) {
+		return &tokens.TokenSet{AccessToken: fresh, RefreshToken: "rt-2"}, nil
+	})
+	got, err := m.Refresh(context.Background())
+	if err != nil || got != fresh {
+		t.Fatalf("Refresh = (%q, %v), want fresh / nil", got, err)
 	}
 }
