@@ -16,16 +16,21 @@ package tokenmanager
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/entireio/auth-go/internal/oauthhttp"
+	"github.com/entireio/auth-go/internal/proclock"
+	"github.com/entireio/auth-go/refresh"
 	"github.com/entireio/auth-go/sts"
 	"github.com/entireio/auth-go/tokens"
 	"github.com/entireio/auth-go/tokenstore"
@@ -54,6 +59,18 @@ var ErrNotLoggedIn = errors.New("not logged in")
 // reach this; split-host deployments must configure STSPath.
 var ErrNoSTSPath = errors.New("token exchange required but Config.STSPath is empty")
 
+// ErrReauthRequired is returned by Token / Refresh when the stored refresh
+// token is genuinely revoked or expired (server returned invalid_grant and
+// a store re-read confirmed the refresh token was not concurrently
+// rotated). Distinct from ErrNotLoggedIn — there was a credential, the
+// session simply needs a fresh interactive login. Callers can match on it
+// to render "your session expired, log in again".
+var ErrReauthRequired = errors.New("reauthentication required")
+
+// ErrNoRefreshPath is returned when a refresh is needed but
+// Config.RefreshPath is empty. Mirrors ErrNoSTSPath.
+var ErrNoRefreshPath = errors.New("refresh required but Config.RefreshPath is empty")
+
 // Config configures a Manager.
 type Config struct {
 	// Issuer is the auth host base URL where the device-flow login
@@ -72,6 +89,19 @@ type Config struct {
 	// empty. When empty and an exchange is attempted, runExchange
 	// returns ErrNoSTSPath rather than POSTing to a bogus URL.
 	STSPath string
+
+	// RefreshPath is the token-endpoint path where grant_type=refresh_token
+	// is POSTed to re-mint the login JWT. Optional: when empty and a
+	// refresh is needed, runRefresh returns ErrNoRefreshPath. Often equal
+	// to STSPath or the device-flow token path, since servers typically
+	// multiplex grants at one /oauth/token.
+	RefreshPath string
+
+	// LockDir is the directory holding the cross-process advisory lock
+	// file. Empty → os.UserCacheDir()/auth-go (falling back to the system
+	// temp dir if the user cache dir is unavailable). The lock file holds
+	// no credentials.
+	LockDir string
 
 	// Store persists the core token. Required. Use any tokenstore.Store
 	// implementation; a per-CLI service name keeps credentials isolated
@@ -140,6 +170,16 @@ func (c Config) validate() error {
 type exchangeFunc func(ctx context.Context, req sts.ExchangeRequest) (*tokens.TokenSet, error)
 type nowFuncType func() time.Time
 
+// ProcessLock serialises credential refreshes across processes. Acquire
+// blocks until the lock is held or ctx is done, returning an idempotent
+// release func. The default implementation is a file lock
+// (internal/proclock); SetProcessLockForTest swaps a fake.
+type ProcessLock interface {
+	Acquire(ctx context.Context) (release func(), err error)
+}
+
+type refreshFunc func(ctx context.Context, req refresh.Request) (*tokens.TokenSet, error)
+
 // Manager orchestrates core-token storage and STS exchanges. Safe for
 // concurrent use.
 type Manager struct {
@@ -155,6 +195,17 @@ type Manager struct {
 	// against test setup/teardown.
 	exchangeOverride atomic.Pointer[exchangeFunc]
 	nowOverride      atomic.Pointer[nowFuncType]
+
+	// refreshMu is the in-process single-flight gate for re-mints. Held
+	// across the cross-process lock + grant so concurrent goroutines
+	// coalesce onto one re-mint (the second waiter re-reads a fresh token).
+	refreshMu sync.Mutex //nolint:unused // wired in doRefresh (Task 5)
+
+	refreshOverride atomic.Pointer[refreshFunc]
+	lockOverride    atomic.Pointer[ProcessLock]
+
+	lockOnce    sync.Once
+	defaultLock ProcessLock
 }
 
 // now returns the manager's effective clock. Tests can replace it via
@@ -511,6 +562,68 @@ func (m *Manager) cacheStore(key cacheKey, t *tokens.TokenSet) {
 		expiresAt:   t.ExpiresAt,
 		cachedAt:    m.now(),
 	}
+}
+
+// fileLockPath adapts a derived lock path to ProcessLock via
+// internal/proclock. The exported path field lets tests assert the
+// per-identity derivation without importing proclock.
+type fileLockPath struct {
+	path string
+	lock *proclock.FileLock
+}
+
+func (f *fileLockPath) Acquire(ctx context.Context) (func(), error) {
+	return f.lock.Acquire(ctx) //nolint:wrapcheck // proclock already prefixes "proclock:"
+}
+
+// processLock returns the test override if set, else the lazily-built
+// default file lock. The lock path is keyed on (ClientID, Issuer) — the
+// identity that scopes the stored credential — so unrelated CLIs sharing
+// an issuer don't serialise against each other.
+func (m *Manager) processLock() ProcessLock {
+	if p := m.lockOverride.Load(); p != nil {
+		return *p
+	}
+	m.lockOnce.Do(func() {
+		dir := m.cfg.LockDir
+		if dir == "" {
+			if cache, err := os.UserCacheDir(); err == nil {
+				dir = filepath.Join(cache, "auth-go")
+			} else {
+				dir = filepath.Join(os.TempDir(), "auth-go")
+			}
+		}
+		sum := sha256.Sum256([]byte(m.cfg.ClientID + "\x00" + m.cfg.Issuer))
+		path := filepath.Join(dir, hex.EncodeToString(sum[:])+".lock")
+		m.defaultLock = &fileLockPath{path: path, lock: proclock.New(path)}
+	})
+	return m.defaultLock
+}
+
+// runRefresh dispatches to the test override (if set) else a freshly built
+// refresh.Client pointing at Issuer + RefreshPath. client_id is sent on
+// both surfaces (Basic auth via the typed field, form body via Extra),
+// matching runExchange — see sts.ExchangeRequest.ClientID for the why.
+func (m *Manager) runRefresh(ctx context.Context, refreshToken string) (*tokens.TokenSet, error) {
+	req := refresh.Request{
+		RefreshToken: refreshToken,
+		ClientID:     m.cfg.ClientID,
+		Extra:        url.Values{"client_id": {m.cfg.ClientID}},
+	}
+	if p := m.refreshOverride.Load(); p != nil {
+		return (*p)(ctx, req)
+	}
+	if strings.TrimSpace(m.cfg.RefreshPath) == "" {
+		return nil, ErrNoRefreshPath
+	}
+	client := &refresh.Client{
+		Transport:         m.cfg.Transport,
+		BaseURL:           m.cfg.Issuer,
+		Path:              m.cfg.RefreshPath,
+		UserAgent:         m.cfg.UserAgent,
+		AllowInsecureHTTP: m.cfg.AllowInsecureHTTP,
+	}
+	return client.Refresh(ctx, req) //nolint:wrapcheck // refresh.Refresh already prefixes "refresh token:"
 }
 
 // runExchange dispatches to either Config.Exchange (test override) or

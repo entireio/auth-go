@@ -4,6 +4,7 @@ import (
 	"context"
 	"time"
 
+	"github.com/entireio/auth-go/refresh"
 	"github.com/entireio/auth-go/sts"
 	"github.com/entireio/auth-go/tokens"
 )
@@ -65,4 +66,34 @@ func SetNowForTest(t TestingTB, m *Manager, now func() time.Time) {
 	t.Cleanup(func() {
 		m.nowOverride.Store(prev)
 	})
+}
+
+// SetRefreshForTest replaces the refresh_token-grant dispatch on m with fn
+// for the lifetime of the test, restoring the previous override on
+// t.Cleanup. Held behind atomic.Pointer so it doesn't race runRefresh's
+// hot-path read. Mirrors SetExchangeForTest — production callers can't set
+// it, so a fake can't bypass the real grant.
+func SetRefreshForTest(t TestingTB, m *Manager, fn func(context.Context, refresh.Request) (*tokens.TokenSet, error)) {
+	t.Helper()
+	prev := m.refreshOverride.Load()
+	if fn == nil {
+		m.refreshOverride.Store(nil)
+	} else {
+		stored := refreshFunc(fn)
+		m.refreshOverride.Store(&stored)
+	}
+	t.Cleanup(func() { m.refreshOverride.Store(prev) })
+}
+
+// SetProcessLockForTest replaces the cross-process lock on m with lock for
+// the lifetime of the test, restoring the previous override on t.Cleanup.
+func SetProcessLockForTest(t TestingTB, m *Manager, lock ProcessLock) {
+	t.Helper()
+	prev := m.lockOverride.Load()
+	if lock == nil {
+		m.lockOverride.Store(nil)
+	} else {
+		m.lockOverride.Store(&lock)
+	}
+	t.Cleanup(func() { m.lockOverride.Store(prev) })
 }
