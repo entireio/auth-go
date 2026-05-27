@@ -306,6 +306,11 @@ func (m *Manager) LookupCoreToken() (string, error) {
 //
 // Callers can use this to warm the session at startup and surface a
 // re-login prompt before the first data call rather than mid-request.
+//
+// Expiry is judged from the login JWT's exp claim. Opaque (non-JWT)
+// stored tokens have no client-visible expiry, so they are treated as
+// live and never trigger a re-mint — the refresh tier assumes a JWT login
+// token (as in the three-tier session model).
 func (m *Manager) Refresh(ctx context.Context) (string, error) {
 	return m.ensureFreshLogin(ctx)
 }
