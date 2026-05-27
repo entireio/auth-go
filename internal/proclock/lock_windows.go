@@ -29,6 +29,7 @@ func tryLock(f *os.File) (bool, error) {
 	return false, err
 }
 
+// unlock releases the lock held on f.
 func unlock(f *os.File) error {
 	var overlapped windows.Overlapped
 	return windows.UnlockFileEx(windows.Handle(f.Fd()), 0, 1, 0, &overlapped)

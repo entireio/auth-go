@@ -23,6 +23,7 @@ func tryLock(f *os.File) (bool, error) {
 	return false, err
 }
 
+// unlock releases the lock held on f.
 func unlock(f *os.File) error {
 	return unix.Flock(int(f.Fd()), unix.LOCK_UN)
 }

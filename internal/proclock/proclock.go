@@ -37,8 +37,8 @@ func New(path string) *FileLock { return &FileLock{path: path} }
 
 // Acquire blocks until the exclusive lock is held or ctx is done. It
 // returns an idempotent release func; call it to release the lock and
-// close the underlying handle. Acquire applies defaultAcquireTimeout when
-// ctx has no earlier deadline.
+// close the underlying handle. Acquire applies defaultAcquireTimeout as a
+// ceiling: if ctx already carries an earlier deadline, that deadline wins.
 func (l *FileLock) Acquire(ctx context.Context) (func(), error) {
 	ctx, cancel := context.WithTimeout(ctx, defaultAcquireTimeout)
 	// cancel is wired into the release path below so the timeout context

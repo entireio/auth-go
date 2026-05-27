@@ -68,7 +68,7 @@ func TestFileLock_ContextCancel(t *testing.T) {
 	if _, err := waiter.Acquire(ctx); err == nil {
 		t.Fatal("waiter Acquire returned nil error, want ctx deadline")
 	}
-	if elapsed := time.Since(start); elapsed > time.Second {
+	if elapsed := time.Since(start); elapsed > 250*time.Millisecond {
 		t.Fatalf("waiter blocked %v, want to honour the 50ms ctx deadline", elapsed)
 	}
 }
