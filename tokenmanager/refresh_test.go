@@ -518,4 +518,7 @@ func TestRefresh_ExportedReMintsWhenExpired(t *testing.T) {
 	if err != nil || got != fresh {
 		t.Fatalf("Refresh = (%q, %v), want fresh / nil", got, err)
 	}
+	if store.data[testIssuer].RefreshToken != "rt-2" {
+		t.Fatalf("stored RT = %q, want rotated rt-2", store.data[testIssuer].RefreshToken)
+	}
 }

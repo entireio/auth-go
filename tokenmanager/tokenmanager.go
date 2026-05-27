@@ -360,11 +360,15 @@ func (m *Manager) TokenForResource(ctx context.Context, resourceBaseURL string) 
 // Resolution rules:
 //
 //  1. No core token in the store → ErrNotLoggedIn.
-//  2. m.Issuer() == req.Resource (and req.Audience is empty) → use
+//  2. Core (login JWT) expired or near expiry → transparently re-mint it
+//     from the stored refresh token (see Refresh). No refresh token →
+//     ErrNotLoggedIn; refresh token revoked/expired → ErrReauthRequired;
+//     Config.RefreshPath unset → ErrNoRefreshPath.
+//  3. m.Issuer() == req.Resource (and req.Audience is empty) → use
 //     the core token directly. Single-host deployments hit this path.
-//  3. Core token's `aud` claim already includes req.Resource → use
+//  4. Core token's `aud` claim already includes req.Resource → use
 //     the core token directly. Multi-audience tokens skip exchange.
-//  4. Otherwise → RFC 8693 token exchange.
+//  5. Otherwise → RFC 8693 token exchange.
 //
 // Successful exchanges are cached in-memory keyed by (core token,
 // resource, audience, requested-token-type, scope) until expiry.
