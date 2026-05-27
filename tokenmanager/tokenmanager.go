@@ -717,6 +717,9 @@ func (m *Manager) persistRefreshed(prev tokens.TokenSet, res *tokens.TokenSet) e
 // a still-fresh token (the common case) returns immediately. ErrNotLoggedIn
 // when no credential is stored or an expired one has no refresh token;
 // ErrReauthRequired when the refresh token is revoked/expired.
+// The fast path intentionally mirrors freshOrProceed's checks to avoid
+// taking refreshMu on the common case of a still-fresh token; keep the two
+// in sync if you add an early-exit condition.
 func (m *Manager) ensureFreshLogin(ctx context.Context) (string, error) {
 	set, ok, err := m.loadTokenSet()
 	if err != nil {
@@ -764,7 +767,7 @@ func (m *Manager) refreshLocked(ctx context.Context) (string, error) {
 // is fresh now, no credential exists, or an expired token has no refresh
 // token. done=false means "still expired with a refresh token — proceed to
 // the re-mint".
-func (m *Manager) freshOrProceed() (tok string, done bool, err error) {
+func (m *Manager) freshOrProceed() (string, bool, error) {
 	set, ok, err := m.loadTokenSet()
 	if err != nil {
 		return "", true, err

@@ -362,11 +362,16 @@ func TestEnsureFreshLogin_CoalescesConcurrentCallers(t *testing.T) {
 
 	const n = 8
 	var wg sync.WaitGroup
+	var ready sync.WaitGroup
+	ready.Add(n)
+	start := make(chan struct{})
 	errs := make(chan error, n)
 	for i := 0; i < n; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
+			ready.Done()
+			<-start // park until all goroutines are live, then race together
 			got, err := m.ensureFreshLogin(context.Background())
 			if err == nil && got != fresh {
 				err = errors.New("got stale token")
@@ -374,6 +379,8 @@ func TestEnsureFreshLogin_CoalescesConcurrentCallers(t *testing.T) {
 			errs <- err
 		}()
 	}
+	ready.Wait() // all goroutines parked at the barrier
+	close(start) // release them simultaneously
 	wg.Wait()
 	close(errs)
 	for err := range errs {
@@ -383,5 +390,8 @@ func TestEnsureFreshLogin_CoalescesConcurrentCallers(t *testing.T) {
 	}
 	if g := grants.Load(); g != 1 {
 		t.Fatalf("grants fired = %d, want exactly 1 (single-flight)", g)
+	}
+	if lock.acquired != 1 {
+		t.Fatalf("cross-process lock acquired = %d, want 1 (only one goroutine should reach the gate)", lock.acquired)
 	}
 }
