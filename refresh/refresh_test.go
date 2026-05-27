@@ -204,3 +204,27 @@ func TestRefresh_NowSeamDerivesExpiry(t *testing.T) {
 		t.Fatalf("ExpiresAt = %v, want %v", ts.ExpiresAt, fixed.Add(time.Hour))
 	}
 }
+
+// TestRefresh_ClampsHugeExpiresIn pins that an absurd server-provided
+// expires_in is clamped rather than overflowing time.Duration's int64
+// nanosecond range. 9_300_000_000s × 1e9 ns/s ≈ 9.3e18 just exceeds the
+// int64 max (~9.22e18), so unclamped it wraps to a negative duration and
+// places ExpiresAt in the past — making a freshly-minted token look
+// already-expired.
+func TestRefresh_ClampsHugeExpiresIn(t *testing.T) {
+	t.Parallel()
+	now := time.Date(2026, 5, 27, 12, 0, 0, 0, time.UTC)
+	srv := newServer(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"access_token":"jwt","expires_in":9300000000}`))
+	})
+	c := &refresh.Client{BaseURL: srv.URL, Path: "/oauth/token", AllowInsecureHTTP: true}
+	refresh.SetNowForTest(t, c, func() time.Time { return now })
+	ts, err := c.Refresh(context.Background(), refresh.Request{RefreshToken: "rt"})
+	if err != nil {
+		t.Fatalf("Refresh: %v", err)
+	}
+	if !ts.ExpiresAt.After(now) {
+		t.Fatalf("ExpiresAt = %v, want a future time (clamped, not overflowed into the past)", ts.ExpiresAt)
+	}
+}

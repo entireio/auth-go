@@ -238,9 +238,27 @@ func (c *Client) Refresh(ctx context.Context, req Request) (*tokens.TokenSet, er
 		Scope:        raw.Scope,
 	}
 	if raw.ExpiresIn > 0 {
-		ts.ExpiresAt = c.now().Add(time.Duration(raw.ExpiresIn) * time.Second)
+		ts.ExpiresAt = c.now().Add(expiresInDuration(raw.ExpiresIn))
 	}
 	return ts, nil
+}
+
+// maxExpiresInSeconds caps a server-provided expires_in before it is
+// multiplied into a time.Duration. Without a ceiling, a hostile or buggy
+// AS returning a value above ~9.2e9 overflows time.Duration's int64
+// nanosecond range, wrapping ExpiresAt into the past so a freshly-minted
+// token looks already-expired. 100 years is far beyond any real token
+// lifetime and safely below the overflow threshold. Mirrors the
+// defensive clamp deviceflow applies to its interval field.
+const maxExpiresInSeconds = 100 * 365 * 24 * 60 * 60
+
+// expiresInDuration converts a server-provided expires_in (seconds) to a
+// time.Duration, clamping at maxExpiresInSeconds to avoid int64 overflow.
+func expiresInDuration(secs int) time.Duration {
+	if secs > maxExpiresInSeconds {
+		secs = maxExpiresInSeconds
+	}
+	return time.Duration(secs) * time.Second
 }
 
 // buildForm renders a Request into the wire form, layering the standard
