@@ -8,9 +8,9 @@
 // The package is provider-agnostic: every endpoint, identifier, and
 // default value comes from Config. It has no env-var reads, no
 // implicit URLs, and no embedded provider tables. Tests inject
-// behaviour via SetExchangeForTest / SetNowForTest (see testseams.go)
-// rather than via the public Config — keeping the STS call out of the
-// caller-controllable surface.
+// behaviour via SetExchangeForTest / SetNowForTest / SetRefreshForTest /
+// SetProcessLockForTest (see testseams.go) rather than via the public
+// Config — keeping the STS call out of the caller-controllable surface.
 package tokenmanager
 
 import (
@@ -49,9 +49,10 @@ const DefaultRequestedTokenType = "urn:ietf:params:oauth:token-type:access_token
 // the worst case (re-exchange one extra time per command) is cheap.
 const exchangeSkew = 30 * time.Second
 
-// ErrNotLoggedIn is returned by Token / TokenForResource when no core
-// token is present in the store. Callers can match on it to render a
-// "run <login>" message.
+// ErrNotLoggedIn is returned by Token / TokenForResource when no core token
+// is present in the store, or when a stored token is expired and carries no
+// refresh token (the session cannot be silently renewed). Callers can match
+// on it to render a "run <login>" message.
 var ErrNotLoggedIn = errors.New("not logged in")
 
 // ErrNoSTSPath is returned when an exchange is needed but Config.STSPath
@@ -174,6 +175,7 @@ type nowFuncType func() time.Time
 // blocks until the lock is held or ctx is done, returning an idempotent
 // release func. The default implementation is a file lock
 // (internal/proclock); SetProcessLockForTest swaps a fake.
+// On error the returned release func is nil and must not be called.
 type ProcessLock interface {
 	Acquire(ctx context.Context) (release func(), err error)
 }
@@ -201,6 +203,8 @@ type Manager struct {
 	// coalesce onto one re-mint (the second waiter re-reads a fresh token).
 	refreshMu sync.Mutex
 
+	// Refresh + process-lock test seams; see SetRefreshForTest /
+	// SetProcessLockForTest. Same atomic.Pointer rationale as above.
 	refreshOverride atomic.Pointer[refreshFunc]
 	lockOverride    atomic.Pointer[ProcessLock]
 
@@ -688,7 +692,14 @@ func (m *Manager) doRefresh(ctx context.Context) (string, error) {
 	if rerr != nil {
 		return "", rerr
 	}
-	if ok && cur.HasRefresh() && cur.RefreshToken != sent {
+	if !ok {
+		return "", ErrNotLoggedIn // credential deleted concurrently (e.g. logout)
+	}
+	if !cur.HasRefresh() {
+		return "", ErrNotLoggedIn // refresh token cleared concurrently
+	}
+	if cur.RefreshToken != sent {
+		// A non-cooperating actor rotated the RT under us; retry once.
 		res, err = m.runRefresh(ctx, cur.RefreshToken)
 		if err == nil {
 			if perr := m.persistRefreshed(cur, res); perr != nil {
@@ -697,7 +708,7 @@ func (m *Manager) doRefresh(ctx context.Context) (string, error) {
 			return res.AccessToken, nil
 		}
 		if !errors.Is(err, refresh.ErrInvalidGrant) {
-			return "", err // transport/other error — don't misreport as reauth
+			return "", err
 		}
 	}
 	return "", ErrReauthRequired
@@ -716,6 +727,9 @@ func (m *Manager) persistRefreshed(prev tokens.TokenSet, res *tokens.TokenSet) e
 	}
 	if merged.Scope == "" {
 		merged.Scope = prev.Scope
+	}
+	if merged.TokenType == "" {
+		merged.TokenType = prev.TokenType
 	}
 	if err := m.SaveCoreToken(merged); err != nil {
 		return fmt.Errorf("refresh: persist: %w", err)

@@ -522,3 +522,76 @@ func TestRefresh_ExportedReMintsWhenExpired(t *testing.T) {
 		t.Fatalf("stored RT = %q, want rotated rt-2", store.data[testIssuer].RefreshToken)
 	}
 }
+
+// errAcquireLock is a ProcessLock whose Acquire always fails, exercising
+// refreshLocked's lock-acquisition error path.
+type errAcquireLock struct{ err error }
+
+func (l errAcquireLock) Acquire(_ context.Context) (func(), error) { return nil, l.err }
+
+// TestEnsureFreshLogin_LockAcquireFailureSurfaces pins that a cross-process
+// lock-acquisition failure surfaces as a wrapped error (not a credential
+// sentinel) and does not run the grant.
+func TestEnsureFreshLogin_LockAcquireFailureSurfaces(t *testing.T) {
+	t.Parallel()
+	store := newMemStore()
+	store.data[testIssuer] = tokens.TokenSet{AccessToken: expiredJWT(t), RefreshToken: "rt-1"}
+	m, _ := New(Config{Issuer: testIssuer, ClientID: testClientID, RefreshPath: "/p", Store: store})
+
+	SetProcessLockForTest(t, m, errAcquireLock{err: errors.New("flock failed")})
+	SetRefreshForTest(t, m, func(_ context.Context, _ refresh.Request) (*tokens.TokenSet, error) {
+		t.Fatal("grant must not run when the lock can't be acquired")
+		return nil, errors.New("unreachable")
+	})
+
+	_, err := m.ensureFreshLogin(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "acquire lock") {
+		t.Fatalf("err = %v, want wrapped acquire-lock error", err)
+	}
+	if errors.Is(err, ErrReauthRequired) || errors.Is(err, ErrNotLoggedIn) {
+		t.Fatalf("err = %v, must not be a credential sentinel", err)
+	}
+	if !strings.Contains(err.Error(), "flock failed") {
+		t.Fatalf("err = %v, want underlying lock error surfaced", err)
+	}
+}
+
+// TestDoRefresh_PersistFailureSurfaces pins that a keyring write failure
+// after a successful grant surfaces (rather than returning the new token as
+// if the rotated refresh token had been saved).
+func TestDoRefresh_PersistFailureSurfaces(t *testing.T) {
+	t.Parallel()
+	store := &erroringStore{inner: newMemStore(), saveErr: errors.New("keyring locked")}
+	store.inner.data[testIssuer] = tokens.TokenSet{AccessToken: expiredJWT(t), RefreshToken: "rt-1"}
+	m, _ := New(Config{Issuer: testIssuer, ClientID: testClientID, RefreshPath: "/p", Store: store})
+
+	SetRefreshForTest(t, m, func(_ context.Context, _ refresh.Request) (*tokens.TokenSet, error) {
+		return &tokens.TokenSet{AccessToken: freshJWT(t), RefreshToken: "rt-2"}, nil
+	})
+
+	_, err := m.doRefresh(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "keyring locked") {
+		t.Fatalf("err = %v, want persist error to surface", err)
+	}
+}
+
+// TestDoRefresh_ConcurrentLogoutDuringRefresh pins that if the credential is
+// removed concurrently (e.g. a logout) and the grant then returns
+// invalid_grant, doRefresh reports ErrNotLoggedIn (credential gone), not
+// ErrReauthRequired (which implies a still-present-but-dead refresh token).
+func TestDoRefresh_ConcurrentLogoutDuringRefresh(t *testing.T) {
+	t.Parallel()
+	store := newMemStore()
+	store.data[testIssuer] = tokens.TokenSet{AccessToken: expiredJWT(t), RefreshToken: "rt-1"}
+	m, _ := New(Config{Issuer: testIssuer, ClientID: testClientID, RefreshPath: "/p", Store: store})
+
+	SetRefreshForTest(t, m, func(_ context.Context, _ refresh.Request) (*tokens.TokenSet, error) {
+		delete(store.data, testIssuer) // simulate concurrent logout
+		return nil, refresh.ErrInvalidGrant
+	})
+
+	_, err := m.doRefresh(context.Background())
+	if !errors.Is(err, ErrNotLoggedIn) {
+		t.Fatalf("err = %v, want ErrNotLoggedIn (creds deleted concurrently)", err)
+	}
+}

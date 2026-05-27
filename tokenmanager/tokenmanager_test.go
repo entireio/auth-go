@@ -759,10 +759,14 @@ func TestDeleteCoreToken_PreservesCacheOnStoreFailure(t *testing.T) {
 type erroringStore struct {
 	inner     *memStore
 	loadErr   error
+	saveErr   error
 	deleteErr error
 }
 
 func (s *erroringStore) SaveTokens(profile string, t tokens.TokenSet) error {
+	if s.saveErr != nil {
+		return s.saveErr
+	}
 	return s.inner.SaveTokens(profile, t)
 }
 
