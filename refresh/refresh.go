@@ -70,9 +70,13 @@ type Client struct {
 	// and must be TLS-protected. Only flip for loopback dev/tests.
 	AllowInsecureHTTP bool
 
+	// nowOverride is the per-Client clock. Set only via
+	// SetNowForTest. Held behind atomic.Pointer so hot-path reads in
+	// Refresh don't race against test setup.
 	nowOverride atomic.Pointer[nowFuncType]
 }
 
+// nowFuncType is named so we can hold it behind an atomic.Pointer.
 type nowFuncType func() time.Time
 
 func (c *Client) now() time.Time {
@@ -158,7 +162,7 @@ func (c *Client) Refresh(ctx context.Context, req Request) (*tokens.TokenSet, er
 
 	form := buildForm(req)
 
-	endpoint, err := oauthhttp.ResolveURL(c.BaseURL, c.Path, c.AllowInsecureHTTP)
+	endpoint, err := resolveURL(c.BaseURL, c.Path, c.AllowInsecureHTTP)
 	if err != nil {
 		return nil, fmt.Errorf("refresh token: resolve URL: %w", err)
 	}
@@ -237,6 +241,10 @@ func buildForm(req Request) url.Values {
 		form.Set("scope", req.Scope)
 	}
 	return form
+}
+
+func resolveURL(baseURL, path string, allowInsecureHTTP bool) (string, error) {
+	return oauthhttp.ResolveURL(baseURL, path, allowInsecureHTTP) //nolint:wrapcheck // pass through with sentinel-preserving semantics
 }
 
 func readAPIError(resp *http.Response) error {
