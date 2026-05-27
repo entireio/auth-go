@@ -292,7 +292,7 @@ func (c *Client) Exchange(ctx context.Context, req ExchangeRequest) (*tokens.Tok
 		RefreshToken: raw.RefreshToken,
 		TokenType:    raw.TokenType,
 		Scope:        raw.Scope,
-		ExpiresAt:    c.now().Add(time.Duration(raw.ExpiresIn) * time.Second),
+		ExpiresAt:    c.now().Add(oauthhttp.ExpiresInDuration(raw.ExpiresIn)),
 	}, nil
 }
 

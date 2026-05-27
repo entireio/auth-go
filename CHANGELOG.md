@@ -30,6 +30,11 @@
 - `client_id` validation (`ValidateClientID` / `ValidateClientIDConsistency`)
   moved into `internal/oauthhttp` and shared by `sts` and `refresh`; no
   behavioural change to `sts`.
+- Clamp a server-provided `expires_in` before converting to a
+  `time.Duration` (centralised in `internal/oauthhttp.ExpiresInDuration`),
+  applied across `sts`, `deviceflow`, and `refresh`. Guards against an
+  int64 nanosecond overflow that an absurd value would otherwise wrap into
+  a past expiry.
 
 ## v0.3.4 — 2026-05-25
 

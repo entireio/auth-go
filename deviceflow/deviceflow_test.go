@@ -1027,3 +1027,26 @@ func TestValidateVerificationURI_RejectsNonASCIIHost(t *testing.T) {
 		t.Fatalf("validateVerificationURI(Punycode) = %v, want nil (documented limitation)", err)
 	}
 }
+
+// TestPollDeviceAuth_ClampsHugeExpiresIn pins that an absurd server-provided
+// expires_in is clamped before multiplying into a time.Duration. Without the
+// clamp, a value above ~9.2e9 overflows time.Duration's int64 nanosecond
+// range, wrapping ExpiresAt into the past so a freshly-minted token looks
+// already-expired.
+func TestPollDeviceAuth_ClampsHugeExpiresIn(t *testing.T) {
+	t.Parallel()
+	now := time.Date(2026, 5, 27, 12, 0, 0, 0, time.UTC)
+	c := newTestClient(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		writeBody(t, w, `{"access_token":"acc","token_type":"Bearer","expires_in":9300000000}`)
+	})
+	freezeClock(t, c, now)
+
+	ts, err := c.PollDeviceAuth(context.Background(), "dev-1")
+	if err != nil {
+		t.Fatalf("PollDeviceAuth() error = %v", err)
+	}
+	if !ts.ExpiresAt.After(now) {
+		t.Fatalf("ExpiresAt = %v, want a future time (clamped, not overflowed into the past)", ts.ExpiresAt)
+	}
+}
