@@ -21,7 +21,6 @@ func TestValidateClientID(t *testing.T) {
 		{"non-ascii rejected", "café", "non-printable"},
 	}
 	for _, tc := range cases {
-		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 			err := ValidateClientID(tc.id)
@@ -53,7 +52,6 @@ func TestValidateClientIDConsistency(t *testing.T) {
 		{"extra only ok", "", url.Values{"client_id": {"a"}}, ""},
 	}
 	for _, tc := range cases {
-		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 			err := ValidateClientIDConsistency(tc.id, tc.extra)

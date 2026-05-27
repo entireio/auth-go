@@ -34,6 +34,12 @@ func ValidateClientID(id string) error {
 // field becomes Basic Auth, Extra becomes form body — and a server reading
 // one but not the other would silently accept the wrong identity.
 // Same-value duplication is the documented belt-and-braces pattern.
+//
+// Multiple client_id entries in Extra are always rejected, even when id
+// is unset: servers that read via r.PostFormValue see only the first;
+// servers that read via r.PostForm["client_id"] see all, so a slice like
+// ["a","b"] succeeds against one and fails against the other in ways the
+// caller can't predict.
 func ValidateClientIDConsistency(id string, extra url.Values) error {
 	if extra == nil {
 		return nil
