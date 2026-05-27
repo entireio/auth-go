@@ -41,8 +41,9 @@ func New(path string) *FileLock { return &FileLock{path: path} }
 // ceiling: if ctx already carries an earlier deadline, that deadline wins.
 func (l *FileLock) Acquire(ctx context.Context) (func(), error) {
 	ctx, cancel := context.WithTimeout(ctx, defaultAcquireTimeout)
-	// cancel is wired into the release path below so the timeout context
-	// lives as long as the lock is held.
+	// cancel is deferred to the release path (not called eagerly on
+	// success) so the timeout context's goroutine is cleaned up only when
+	// the caller releases the lock.
 
 	if err := os.MkdirAll(filepath.Dir(l.path), 0o700); err != nil {
 		cancel()

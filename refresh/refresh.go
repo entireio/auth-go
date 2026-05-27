@@ -88,7 +88,19 @@ func (c *Client) now() time.Time {
 
 func (c *Client) httpClient() *http.Client { return oauthhttp.HTTPClient(c.Transport) }
 
-// New validates a Client's required fields at construction time.
+// New validates a Client's required fields at construction time rather than
+// at the first Refresh call. Returns an error if BaseURL or Path is empty —
+// these would otherwise surface as a confusing URL error from the caller at
+// the worst moment.
+//
+// Takes a *Client (rather than a Client value) because the struct embeds an
+// atomic.Pointer for the test-clock seam, which can't be copied per the
+// noCopy convention. Returns the same pointer on success.
+//
+// Field-bag construction (`&refresh.Client{...}`) is still supported for
+// callers who want to set optional fields piecemeal, but New is the
+// recommended path — it makes misconfiguration a startup error rather than
+// a runtime one.
 func New(c *Client) (*Client, error) {
 	if c == nil {
 		return nil, errors.New("refresh.New: nil Client")
@@ -120,6 +132,11 @@ func (c *Client) requestTimeout() time.Duration {
 // Extra["client_id"] for servers that read the form body. Scope is
 // optional (RFC 6749 §6 allows narrowing; omitted when empty). Extra
 // carries additional form fields; standard fields win over Extra.
+//
+// Extra values are NOT redacted by String()/GoString() — only RefreshToken
+// is. Do not place bearer-equivalent credentials (client secrets, assertion
+// JWTs) in Extra; this package targets public-client flows where no such
+// field is expected.
 type Request struct {
 	RefreshToken string
 	ClientID     string

@@ -59,6 +59,12 @@ func TestRefresh_SuccessRotates(t *testing.T) {
 	if gotForm.Get("client_id") != "my-cli" {
 		t.Fatalf("form client_id = %q, want my-cli", gotForm.Get("client_id"))
 	}
+	if ts.TokenType != "Bearer" {
+		t.Fatalf("TokenType = %q, want Bearer", ts.TokenType)
+	}
+	if ts.Scope != "cli" {
+		t.Fatalf("Scope = %q, want cli", ts.Scope)
+	}
 }
 
 func TestRefresh_InvalidGrantSentinel(t *testing.T) {
@@ -155,6 +161,29 @@ func TestNew_RequiresFields(t *testing.T) {
 	}
 	if _, err := refresh.New(&refresh.Client{BaseURL: "https://x"}); err == nil {
 		t.Fatal("want error for empty Path")
+	}
+}
+
+func TestRefresh_PublicClientOmitsBasicAuth(t *testing.T) {
+	t.Parallel()
+	var hadAuthHeader bool
+	var formClientID string
+	srv := newServer(t, func(w http.ResponseWriter, r *http.Request) {
+		_, _, hadAuthHeader = r.BasicAuth()
+		_ = r.ParseForm()
+		formClientID = r.PostForm.Get("client_id")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"access_token":"jwt","expires_in":3600}`))
+	})
+	c := &refresh.Client{BaseURL: srv.URL, Path: "/oauth/token", AllowInsecureHTTP: true}
+	if _, err := c.Refresh(context.Background(), refresh.Request{RefreshToken: "rt"}); err != nil {
+		t.Fatalf("Refresh: %v", err)
+	}
+	if hadAuthHeader {
+		t.Error("public client (empty ClientID) must not send an Authorization: Basic header")
+	}
+	if formClientID != "" {
+		t.Errorf("form client_id = %q, want empty for a public client with no ClientID", formClientID)
 	}
 }
 
