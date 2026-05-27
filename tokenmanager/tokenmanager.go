@@ -199,7 +199,7 @@ type Manager struct {
 	// refreshMu is the in-process single-flight gate for re-mints. Held
 	// across the cross-process lock + grant so concurrent goroutines
 	// coalesce onto one re-mint (the second waiter re-reads a fresh token).
-	refreshMu sync.Mutex //nolint:unused // in-process single-flight gate; acquired by refreshLocked
+	refreshMu sync.Mutex
 
 	refreshOverride atomic.Pointer[refreshFunc]
 	lockOverride    atomic.Pointer[ProcessLock]
@@ -710,6 +710,75 @@ func (m *Manager) persistRefreshed(prev tokens.TokenSet, res *tokens.TokenSet) e
 		return fmt.Errorf("refresh: persist: %w", err)
 	}
 	return nil
+}
+
+// ensureFreshLogin returns a usable login JWT, transparently re-minting an
+// expired one from the stored refresh token. The fast path takes no locks:
+// a still-fresh token (the common case) returns immediately. ErrNotLoggedIn
+// when no credential is stored or an expired one has no refresh token;
+// ErrReauthRequired when the refresh token is revoked/expired.
+func (m *Manager) ensureFreshLogin(ctx context.Context) (string, error) {
+	set, ok, err := m.loadTokenSet()
+	if err != nil {
+		return "", err
+	}
+	if !ok {
+		return "", ErrNotLoggedIn
+	}
+	if !coreTokenExpired(set.AccessToken, m.now()) {
+		return set.AccessToken, nil
+	}
+	if !set.HasRefresh() {
+		return "", ErrNotLoggedIn
+	}
+	return m.refreshLocked(ctx)
+}
+
+// refreshLocked performs the serialize-and-double-check re-mint: the
+// in-process mutex coalesces goroutines, the cross-process lock coalesces
+// processes, and a store re-read after each gate lets a late waiter return
+// the token a peer just minted instead of re-minting.
+func (m *Manager) refreshLocked(ctx context.Context) (string, error) {
+	m.refreshMu.Lock()
+	defer m.refreshMu.Unlock()
+
+	if tok, done, err := m.freshOrProceed(); done {
+		return tok, err
+	}
+
+	release, err := m.processLock().Acquire(ctx)
+	if err != nil {
+		return "", fmt.Errorf("refresh: acquire lock: %w", err)
+	}
+	defer release()
+
+	if tok, done, err := m.freshOrProceed(); done {
+		return tok, err
+	}
+
+	return m.doRefresh(ctx)
+}
+
+// freshOrProceed re-reads the store and reports whether the caller has a
+// terminal result. done=true means return (tok, err) directly — the token
+// is fresh now, no credential exists, or an expired token has no refresh
+// token. done=false means "still expired with a refresh token — proceed to
+// the re-mint".
+func (m *Manager) freshOrProceed() (tok string, done bool, err error) {
+	set, ok, err := m.loadTokenSet()
+	if err != nil {
+		return "", true, err
+	}
+	if !ok {
+		return "", true, ErrNotLoggedIn
+	}
+	if !coreTokenExpired(set.AccessToken, m.now()) {
+		return set.AccessToken, true, nil
+	}
+	if !set.HasRefresh() {
+		return "", true, ErrNotLoggedIn
+	}
+	return "", false, nil
 }
 
 // runExchange dispatches to either Config.Exchange (test override) or

@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -228,5 +230,158 @@ func TestDoRefresh_RotationRaceRetryTransportErrorNotReauth(t *testing.T) {
 	}
 	if calls != 2 {
 		t.Fatalf("calls = %d, want 2 (one initial + one retry)", calls)
+	}
+}
+
+// recordingLock is a fake ProcessLock that counts acquire/release. The
+// in-process mutex already serialises goroutines, so the fake need not
+// enforce real mutual exclusion.
+type recordingLock struct {
+	mu                 sync.Mutex
+	acquired, released int
+}
+
+func (l *recordingLock) Acquire(_ context.Context) (func(), error) {
+	l.mu.Lock()
+	l.acquired++
+	l.mu.Unlock()
+	return func() {
+		l.mu.Lock()
+		l.released++
+		l.mu.Unlock()
+	}, nil
+}
+
+// syncStore is a mutex-guarded tokenstore.Store for the concurrency test.
+// memStore is a bare map; the coalescing test reads it on the fast path
+// while a peer writes it via SaveCoreToken, which would be a concurrent
+// map read/write (-race fatal). The production keyring store does its own
+// locking; this wrapper gives the test the same guarantee. Seed via the
+// inner map BEFORE launching goroutines.
+type syncStore struct {
+	mu    sync.Mutex
+	inner *memStore
+}
+
+func newSyncStore() *syncStore { return &syncStore{inner: newMemStore()} }
+
+func (s *syncStore) SaveTokens(p string, t tokens.TokenSet) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.inner.SaveTokens(p, t)
+}
+
+func (s *syncStore) LoadTokens(p string) (tokens.TokenSet, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.inner.LoadTokens(p)
+}
+
+func (s *syncStore) DeleteTokens(p string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.inner.DeleteTokens(p)
+}
+
+func TestEnsureFreshLogin_FreshReturnsWithoutGrant(t *testing.T) {
+	t.Parallel()
+	store := newMemStore()
+	fresh := freshJWT(t)
+	store.data[testIssuer] = tokens.TokenSet{AccessToken: fresh, RefreshToken: "rt-1"}
+	m, _ := New(Config{Issuer: testIssuer, ClientID: testClientID, RefreshPath: "/p", Store: store})
+
+	SetRefreshForTest(t, m, func(_ context.Context, _ refresh.Request) (*tokens.TokenSet, error) {
+		t.Fatal("grant must not run when the login JWT is still fresh")
+		return nil, errors.New("unreachable")
+	})
+
+	got, err := m.ensureFreshLogin(context.Background())
+	if err != nil || got != fresh {
+		t.Fatalf("ensureFreshLogin = (%q, %v), want fresh / nil", got, err)
+	}
+}
+
+func TestEnsureFreshLogin_ExpiredNoRefreshIsNotLoggedIn(t *testing.T) {
+	t.Parallel()
+	store := newMemStore()
+	store.data[testIssuer] = tokens.TokenSet{AccessToken: expiredJWT(t)} // no refresh token
+	m, _ := New(Config{Issuer: testIssuer, ClientID: testClientID, RefreshPath: "/p", Store: store})
+
+	if _, err := m.ensureFreshLogin(context.Background()); !errors.Is(err, ErrNotLoggedIn) {
+		t.Fatalf("err = %v, want ErrNotLoggedIn", err)
+	}
+}
+
+func TestEnsureFreshLogin_NoCredentialIsNotLoggedIn(t *testing.T) {
+	t.Parallel()
+	m, _ := New(Config{Issuer: testIssuer, ClientID: testClientID, RefreshPath: "/p", Store: newMemStore()})
+	if _, err := m.ensureFreshLogin(context.Background()); !errors.Is(err, ErrNotLoggedIn) {
+		t.Fatalf("err = %v, want ErrNotLoggedIn", err)
+	}
+}
+
+func TestEnsureFreshLogin_AcquiresAndReleasesLock(t *testing.T) {
+	t.Parallel()
+	store := newMemStore()
+	store.data[testIssuer] = tokens.TokenSet{AccessToken: expiredJWT(t), RefreshToken: "rt-1"}
+	m, _ := New(Config{Issuer: testIssuer, ClientID: testClientID, RefreshPath: "/p", Store: store})
+
+	lock := &recordingLock{}
+	SetProcessLockForTest(t, m, lock)
+	SetRefreshForTest(t, m, func(_ context.Context, _ refresh.Request) (*tokens.TokenSet, error) {
+		return &tokens.TokenSet{AccessToken: freshJWT(t), RefreshToken: "rt-2"}, nil
+	})
+
+	if _, err := m.ensureFreshLogin(context.Background()); err != nil {
+		t.Fatalf("ensureFreshLogin: %v", err)
+	}
+	if lock.acquired != 1 || lock.released != 1 {
+		t.Fatalf("lock acquired=%d released=%d, want 1/1", lock.acquired, lock.released)
+	}
+}
+
+// TestEnsureFreshLogin_CoalescesConcurrentCallers pins single-flight: many
+// goroutines hit an expired login JWT at once, but the double-check after
+// each gate means exactly one grant fires; the rest read the freshly
+// persisted token.
+func TestEnsureFreshLogin_CoalescesConcurrentCallers(t *testing.T) {
+	t.Parallel()
+	store := newSyncStore()
+	store.inner.data[testIssuer] = tokens.TokenSet{AccessToken: expiredJWT(t), RefreshToken: "rt-1"}
+	m, _ := New(Config{Issuer: testIssuer, ClientID: testClientID, RefreshPath: "/p", Store: store})
+
+	lock := &recordingLock{}
+	SetProcessLockForTest(t, m, lock)
+
+	fresh := freshJWT(t)
+	var grants atomic.Int32
+	SetRefreshForTest(t, m, func(_ context.Context, _ refresh.Request) (*tokens.TokenSet, error) {
+		grants.Add(1)
+		return &tokens.TokenSet{AccessToken: fresh, RefreshToken: "rt-2"}, nil
+	})
+
+	const n = 8
+	var wg sync.WaitGroup
+	errs := make(chan error, n)
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			got, err := m.ensureFreshLogin(context.Background())
+			if err == nil && got != fresh {
+				err = errors.New("got stale token")
+			}
+			errs <- err
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatalf("concurrent ensureFreshLogin: %v", err)
+		}
+	}
+	if g := grants.Load(); g != 1 {
+		t.Fatalf("grants fired = %d, want exactly 1 (single-flight)", g)
 	}
 }
