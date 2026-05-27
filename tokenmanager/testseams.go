@@ -87,6 +87,9 @@ func SetRefreshForTest(t TestingTB, m *Manager, fn func(context.Context, refresh
 
 // SetProcessLockForTest replaces the cross-process lock on m with lock for
 // the lifetime of the test, restoring the previous override on t.Cleanup.
+// It lives off Config (as a test seam) so production callers can't bypass
+// the real file lock by setting a struct field — same rationale as
+// SetExchangeForTest.
 func SetProcessLockForTest(t TestingTB, m *Manager, lock ProcessLock) {
 	t.Helper()
 	prev := m.lockOverride.Load()

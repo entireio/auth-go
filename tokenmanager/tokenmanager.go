@@ -199,7 +199,7 @@ type Manager struct {
 	// refreshMu is the in-process single-flight gate for re-mints. Held
 	// across the cross-process lock + grant so concurrent goroutines
 	// coalesce onto one re-mint (the second waiter re-reads a fresh token).
-	refreshMu sync.Mutex //nolint:unused // wired in doRefresh (Task 5)
+	refreshMu sync.Mutex //nolint:unused // in-process single-flight gate; acquired by refreshLocked
 
 	refreshOverride atomic.Pointer[refreshFunc]
 	lockOverride    atomic.Pointer[ProcessLock]
@@ -565,8 +565,8 @@ func (m *Manager) cacheStore(key cacheKey, t *tokens.TokenSet) {
 }
 
 // fileLockPath adapts a derived lock path to ProcessLock via
-// internal/proclock. The exported path field lets tests assert the
-// per-identity derivation without importing proclock.
+// internal/proclock. The path field lets tests assert the per-identity
+// derivation without importing proclock.
 type fileLockPath struct {
 	path string
 	lock *proclock.FileLock
