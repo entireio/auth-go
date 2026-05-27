@@ -626,6 +626,89 @@ func (m *Manager) runRefresh(ctx context.Context, refreshToken string) (*tokens.
 	return client.Refresh(ctx, req) //nolint:wrapcheck // refresh.Refresh already prefixes "refresh token:"
 }
 
+// loadTokenSet reads the full stored TokenSet for the configured issuer.
+// ok=false (with nil error) means no credential is stored; a non-nil error
+// is a genuine store failure (never collapsed to "not logged in").
+func (m *Manager) loadTokenSet() (set tokens.TokenSet, ok bool, err error) {
+	t, err := m.cfg.Store.LoadTokens(m.cfg.Issuer)
+	if errors.Is(err, tokenstore.ErrNotFound) {
+		return tokens.TokenSet{}, false, nil
+	}
+	if err != nil {
+		return tokens.TokenSet{}, false, fmt.Errorf("load core token: %w", err)
+	}
+	return t, true, nil
+}
+
+// doRefresh runs the refresh_token grant for the currently stored refresh
+// token and persists the rotated result. Assumes the caller holds both the
+// in-process mutex and the cross-process lock and has already confirmed the
+// stored login JWT is expired with a refresh token present.
+//
+// On invalid_grant it re-reads the store: if the refresh token changed
+// (a non-cooperating actor rotated it under us) it retries once with the
+// new token; otherwise the family is genuinely dead → ErrReauthRequired.
+// Transport and other errors are returned as-is, never as reauth, and
+// never delete the stored credential.
+func (m *Manager) doRefresh(ctx context.Context) (string, error) {
+	set, ok, err := m.loadTokenSet()
+	if err != nil {
+		return "", err
+	}
+	if !ok || !set.HasRefresh() {
+		return "", ErrNotLoggedIn
+	}
+	sent := set.RefreshToken
+
+	res, err := m.runRefresh(ctx, sent)
+	if err == nil {
+		if perr := m.persistRefreshed(set, res); perr != nil {
+			return "", perr
+		}
+		return res.AccessToken, nil
+	}
+	if !errors.Is(err, refresh.ErrInvalidGrant) {
+		return "", err
+	}
+
+	// Rotation-race recovery: another actor may have rotated the refresh
+	// token between our read and our grant. Re-read; retry once if so.
+	cur, ok, rerr := m.loadTokenSet()
+	if rerr != nil {
+		return "", rerr
+	}
+	if ok && cur.HasRefresh() && cur.RefreshToken != sent {
+		res, err = m.runRefresh(ctx, cur.RefreshToken)
+		if err == nil {
+			if perr := m.persistRefreshed(cur, res); perr != nil {
+				return "", perr
+			}
+			return res.AccessToken, nil
+		}
+	}
+	return "", ErrReauthRequired
+}
+
+// persistRefreshed merges the grant response onto the prior set and saves
+// it. A non-rotating server (empty refresh_token / scope in the response)
+// must not wipe a still-valid refresh token, so empty fields fall back to
+// the prior values. The new login JWT and ExpiresAt always replace.
+// SaveCoreToken clears the in-process exchange cache as a side effect, so
+// the next Token() re-exchanges against the new login JWT.
+func (m *Manager) persistRefreshed(prev tokens.TokenSet, res *tokens.TokenSet) error {
+	merged := *res
+	if merged.RefreshToken == "" {
+		merged.RefreshToken = prev.RefreshToken
+	}
+	if merged.Scope == "" {
+		merged.Scope = prev.Scope
+	}
+	if err := m.SaveCoreToken(merged); err != nil {
+		return fmt.Errorf("refresh: persist: %w", err)
+	}
+	return nil
+}
+
 // runExchange dispatches to either Config.Exchange (test override) or
 // a freshly built sts.Client pointing at m.cfg.Issuer + m.cfg.STSPath.
 func (m *Manager) runExchange(ctx context.Context, coreToken string, req TokenRequest) (*tokens.TokenSet, error) {

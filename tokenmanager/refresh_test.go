@@ -3,7 +3,9 @@ package tokenmanager
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/entireio/auth-go/refresh"
 	"github.com/entireio/auth-go/tokens"
@@ -60,5 +62,137 @@ func TestProcessLock_DefaultDerivesPerIdentityPath(t *testing.T) {
 	}
 	if p1 != p3 {
 		t.Fatal("same (ClientID, Issuer) must derive the same lock path")
+	}
+}
+
+func expiredJWT(t *testing.T) string {
+	t.Helper()
+	return makeJWTWithExp(t, time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC), nil)
+}
+
+func freshJWT(t *testing.T) string {
+	t.Helper()
+	return makeJWTWithExp(t, time.Date(2099, 1, 1, 0, 0, 0, 0, time.UTC), nil)
+}
+
+func TestDoRefresh_HappyRotation(t *testing.T) {
+	t.Parallel()
+	store := newMemStore()
+	store.data[testIssuer] = tokens.TokenSet{AccessToken: expiredJWT(t), RefreshToken: "rt-1"}
+	m, _ := New(Config{Issuer: testIssuer, ClientID: testClientID, RefreshPath: "/p", Store: store})
+
+	fresh := freshJWT(t)
+	SetRefreshForTest(t, m, func(_ context.Context, req refresh.Request) (*tokens.TokenSet, error) {
+		if req.RefreshToken != "rt-1" {
+			t.Errorf("grant used RT %q, want rt-1", req.RefreshToken)
+		}
+		return &tokens.TokenSet{AccessToken: fresh, RefreshToken: "rt-2"}, nil
+	})
+
+	got, err := m.doRefresh(context.Background())
+	if err != nil {
+		t.Fatalf("doRefresh: %v", err)
+	}
+	if got != fresh {
+		t.Fatalf("returned %q, want fresh login JWT", got)
+	}
+	saved := store.data[testIssuer]
+	if saved.AccessToken != fresh || saved.RefreshToken != "rt-2" {
+		t.Fatalf("persisted %q / %q, want fresh / rt-2", saved.AccessToken, saved.RefreshToken)
+	}
+}
+
+func TestDoRefresh_NonRotatingServerRetainsRT(t *testing.T) {
+	t.Parallel()
+	store := newMemStore()
+	store.data[testIssuer] = tokens.TokenSet{AccessToken: expiredJWT(t), RefreshToken: "rt-1", Scope: "cli"}
+	m, _ := New(Config{Issuer: testIssuer, ClientID: testClientID, RefreshPath: "/p", Store: store})
+
+	fresh := freshJWT(t)
+	SetRefreshForTest(t, m, func(_ context.Context, _ refresh.Request) (*tokens.TokenSet, error) {
+		// Server doesn't rotate: empty refresh_token, empty scope.
+		return &tokens.TokenSet{AccessToken: fresh}, nil
+	})
+
+	if _, err := m.doRefresh(context.Background()); err != nil {
+		t.Fatalf("doRefresh: %v", err)
+	}
+	saved := store.data[testIssuer]
+	if saved.RefreshToken != "rt-1" {
+		t.Fatalf("RefreshToken = %q, want retained rt-1", saved.RefreshToken)
+	}
+	if saved.Scope != "cli" {
+		t.Fatalf("Scope = %q, want retained cli", saved.Scope)
+	}
+}
+
+func TestDoRefresh_RotationRaceRetriesWithNewRT(t *testing.T) {
+	t.Parallel()
+	store := newMemStore()
+	store.data[testIssuer] = tokens.TokenSet{AccessToken: expiredJWT(t), RefreshToken: "rt-1"}
+	m, _ := New(Config{Issuer: testIssuer, ClientID: testClientID, RefreshPath: "/p", Store: store})
+
+	fresh := freshJWT(t)
+	calls := 0
+	SetRefreshForTest(t, m, func(_ context.Context, req refresh.Request) (*tokens.TokenSet, error) {
+		calls++
+		if calls == 1 {
+			// Simulate another process having rotated the RT in the store
+			// just before our grant landed.
+			store.data[testIssuer] = tokens.TokenSet{AccessToken: expiredJWT(t), RefreshToken: "rt-from-other"}
+			return nil, refresh.ErrInvalidGrant
+		}
+		if req.RefreshToken != "rt-from-other" {
+			t.Errorf("retry used RT %q, want rt-from-other", req.RefreshToken)
+		}
+		return &tokens.TokenSet{AccessToken: fresh, RefreshToken: "rt-3"}, nil
+	})
+
+	got, err := m.doRefresh(context.Background())
+	if err != nil {
+		t.Fatalf("doRefresh: %v", err)
+	}
+	if got != fresh || calls != 2 {
+		t.Fatalf("got %q after %d calls, want fresh after 2", got, calls)
+	}
+}
+
+func TestDoRefresh_TerminalInvalidGrant(t *testing.T) {
+	t.Parallel()
+	store := newMemStore()
+	store.data[testIssuer] = tokens.TokenSet{AccessToken: expiredJWT(t), RefreshToken: "rt-1"}
+	m, _ := New(Config{Issuer: testIssuer, ClientID: testClientID, RefreshPath: "/p", Store: store})
+
+	SetRefreshForTest(t, m, func(_ context.Context, _ refresh.Request) (*tokens.TokenSet, error) {
+		return nil, refresh.ErrInvalidGrant
+	})
+
+	_, err := m.doRefresh(context.Background())
+	if !errors.Is(err, ErrReauthRequired) {
+		t.Fatalf("err = %v, want ErrReauthRequired", err)
+	}
+	// Creds must NOT be deleted — a transient invalid_grant shouldn't wipe
+	// the keyring; the next login overwrites.
+	if _, ok := store.data[testIssuer]; !ok {
+		t.Fatal("credentials deleted on terminal invalid_grant, want preserved")
+	}
+}
+
+func TestDoRefresh_NetworkErrorNotReauth(t *testing.T) {
+	t.Parallel()
+	store := newMemStore()
+	store.data[testIssuer] = tokens.TokenSet{AccessToken: expiredJWT(t), RefreshToken: "rt-1"}
+	m, _ := New(Config{Issuer: testIssuer, ClientID: testClientID, RefreshPath: "/p", Store: store})
+
+	SetRefreshForTest(t, m, func(_ context.Context, _ refresh.Request) (*tokens.TokenSet, error) {
+		return nil, errors.New("connection refused")
+	})
+
+	_, err := m.doRefresh(context.Background())
+	if errors.Is(err, ErrReauthRequired) {
+		t.Fatalf("err = %v, must NOT be ErrReauthRequired for a transport error", err)
+	}
+	if err == nil || !strings.Contains(err.Error(), "connection refused") {
+		t.Fatalf("err = %v, want underlying transport error", err)
 	}
 }
