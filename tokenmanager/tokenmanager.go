@@ -753,7 +753,11 @@ func (m *Manager) ensureFreshLogin(ctx context.Context) (string, error) {
 	if !ok {
 		return "", ErrNotLoggedIn
 	}
-	if !coreTokenExpired(set.AccessToken, m.now()) {
+	// A usable token must be non-empty as well as unexpired. A BYO Store
+	// that returns a TokenSet with an empty AccessToken (without
+	// ErrNotFound) must not yield an empty bearer — coreTokenExpired("")
+	// reports not-expired (parse failure), so guard the empty case here.
+	if set.AccessToken != "" && !coreTokenExpired(set.AccessToken, m.now()) {
 		return set.AccessToken, nil
 	}
 	if !set.HasRefresh() {
@@ -800,7 +804,7 @@ func (m *Manager) freshOrProceed() (string, bool, error) {
 	if !ok {
 		return "", true, ErrNotLoggedIn
 	}
-	if !coreTokenExpired(set.AccessToken, m.now()) {
+	if set.AccessToken != "" && !coreTokenExpired(set.AccessToken, m.now()) {
 		return set.AccessToken, true, nil
 	}
 	if !set.HasRefresh() {

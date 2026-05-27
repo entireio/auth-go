@@ -595,3 +595,45 @@ func TestDoRefresh_ConcurrentLogoutDuringRefresh(t *testing.T) {
 		t.Fatalf("err = %v, want ErrNotLoggedIn (creds deleted concurrently)", err)
 	}
 }
+
+// TestEnsureFreshLogin_EmptyAccessTokenNeverReturnedAsBearer pins that a
+// BYO Store returning a TokenSet with an empty AccessToken (without
+// ErrNotFound) never yields an empty bearer with a nil error. The old
+// Token() path had an explicit `core == ""` guard that the ensureFreshLogin
+// refactor must preserve.
+func TestEnsureFreshLogin_EmptyAccessTokenNeverReturnedAsBearer(t *testing.T) {
+	t.Parallel()
+
+	t.Run("no refresh token", func(t *testing.T) {
+		t.Parallel()
+		store := newMemStore()
+		store.data[testIssuer] = tokens.TokenSet{AccessToken: ""} // present but empty, no RT
+		m, _ := New(Config{Issuer: testIssuer, ClientID: testClientID, RefreshPath: "/p", Store: store})
+
+		tok, err := m.ensureFreshLogin(context.Background())
+		if !errors.Is(err, ErrNotLoggedIn) {
+			t.Fatalf("err = %v, want ErrNotLoggedIn", err)
+		}
+		if tok != "" {
+			t.Fatalf("tok = %q, want empty", tok)
+		}
+	})
+
+	t.Run("with refresh token re-mints", func(t *testing.T) {
+		t.Parallel()
+		store := newMemStore()
+		store.data[testIssuer] = tokens.TokenSet{AccessToken: "", RefreshToken: "rt-1"}
+		m, _ := New(Config{Issuer: testIssuer, ClientID: testClientID, RefreshPath: "/p", Store: store})
+		SetProcessLockForTest(t, m, &recordingLock{})
+
+		fresh := freshJWT(t)
+		SetRefreshForTest(t, m, func(_ context.Context, _ refresh.Request) (*tokens.TokenSet, error) {
+			return &tokens.TokenSet{AccessToken: fresh, RefreshToken: "rt-2"}, nil
+		})
+
+		tok, err := m.ensureFreshLogin(context.Background())
+		if err != nil || tok != fresh {
+			t.Fatalf("ensureFreshLogin = (%q, %v), want fresh / nil", tok, err)
+		}
+	})
+}
