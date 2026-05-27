@@ -196,3 +196,37 @@ func TestDoRefresh_NetworkErrorNotReauth(t *testing.T) {
 		t.Fatalf("err = %v, want underlying transport error", err)
 	}
 }
+
+// TestDoRefresh_RotationRaceRetryTransportErrorNotReauth pins that a
+// transport error on the RETRY attempt (after a rotation race) surfaces
+// verbatim rather than being misreported as ErrReauthRequired — the same
+// contract the first attempt already honours.
+func TestDoRefresh_RotationRaceRetryTransportErrorNotReauth(t *testing.T) {
+	t.Parallel()
+	store := newMemStore()
+	store.data[testIssuer] = tokens.TokenSet{AccessToken: expiredJWT(t), RefreshToken: "rt-1"}
+	m, _ := New(Config{Issuer: testIssuer, ClientID: testClientID, RefreshPath: "/p", Store: store})
+
+	calls := 0
+	SetRefreshForTest(t, m, func(_ context.Context, _ refresh.Request) (*tokens.TokenSet, error) {
+		calls++
+		if calls == 1 {
+			// Another process rotated the RT, then our grant got invalid_grant.
+			store.data[testIssuer] = tokens.TokenSet{AccessToken: expiredJWT(t), RefreshToken: "rt-from-other"}
+			return nil, refresh.ErrInvalidGrant
+		}
+		// Retry attempt hits a transport failure.
+		return nil, errors.New("connection refused")
+	})
+
+	_, err := m.doRefresh(context.Background())
+	if errors.Is(err, ErrReauthRequired) {
+		t.Fatalf("err = %v, must NOT be ErrReauthRequired for a retry transport error", err)
+	}
+	if err == nil || !strings.Contains(err.Error(), "connection refused") {
+		t.Fatalf("err = %v, want underlying transport error from the retry", err)
+	}
+	if calls != 2 {
+		t.Fatalf("calls = %d, want 2 (one initial + one retry)", calls)
+	}
+}

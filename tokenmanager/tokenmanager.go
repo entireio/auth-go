@@ -685,6 +685,9 @@ func (m *Manager) doRefresh(ctx context.Context) (string, error) {
 			}
 			return res.AccessToken, nil
 		}
+		if !errors.Is(err, refresh.ErrInvalidGrant) {
+			return "", err // transport/other error — don't misreport as reauth
+		}
 	}
 	return "", ErrReauthRequired
 }
