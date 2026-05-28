@@ -154,10 +154,18 @@ func helperRefreshWithTimeout() helperResult {
 		r.OK = true
 		return r
 	}
-	// Ctx cancellation surfaces as either context.DeadlineExceeded, a
-	// wrapped form of it, OR an HTTP transport error that mentions "context"
-	// (depending on which layer caught it first).
-	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) || strings.Contains(err.Error(), "context") {
+	// A real ctx-cancel surfaces as context.DeadlineExceeded (the typed
+	// cause) OR a transport error containing that sentinel string (e.g.
+	// `Post "...": context deadline exceeded` from net/http). We accept
+	// context.Canceled too because some transport paths surface a parent-
+	// cancelled write as Canceled before the deadline propagates. The
+	// substring fallback is deliberately narrow ("context deadline" or
+	// "context canceled") so unrelated errors that happen to mention the
+	// word "context" don't get classified as the expected outcome.
+	if errors.Is(err, context.DeadlineExceeded) ||
+		errors.Is(err, context.Canceled) ||
+		strings.Contains(err.Error(), "context deadline") ||
+		strings.Contains(err.Error(), "context canceled") {
 		r.OK = true
 		r.Error = err.Error()
 		return r
@@ -530,7 +538,7 @@ func TestE2ESub_LogoutWinsOverInFlightRefresh(t *testing.T) {
 		"AUTHGO_E2E_STORE_DIR": storeDir,
 	}
 
-	release := srv.StallNextRefresh()
+	release, _ := srv.StallNextRefresh()
 	// Always release on test exit so we don't hang if the test fails early.
 	t.Cleanup(release)
 
@@ -639,7 +647,7 @@ func TestE2ESub_ReloginWinsOverInFlightRefresh(t *testing.T) {
 		"AUTHGO_E2E_NEW_USER_JSON": mustMarshal(t, newUserSet),
 	}
 
-	release := srv.StallNextRefresh()
+	release, _ := srv.StallNextRefresh()
 	t.Cleanup(release)
 
 	// Start refresh subprocess.
@@ -743,25 +751,6 @@ func TestE2ESub_ProclockMutualExclusion(t *testing.T) {
 	}
 }
 
-// waitForGrantHandlerEntry polls srv.GrantCount until it reaches want or
-// the timeout fires. Used to synchronise the race tests: the parent needs
-// to know helper A's request has reached the server's handler before
-// spawning helper B, so the family-state mutations land in the correct
-// order.
-func waitForGrantHandlerEntry(t *testing.T, srv *testoauth.Server, want int, timeout time.Duration) {
-	t.Helper()
-	deadline := time.Now().Add(timeout)
-	for {
-		if srv.GrantCount() >= want {
-			return
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("server handler did not see %d grants within %v (currently %d)", want, timeout, srv.GrantCount())
-		}
-		time.Sleep(5 * time.Millisecond)
-	}
-}
-
 // TestE2ESub_CtxCancelReleasesLocks verifies that a context cancellation
 // mid-refresh releases both refreshMu and the cross-process proclock cleanly.
 // Helper A's 150ms ctx expires while the server is stalled; helper B then
@@ -783,7 +772,7 @@ func TestE2ESub_CtxCancelReleasesLocks(t *testing.T) {
 		t.Fatalf("seed: %v", err)
 	}
 
-	release := srv.StallNextRefresh()
+	release, _ := srv.StallNextRefresh()
 	t.Cleanup(release)
 
 	commonEnv := map[string]string{
@@ -805,8 +794,8 @@ func TestE2ESub_CtxCancelReleasesLocks(t *testing.T) {
 	if err := cmdA.Run(); err != nil {
 		t.Fatalf("helper A: %v\nstdout: %s", err, outA.String())
 	}
-	var resA helperResult
-	if err := json.NewDecoder(strings.NewReader(outA.String())).Decode(&resA); err != nil {
+	resA, err := decodeHelperOutput(outA.String())
+	if err != nil {
 		t.Fatalf("decode A: %v", err)
 	}
 	if !resA.OK {
@@ -814,9 +803,9 @@ func TestE2ESub_CtxCancelReleasesLocks(t *testing.T) {
 	}
 	// A's ctx had a 150ms budget; the lock-acquire timeout default is 30s.
 	// If the ctx fired correctly mid-grant, A's elapsed should be roughly
-	// 150ms + a bit of startup. We give generous margin for CI: < 5 seconds.
-	if resA.ElapsedMs >= 5000 {
-		t.Fatalf("helper A elapsed = %dms; suggests something other than ctx-cancel fired (lock-acquire timeout?)", resA.ElapsedMs)
+	// 150ms + a bit of startup. We give generous margin for CI: < 2s.
+	if resA.ElapsedMs >= 2000 {
+		t.Fatalf("helper A elapsed = %dms; suggests something other than ctx-cancel fired (lock-acquire timeout?) > 2s", resA.ElapsedMs)
 	}
 
 	// Helper B: standard refresh after A's cancellation. Should succeed
@@ -832,8 +821,8 @@ func TestE2ESub_CtxCancelReleasesLocks(t *testing.T) {
 	if err := cmdB.Run(); err != nil {
 		t.Fatalf("helper B: %v\nstdout: %s", err, outB.String())
 	}
-	var resB helperResult
-	if err := json.NewDecoder(strings.NewReader(outB.String())).Decode(&resB); err != nil {
+	resB, err := decodeHelperOutput(outB.String())
+	if err != nil {
 		t.Fatalf("decode B: %v", err)
 	}
 	if !resB.OK {
@@ -845,8 +834,8 @@ func TestE2ESub_CtxCancelReleasesLocks(t *testing.T) {
 	// If A had orphaned either lock, B would wait up to ~30s on the
 	// cross-process lock acquire. A few seconds is fine — anything in the
 	// teens-of-seconds range indicates the lock wasn't released.
-	if resB.ElapsedMs >= 5000 {
-		t.Fatalf("helper B elapsed = %dms; suggests the previous helper orphaned a lock", resB.ElapsedMs)
+	if resB.ElapsedMs >= 2000 {
+		t.Fatalf("helper B elapsed = %dms; suggests the previous helper orphaned a lock > 2s", resB.ElapsedMs)
 	}
 
 	// Release the stall so the t.Cleanup stall goroutine can drain cleanly.
@@ -914,7 +903,7 @@ func TestE2ESub_NonCooperatingRaceStrictRevokes(t *testing.T) {
 	}
 	envB["AUTHGO_E2E_LOCK_DIR"] = lockDirB
 
-	release := srv.StallNextRefresh()
+	release, stalled := srv.StallNextRefresh()
 	t.Cleanup(release)
 
 	// Spawn A in background so the parent can continue while A is stalled.
@@ -924,10 +913,15 @@ func TestE2ESub_NonCooperatingRaceStrictRevokes(t *testing.T) {
 		t.Fatalf("start A: %v", err)
 	}
 
-	// Wait for A's request to reach the server handler, plus a small
-	// settling time for A to actually be inside the stall wait.
-	waitForGrantHandlerEntry(t, srv, 1, 2*time.Second)
-	time.Sleep(30 * time.Millisecond)
+	// Wait for A's request to be definitively inside the stall wait before
+	// spawning B. The stalled channel closes the moment A's goroutine enters
+	// <-stallCh, so this is a precise synchronisation point with no sleep.
+	select {
+	case <-stalled:
+		// A's request is now blocked on the stall channel — safe to spawn B.
+	case <-time.After(2 * time.Second):
+		t.Fatal("helper A did not enter the stall within 2s")
+	}
 
 	// Spawn B and wait for it to finish. B is not stalled (one-shot consumed by A).
 	// B consumes RT_orig → gets RT_new1 → persists to shared fileStore.
@@ -936,8 +930,8 @@ func TestE2ESub_NonCooperatingRaceStrictRevokes(t *testing.T) {
 	if err := cmdB.Run(); err != nil {
 		t.Fatalf("B: %v\n%s", err, outB.String())
 	}
-	var resB helperResult
-	if err := json.NewDecoder(strings.NewReader(outB.String())).Decode(&resB); err != nil {
+	resB, err := decodeHelperOutput(outB.String())
+	if err != nil {
 		t.Fatalf("decode B: %v", err)
 	}
 
@@ -946,8 +940,8 @@ func TestE2ESub_NonCooperatingRaceStrictRevokes(t *testing.T) {
 	// A exits with code 1 (resA.OK == false) — don't fatal on that.
 	_ = cmdA.Wait()
 
-	var resA helperResult
-	if err := json.NewDecoder(strings.NewReader(outA.String())).Decode(&resA); err != nil {
+	resA, err := decodeHelperOutput(outA.String())
+	if err != nil {
 		t.Fatalf("decode A: %v\nraw: %s", err, outA.String())
 	}
 
@@ -972,7 +966,13 @@ func TestE2ESub_NonCooperatingRaceStrictRevokes(t *testing.T) {
 	if got := srv.RefreshGrantCount(); got != 1 {
 		t.Fatalf("RefreshGrantCount = %d, want 1 (only B succeeded)", got)
 	}
-	// B's success + A's first attempt + A's retry = 3 total handler calls.
+	// GrantCount == 3 + RefreshGrantCount == 1 proves the retry path fired
+	// (two handler entries from A — first attempt + retry — plus B's success).
+	// Note this does NOT externally distinguish "retry used cur.RefreshToken
+	// from the store" from "retry used the original sent RT again" — both
+	// would leave the family revoked. The unit test
+	// TestDoRefresh_RotationRaceRetriesWithNewRT covers that distinction
+	// directly with a fake refresh fn.
 	if got := srv.GrantCount(); got != 3 {
 		t.Fatalf("GrantCount = %d, want 3 (B's success + A's first + A's retry)", got)
 	}
@@ -1034,7 +1034,7 @@ func TestE2ESub_NonCooperatingRaceLaxAbsorbs(t *testing.T) {
 	}
 	envB["AUTHGO_E2E_LOCK_DIR"] = lockDirB
 
-	release := srv.StallNextRefresh()
+	release, stalled := srv.StallNextRefresh()
 	t.Cleanup(release)
 
 	// Spawn A in background so the parent can continue while A is stalled.
@@ -1044,10 +1044,15 @@ func TestE2ESub_NonCooperatingRaceLaxAbsorbs(t *testing.T) {
 		t.Fatalf("start A: %v", err)
 	}
 
-	// Wait for A's request to reach the server handler, plus a small
-	// settling time for A to actually be inside the stall wait.
-	waitForGrantHandlerEntry(t, srv, 1, 2*time.Second)
-	time.Sleep(30 * time.Millisecond)
+	// Wait for A's request to be definitively inside the stall wait before
+	// spawning B. The stalled channel closes the moment A's goroutine enters
+	// <-stallCh, so this is a precise synchronisation point with no sleep.
+	select {
+	case <-stalled:
+		// A's request is now blocked on the stall channel — safe to spawn B.
+	case <-time.After(2 * time.Second):
+		t.Fatal("helper A did not enter the stall within 2s")
+	}
 
 	// Spawn B and wait for it to finish. B is not stalled (one-shot consumed by A).
 	// B consumes RT_orig → gets RT_new1 → persists to shared fileStore.
@@ -1056,8 +1061,8 @@ func TestE2ESub_NonCooperatingRaceLaxAbsorbs(t *testing.T) {
 	if err := cmdB.Run(); err != nil {
 		t.Fatalf("B: %v\n%s", err, outB.String())
 	}
-	var resB helperResult
-	if err := json.NewDecoder(strings.NewReader(outB.String())).Decode(&resB); err != nil {
+	resB, err := decodeHelperOutput(outB.String())
+	if err != nil {
 		t.Fatalf("decode B: %v", err)
 	}
 
@@ -1067,8 +1072,8 @@ func TestE2ESub_NonCooperatingRaceLaxAbsorbs(t *testing.T) {
 		t.Logf("A exit: %v (decoded result will confirm OK)", err)
 	}
 
-	var resA helperResult
-	if err := json.NewDecoder(strings.NewReader(outA.String())).Decode(&resA); err != nil {
+	resA, err := decodeHelperOutput(outA.String())
+	if err != nil {
 		t.Fatalf("decode A: %v\nraw: %s", err, outA.String())
 	}
 

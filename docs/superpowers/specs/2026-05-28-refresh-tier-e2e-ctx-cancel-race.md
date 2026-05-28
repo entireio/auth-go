@@ -52,7 +52,7 @@ All work in `tokenmanager/e2e_subprocess_test.go` plus one new helper mode. No c
 - Reads config from env including `AUTHGO_E2E_CTX_TIMEOUT_MS=150`.
 - Builds the Manager from env, constructs `ctx, cancel := context.WithTimeout(context.Background(), 150ms)`.
 - Calls `m.Refresh(ctx)`. The grant stalls at the server; the ctx expires after 150ms; refresh returns wrapped `context.DeadlineExceeded` (or similar transport error).
-- Helper writes its `helperResult` — `OK: errors.Is(err, context.DeadlineExceeded) || strings.Contains(err.Error(), "context")`, plus the elapsed.
+- Helper writes its `helperResult` — `OK: errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) || strings.Contains(err.Error(), "context deadline") || strings.Contains(err.Error(), "context canceled")`. The substring matches are deliberately narrow so unrelated errors that happen to mention "context" don't get classified as the expected outcome.
 - Exits.
 
 **Helper B (`refresh-once` mode, dispatched after A returns):**
@@ -60,7 +60,7 @@ All work in `tokenmanager/e2e_subprocess_test.go` plus one new helper mode. No c
 - The parent releases the stall BEFORE dispatching B so the server's stall goroutine cleans up; B's grant proceeds normally.
 
 **Parent assertions:**
-- Helper A's result reports OK (the ctx error was the expected outcome) AND `ElapsedMs < 1000` (proves no 30s lock-acquire timeout fired — the cancel hit the right path).
+- Helper A's result reports OK (the ctx error was the expected outcome) AND `ElapsedMs < 2000` (proves no 30s lock-acquire timeout fired — the cancel hit the right path).
 - Helper B's result is OK with a non-empty AccessToken AND `ElapsedMs < 2000` (proves the proclock was free for B; if A had orphaned the lock, B would wait ~30s).
 - `srv.RefreshGrantCount() == 1` (only B's grant succeeded; A's grant errored out from the server's perspective when the client disconnected).
 - Final store state: rotated RT (B's refresh succeeded, A's didn't persist anything).
@@ -148,22 +148,23 @@ This validates that the Manager doesn't trip on the idempotency-window path — 
 
 ### Helper sequencing (avoiding flakes)
 
-The race tests need helper A to be **definitively stalled** at the server before helper B is spawned, otherwise the order of consume calls is non-deterministic. Use a wait-for-stall pattern:
+The race tests need helper A to be **definitively stalled** at the server before helper B is spawned, otherwise the order of consume calls is non-deterministic.
+
+`StallNextRefresh` now returns a `stalled <-chan struct{}` that closes when the next refresh request enters the stall wait. Parent tests `<-stalled` to deterministically synchronise on "A is blocked at the server" before spawning B, eliminating the polling/sleep heuristic the initial design considered.
 
 ```go
-// After spawning A, poll srv.GrantCount() in the parent: it should
-// increment once when A's request hits the handler, then stay flat
-// (because A is stalled BEFORE the handler increments... actually
-// totalGrants increments at the TOP of the handler, before the stall).
-// So we poll for grant_count >= 1 with a short timeout.
-//
-// Alternative: use a sync channel from the stall itself. Cleanest is
-// to extend StallNextRefresh to signal when the request enters the
-// stall — but that's an additional API surface change. Polling
-// GrantCount with a tight loop is simpler.
+release, stalled := srv.StallNextRefresh()
+t.Cleanup(release)
+// ...
+cmdA.Start()
+select {
+case <-stalled:
+    // A's request is now blocked on the stall channel — safe to spawn B.
+case <-time.After(2 * time.Second):
+    t.Fatal("helper A did not enter the stall within 2s")
+}
+// spawn B...
 ```
-
-I'll have the implementer extend `testoauth.Server` with a small helper if polling proves flaky: `StallNextRefresh` could return both `release` and a `stalled <-chan struct{}` that closes when the request enters the stall. Cleaner than polling and avoids any timing assumption.
 
 ### Env vars added
 
@@ -173,17 +174,27 @@ I'll have the implementer extend `testoauth.Server` with a small helper if polli
 
 ```go
 func helperRefreshWithTimeout() helperResult {
-    m, _ := newHelperManager()
+    m := newHelperManager()
     timeoutMs, _ := strconv.Atoi(os.Getenv("AUTHGO_E2E_CTX_TIMEOUT_MS"))
     if timeoutMs <= 0 { timeoutMs = 150 }
     ctx, cancel := context.WithTimeout(context.Background(), time.Duration(timeoutMs)*time.Millisecond)
     defer cancel()
     tok, err := m.Refresh(ctx)
-    return helperResult{
-        OK:          err != nil && (errors.Is(err, context.DeadlineExceeded) || strings.Contains(err.Error(), "context")),
-        AccessToken: tok,
-        Error:       fmt.Sprintf("%v", err),
+    r := helperResult{AccessToken: tok}
+    if err == nil {
+        r.OK = true
+        return r
     }
+    if errors.Is(err, context.DeadlineExceeded) ||
+        errors.Is(err, context.Canceled) ||
+        strings.Contains(err.Error(), "context deadline") ||
+        strings.Contains(err.Error(), "context canceled") {
+        r.OK = true
+        r.Error = err.Error()
+        return r
+    }
+    r.Error = err.Error()
+    return r
 }
 ```
 

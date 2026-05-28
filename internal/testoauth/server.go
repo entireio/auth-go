@@ -87,10 +87,14 @@ type Server struct {
 	// forceNext overrides the next refresh handler call. Guards by mu.
 	forceNext FailureMode
 
-	// stallActive and stallRelease implement the one-shot stall used by
-	// StallNextRefresh. Both are guarded by mu.
-	stallActive  bool
-	stallRelease chan struct{}
+	// stallActive, stallRelease, stallEntered, and stallCloseEntered
+	// implement the one-shot stall used by StallNextRefresh. All are
+	// guarded by mu (except stallCloseEntered which is safe to call
+	// after mu is released, as it uses its own sync.Once internally).
+	stallActive       bool
+	stallRelease      chan struct{}
+	stallEntered      chan struct{}
+	stallCloseEntered func() // idempotent; closes stallEntered exactly once
 
 	// per-category atomic counters.
 	totalGrants    atomic.Int64
@@ -217,34 +221,55 @@ func (s *Server) ForceNextRefresh(mode FailureMode) (release func()) {
 
 // StallNextRefresh causes the next /oauth/token refresh_token request to
 // block in the handler until release is called, then proceed normally
-// (rotation + JWT mint). Parent tests use this to keep a refresh
-// in-flight across processes while exercising concurrent mutations.
-// One-shot: only the next refresh stalls; subsequent refreshes go
-// through immediately. Returns release; calling release while a request
-// is stalled unblocks it. Calling release before any request stalls
-// clears the override so no future request stalls.
+// (rotation + JWT mint). Returns:
+//
+//   - release: idempotent unblock. Calling release while a request is
+//     stalled lets it proceed; calling release before any request stalls
+//     clears the override so no future request stalls.
+//   - stalled: a channel that closes once the next refresh request enters
+//     the stall wait (i.e. has acquired its position inside <-stallCh).
+//     Test parents can <-stalled to deterministically synchronise on
+//     "the request is now blocked here," without relying on polling +
+//     sleep heuristics.
+//
+// One-shot: only the next refresh stalls; subsequent refreshes proceed
+// immediately. (See ForceNextRefresh for an analogous one-shot override.)
 //
 // While stalled, the request still holds refreshMu + processLock on the
 // CLIENT side (the Manager that initiated it) — that's the whole point.
 // Server-side, the family is NOT consumed until release; if the parent
 // abandons the stalled request without releasing, the test will hang.
-func (s *Server) StallNextRefresh() (release func()) {
-	ch := make(chan struct{})
+func (s *Server) StallNextRefresh() (release func(), stalled <-chan struct{}) {
+	releaseCh := make(chan struct{})
+	enteredCh := make(chan struct{})
+
+	var enteredOnce sync.Once
+	closeEntered := func() { enteredOnce.Do(func() { close(enteredCh) }) }
+
 	s.mu.Lock()
 	s.stallActive = true
-	s.stallRelease = ch
+	s.stallRelease = releaseCh
+	s.stallEntered = enteredCh
+	s.stallCloseEntered = closeEntered
 	s.mu.Unlock()
 
-	var once sync.Once
-	return func() {
-		once.Do(func() {
+	var releaseOnce sync.Once
+	rel := func() {
+		releaseOnce.Do(func() {
 			s.mu.Lock()
 			s.stallActive = false
 			s.stallRelease = nil
+			s.stallEntered = nil
+			s.stallCloseEntered = nil
 			s.mu.Unlock()
-			close(ch)
+			close(releaseCh)
 		})
+		// Also close stallEntered so <-stalled never hangs forever if no
+		// request arrived before release was called.
+		closeEntered()
 	}
+
+	return rel, enteredCh
 }
 
 // mintLoginJWT mints a login JWT for the given family using the server clock.
@@ -306,13 +331,21 @@ func (s *Server) handleRefresh(w http.ResponseWriter, r *http.Request) {
 	// Pop the stall atomically so only the very next request blocks.
 	s.mu.Lock()
 	var stallCh chan struct{}
+	var closeEntered func()
 	if s.stallActive {
 		stallCh = s.stallRelease
+		closeEntered = s.stallCloseEntered
 		s.stallActive = false
 		s.stallRelease = nil
+		s.stallEntered = nil
+		s.stallCloseEntered = nil
 	}
 	s.mu.Unlock()
 	if stallCh != nil {
+		// Signal callers that the request is now entering the stall wait.
+		// closeEntered is idempotent (sync.Once-wrapped); the release closure
+		// may also call it if the parent abandons the stall before this fires.
+		closeEntered()
 		<-stallCh
 	}
 
