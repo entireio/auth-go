@@ -98,6 +98,17 @@ func TestE2E_RefreshOnExpiredJWTThenExchange(t *testing.T) {
 	if store.data[srv.URL()].RefreshToken == seed.RefreshToken {
 		t.Error("stored refresh token did not rotate")
 	}
+
+	// Verify the returned token is the exchanged token scoped to the requested
+	// resource, not the login JWT. A mock bug returning the wrong token would
+	// have a different audience and be caught here.
+	claims, err := tokens.ParseClaims(got)
+	if err != nil {
+		t.Fatalf("ParseClaims(got): %v", err)
+	}
+	if len(claims.Audience) != 1 || claims.Audience[0] != resource {
+		t.Fatalf("Audience = %v, want [%q] (token must be aud-scoped to the requested resource, not the issuer)", claims.Audience, resource)
+	}
 }
 
 // TestE2E_SilentRefreshAcrossTwoCycles runs two full refresh cycles and
@@ -331,16 +342,11 @@ func TestE2E_IdempotencySuccessorAbsorbsReplay(t *testing.T) {
 	}
 
 	m := newE2EManager(t, srv, store, t.TempDir())
-	SetNowForTest(t, m, clockFn)
 
-	// Advance the clock: but we want the refresh to fire. The LoginJWT was
-	// minted at `now` with TTL=1h. We do NOT advance the clock here — we
-	// advance in the Manager's clock. Use SetNowForTest to give the Manager
-	// a shifted clock while the server clock stays at `now`.
-	// Actually, let's just seed the store with an expired JWT from the start
-	// and advance the manager's clock to trigger the refresh.
-	expiredNow := now.Add(2 * time.Hour)
-	managerClock := expiredNow
+	// The Manager's clock is advanced 2h so the seeded login JWT (TTL=1h) is
+	// expired and a refresh is triggered. The server clock stays at `now` so
+	// a direct RT1 replay is within the 500ms idempotency window.
+	managerClock := now.Add(2 * time.Hour)
 	SetNowForTest(t, m, func() time.Time { return managerClock })
 
 	// Refresh via the Manager: RT1 is consumed on the server, RT2 issued.

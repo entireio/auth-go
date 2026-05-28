@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -183,12 +184,20 @@ func helperProclockContend() helperResult {
 }
 
 // readCounter reads an integer from path. Returns 0 if the file doesn't exist.
+// Panics on any other read error or parse failure so the proclock test cannot
+// silently pass on a broken counter file.
 func readCounter(path string) int {
 	b, err := os.ReadFile(path)
 	if err != nil {
-		return 0
+		if errors.Is(err, fs.ErrNotExist) {
+			return 0
+		}
+		panic(fmt.Sprintf("readCounter %q: %v", path, err))
 	}
-	n, _ := strconv.Atoi(strings.TrimSpace(string(b)))
+	n, err := strconv.Atoi(strings.TrimSpace(string(b)))
+	if err != nil {
+		panic(fmt.Sprintf("readCounter %q parse: content=%q: %v", path, string(b), err))
+	}
 	return n
 }
 
@@ -224,6 +233,9 @@ func (s *fileStore) filePath(profile string) string {
 }
 
 func (s *fileStore) SaveTokens(profile string, t tokens.TokenSet) error {
+	if t.AccessToken == "" {
+		return fmt.Errorf("fileStore: refusing to save TokenSet with empty access token")
+	}
 	b, err := json.Marshal(t)
 	if err != nil {
 		return fmt.Errorf("fileStore SaveTokens marshal: %w", err)
@@ -242,7 +254,7 @@ func (s *fileStore) SaveTokens(profile string, t tokens.TokenSet) error {
 func (s *fileStore) LoadTokens(profile string) (tokens.TokenSet, error) {
 	b, err := os.ReadFile(s.filePath(profile))
 	if err != nil {
-		if os.IsNotExist(err) {
+		if errors.Is(err, fs.ErrNotExist) {
 			return tokens.TokenSet{}, tokenstore.ErrNotFound
 		}
 		return tokens.TokenSet{}, fmt.Errorf("fileStore LoadTokens: %w", err)
@@ -255,7 +267,7 @@ func (s *fileStore) LoadTokens(profile string) (tokens.TokenSet, error) {
 }
 
 func (s *fileStore) DeleteTokens(profile string) error {
-	if err := os.Remove(s.filePath(profile)); err != nil && !os.IsNotExist(err) {
+	if err := os.Remove(s.filePath(profile)); err != nil && !errors.Is(err, fs.ErrNotExist) {
 		return fmt.Errorf("fileStore DeleteTokens: %w", err)
 	}
 	return nil
@@ -274,7 +286,7 @@ func (w *lineCaptureWriter) Write(p []byte) (int, error) {
 	w.t.Helper()
 	w.buf = append(w.buf, p...)
 	for {
-		i := bytesIndexByte(w.buf, '\n')
+		i := bytes.IndexByte(w.buf, '\n')
 		if i < 0 {
 			break
 		}
@@ -284,17 +296,20 @@ func (w *lineCaptureWriter) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
-func bytesIndexByte(b []byte, c byte) int {
-	for i, x := range b {
-		if x == c {
-			return i
-		}
+// flush writes any buffered bytes that don't end with '\n' as a final log line.
+// Called after cmd.Wait so residual subprocess output (e.g. a panic stack
+// ending mid-line) is not lost.
+func (w *lineCaptureWriter) flush() {
+	if len(w.buf) > 0 {
+		w.t.Logf("%s%s (no trailing newline)", w.prefix, string(w.buf))
+		w.buf = nil
 	}
-	return -1
 }
 
 // spawnHelper builds an *exec.Cmd that re-execs the test binary in helper
-// mode. Stdout is captured into out; stderr is written to t.Log.
+// mode. Stdout is captured into out; stderr is written to t.Log. A Cleanup
+// is registered to flush any residual stderr bytes that lacked a trailing
+// newline (e.g. a mid-line panic stack).
 func spawnHelper(t *testing.T, mode string, env map[string]string, out *bytes.Buffer) *exec.Cmd {
 	t.Helper()
 	cmd := exec.Command(os.Args[0], "-test.run=^TestE2ESub_Helper$", "-test.v=false")
@@ -305,7 +320,9 @@ func spawnHelper(t *testing.T, mode string, env map[string]string, out *bytes.Bu
 	}
 	cmd.Env = envv
 	cmd.Stdout = out
-	cmd.Stderr = &lineCaptureWriter{t: t, prefix: mode + ": "}
+	lcw := &lineCaptureWriter{t: t, prefix: mode + ": "}
+	cmd.Stderr = lcw
+	t.Cleanup(lcw.flush)
 	return cmd
 }
 
@@ -380,7 +397,6 @@ func TestE2ESub_CrossProcessSingleFlight(t *testing.T) {
 	}
 
 	commonEnv := map[string]string{
-		"AUTHGO_E2E_SERVER":    srv.URL(),
 		"AUTHGO_E2E_ISSUER":    srv.URL(),
 		"AUTHGO_E2E_CLIENT_ID": "cli",
 		"AUTHGO_E2E_LOCK_DIR":  lockDir,
@@ -468,7 +484,6 @@ func TestE2ESub_LogoutWinsOverInFlightRefresh(t *testing.T) {
 	}
 
 	commonEnv := map[string]string{
-		"AUTHGO_E2E_SERVER":    srv.URL(),
 		"AUTHGO_E2E_ISSUER":    srv.URL(),
 		"AUTHGO_E2E_CLIENT_ID": "cli",
 		"AUTHGO_E2E_LOCK_DIR":  lockDir,
@@ -491,7 +506,6 @@ func TestE2ESub_LogoutWinsOverInFlightRefresh(t *testing.T) {
 	time.Sleep(200 * time.Millisecond)
 
 	// Start logout subprocess — it will block on the cross-process lock.
-	logoutStart := time.Now()
 	var logoutOut bytes.Buffer
 	logoutCmd := spawnHelper(t, "logout", commonEnv, &logoutOut)
 	if err := logoutCmd.Start(); err != nil {
@@ -499,7 +513,9 @@ func TestE2ESub_LogoutWinsOverInFlightRefresh(t *testing.T) {
 	}
 
 	// Give logout time to attempt the lock and block, then release the stall.
-	time.Sleep(200 * time.Millisecond)
+	// 300ms gives the subprocess enough runway to start, acquire the lock
+	// attempt, and block — so its elapsed_ms is dominated by actual lock-wait.
+	time.Sleep(300 * time.Millisecond)
 	release() // idempotent; t.Cleanup won't double-release harmfully
 
 	if err := refreshCmd.Wait(); err != nil {
@@ -508,11 +524,26 @@ func TestE2ESub_LogoutWinsOverInFlightRefresh(t *testing.T) {
 	if err := logoutCmd.Wait(); err != nil {
 		t.Fatalf("logout subprocess: %v\nstdout: %s", err, logoutOut.String())
 	}
-	logoutElapsed := time.Since(logoutStart)
 
-	// Logout must have waited for the in-flight refresh: >= 200ms.
-	if logoutElapsed < 200*time.Millisecond {
-		t.Fatalf("logout elapsed = %v, want >= 200ms (must wait for in-flight refresh)", logoutElapsed)
+	// Decode the logout subprocess's own elapsed time. This measures from
+	// Manager construction to result return, capturing actual lock-wait time
+	// rather than parent-side wall-clock (which would include the parent's
+	// own pre-release sleep and is a tautology).
+	const stallWindowMs = 200
+	logoutResult, err := decodeHelperOutput(logoutOut.String())
+	if err != nil {
+		t.Fatalf("decode logout result: %v", err)
+	}
+	if !logoutResult.OK {
+		t.Fatalf("logout subprocess error: %s", logoutResult.Error)
+	}
+	if logoutResult.ElapsedMs < stallWindowMs {
+		t.Fatalf("logout elapsed_ms = %d, want >= %d (subprocess must wait on the cross-process lock)", logoutResult.ElapsedMs, stallWindowMs)
+	}
+
+	// Refresh must have completed exactly once before the logout ran.
+	if got := srv.RefreshGrantCount(); got != 1 {
+		t.Fatalf("RefreshGrantCount = %d, want exactly 1 (the in-flight refresh must complete before the mutation runs)", got)
 	}
 
 	// Final state: store empty (logout deletes after refresh persists).
@@ -555,7 +586,6 @@ func TestE2ESub_ReloginWinsOverInFlightRefresh(t *testing.T) {
 	}
 
 	commonEnv := map[string]string{
-		"AUTHGO_E2E_SERVER":        srv.URL(),
 		"AUTHGO_E2E_ISSUER":        srv.URL(),
 		"AUTHGO_E2E_CLIENT_ID":     "cli",
 		"AUTHGO_E2E_LOCK_DIR":      lockDir,
@@ -582,7 +612,9 @@ func TestE2ESub_ReloginWinsOverInFlightRefresh(t *testing.T) {
 		t.Fatalf("start relogin: %v", err)
 	}
 
-	time.Sleep(200 * time.Millisecond)
+	// 300ms gives the subprocess enough runway to start, acquire the lock
+	// attempt, and block — so its elapsed_ms is dominated by actual lock-wait.
+	time.Sleep(300 * time.Millisecond)
 	release()
 
 	if err := refreshCmd.Wait(); err != nil {
@@ -590,6 +622,27 @@ func TestE2ESub_ReloginWinsOverInFlightRefresh(t *testing.T) {
 	}
 	if err := reloginCmd.Wait(); err != nil {
 		t.Fatalf("relogin subprocess: %v\nstdout: %s", err, reloginOut.String())
+	}
+
+	// Decode the relogin subprocess's own elapsed time. This measures from
+	// Manager construction to result return, capturing actual lock-wait time
+	// rather than parent-side wall-clock (which would include the parent's
+	// own pre-release sleep and is a tautology).
+	const stallWindowMs = 200
+	reloginResult, err := decodeHelperOutput(reloginOut.String())
+	if err != nil {
+		t.Fatalf("decode relogin result: %v", err)
+	}
+	if !reloginResult.OK {
+		t.Fatalf("relogin subprocess error: %s", reloginResult.Error)
+	}
+	if reloginResult.ElapsedMs < stallWindowMs {
+		t.Fatalf("relogin elapsed_ms = %d, want >= %d (subprocess must wait on the cross-process lock)", reloginResult.ElapsedMs, stallWindowMs)
+	}
+
+	// Refresh must have completed exactly once before the relogin ran.
+	if got := srv.RefreshGrantCount(); got != 1 {
+		t.Fatalf("RefreshGrantCount = %d, want exactly 1 (the in-flight refresh must complete before the mutation runs)", got)
 	}
 
 	// Final state: store has the new user's access token.
