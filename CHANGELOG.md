@@ -35,6 +35,13 @@
   applied across `sts`, `deviceflow`, and `refresh`. Guards against an
   int64 nanosecond overflow that an absurd value would otherwise wrap into
   a past expiry.
+- `tokenmanager.SaveCoreToken` and `tokenmanager.DeleteCoreToken` now
+  acquire the refresh lock (`refreshMu` in-process, the cross-process file
+  lock) before mutating the store, serialising them against in-flight
+  refreshes. Prevents a refresh whose grant is mid-flight from persisting
+  over a concurrent logout (session resurrection) or overwriting a
+  concurrent re-login. Both methods can now block up to ~30s under
+  contention and may return a wrapped lock-acquire error.
 
 ## v0.3.4 — 2026-05-25
 

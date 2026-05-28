@@ -164,6 +164,17 @@ func (l *FileLock) Acquire(ctx context.Context) (func(), error)
 - Lock file created lazily, mode `0600`, **never deleted** (delete-on-unlock
   races the next acquirer for the inode).
 
+**Lock scope: all credential mutations, not just refresh.** `refreshLocked`
+holds the lock across the grant + persist, but any *other* writer of the
+credential store — `SaveCoreToken` (re-login) and `DeleteCoreToken`
+(logout) — must also acquire it. Otherwise a refresh whose grant is
+mid-flight could land its persist after a concurrent delete and resurrect
+a logged-out session, or overwrite a fresh login with the old account's
+refreshed credentials. Lock-ordering invariant: `refreshMu` first, then
+`ProcessLock` — everywhere. `persistRefreshed` runs from inside
+`refreshLocked` (both locks already held) and so calls an unlocked
+`saveCoreTokenLocked` variant to avoid self-deadlock.
+
 ---
 
 ## 3. `tokenmanager` integration

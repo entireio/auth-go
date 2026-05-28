@@ -14,6 +14,122 @@ import (
 	"github.com/entireio/auth-go/tokens"
 )
 
+// TestDeleteCoreToken_SerializesWithInFlightRefresh pins the lock invariant
+// added to defend against post-logout session resurrection: a concurrent
+// DeleteCoreToken must block until an in-flight refresh has released the
+// refresh+process lock, then the delete wins and the store is empty.
+//
+// Without the coordination, the refresh's persist would race the logout
+// and write the rotated credentials back over the deleted entry.
+func TestDeleteCoreToken_SerializesWithInFlightRefresh(t *testing.T) {
+	t.Parallel()
+	store := newSyncStore()
+	store.inner.data[testIssuer] = tokens.TokenSet{AccessToken: expiredJWT(t), RefreshToken: "rt-1"}
+	m, _ := New(Config{Issuer: testIssuer, ClientID: testClientID, RefreshPath: "/p", Store: store})
+	SetProcessLockForTest(t, m, &recordingLock{})
+
+	grantStarted := make(chan struct{})
+	releaseGrant := make(chan struct{})
+	fresh := freshJWT(t)
+	SetRefreshForTest(t, m, func(_ context.Context, _ refresh.Request) (*tokens.TokenSet, error) {
+		close(grantStarted)
+		<-releaseGrant
+		return &tokens.TokenSet{AccessToken: fresh, RefreshToken: "rt-2"}, nil
+	})
+
+	// Start the refresh; it will block in the fake grant fn while holding
+	// refreshMu + processLock.
+	refreshErr := make(chan error, 1)
+	go func() {
+		_, err := m.ensureFreshLogin(context.Background())
+		refreshErr <- err
+	}()
+	<-grantStarted
+
+	// Concurrent DeleteCoreToken — must block on refreshMu.
+	deleteErr := make(chan error, 1)
+	go func() { deleteErr <- m.DeleteCoreToken() }()
+
+	select {
+	case <-deleteErr:
+		t.Fatal("DeleteCoreToken returned while refresh held the lock; coordination not honored")
+	case <-time.After(75 * time.Millisecond):
+		// Expected: blocked behind refreshMu.
+	}
+
+	// Let the refresh complete; it persists, releases the locks, the
+	// pending DeleteCoreToken then runs and wipes the entry.
+	close(releaseGrant)
+	if err := <-refreshErr; err != nil {
+		t.Fatalf("refresh: %v", err)
+	}
+	if err := <-deleteErr; err != nil {
+		t.Fatalf("DeleteCoreToken: %v", err)
+	}
+
+	store.mu.Lock()
+	_, present := store.inner.data[testIssuer]
+	store.mu.Unlock()
+	if present {
+		t.Fatal("store entry present after logout; refresh resurrected the credential")
+	}
+}
+
+// TestSaveCoreToken_SerializesWithInFlightRefresh pins the same invariant
+// for re-login: a concurrent SaveCoreToken(otherUser) must block until the
+// refresh releases the locks, then the new login wins (the refresh's
+// rotated old-user credentials must not overwrite it).
+func TestSaveCoreToken_SerializesWithInFlightRefresh(t *testing.T) {
+	t.Parallel()
+	store := newSyncStore()
+	store.inner.data[testIssuer] = tokens.TokenSet{AccessToken: expiredJWT(t), RefreshToken: "rt-old"}
+	m, _ := New(Config{Issuer: testIssuer, ClientID: testClientID, RefreshPath: "/p", Store: store})
+	SetProcessLockForTest(t, m, &recordingLock{})
+
+	grantStarted := make(chan struct{})
+	releaseGrant := make(chan struct{})
+	oldRefreshed := freshJWT(t)
+	SetRefreshForTest(t, m, func(_ context.Context, _ refresh.Request) (*tokens.TokenSet, error) {
+		close(grantStarted)
+		<-releaseGrant
+		return &tokens.TokenSet{AccessToken: oldRefreshed, RefreshToken: "rt-old-rotated"}, nil
+	})
+
+	refreshErr := make(chan error, 1)
+	go func() {
+		_, err := m.ensureFreshLogin(context.Background())
+		refreshErr <- err
+	}()
+	<-grantStarted
+
+	// Concurrent re-login as a different account.
+	newUserToken := tokens.TokenSet{AccessToken: "new-user-jwt", RefreshToken: "rt-new"}
+	saveErr := make(chan error, 1)
+	go func() { saveErr <- m.SaveCoreToken(newUserToken) }()
+
+	select {
+	case <-saveErr:
+		t.Fatal("SaveCoreToken returned while refresh held the lock; coordination not honored")
+	case <-time.After(75 * time.Millisecond):
+		// Expected: blocked.
+	}
+
+	close(releaseGrant)
+	if err := <-refreshErr; err != nil {
+		t.Fatalf("refresh: %v", err)
+	}
+	if err := <-saveErr; err != nil {
+		t.Fatalf("SaveCoreToken: %v", err)
+	}
+
+	store.mu.Lock()
+	got := store.inner.data[testIssuer]
+	store.mu.Unlock()
+	if got.AccessToken != newUserToken.AccessToken || got.RefreshToken != newUserToken.RefreshToken {
+		t.Fatalf("store = %+v, want new-user credentials (refresh must not have overwritten)", got)
+	}
+}
+
 func TestRunRefresh_NoRefreshPath(t *testing.T) {
 	t.Parallel()
 	m, err := New(Config{Issuer: testIssuer, ClientID: testClientID, Store: newMemStore()})

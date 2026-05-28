@@ -171,11 +171,11 @@ func (c Config) validate() error {
 type exchangeFunc func(ctx context.Context, req sts.ExchangeRequest) (*tokens.TokenSet, error)
 type nowFuncType func() time.Time
 
-// ProcessLock serialises credential refreshes across processes. Acquire
-// blocks until the lock is held or ctx is done, returning an idempotent
-// release func. The default implementation is a file lock
+// ProcessLock serialises credential mutations (refresh, save, delete)
+// across processes. Acquire blocks until the lock is held or ctx is done,
+// returning an idempotent release func. On error the returned release func
+// is nil and must not be called. The default implementation is a file lock
 // (internal/proclock); SetProcessLockForTest swaps a fake.
-// On error the returned release func is nil and must not be called.
 type ProcessLock interface {
 	Acquire(ctx context.Context) (release func(), err error)
 }
@@ -274,7 +274,39 @@ func (m *Manager) Issuer() string { return m.cfg.Issuer }
 // exchanged tokens. The cacheKey already binds entries to the core
 // token's SHA-256 hash, so this is defence-in-depth — see
 // TestSaveCoreToken_ClearsExchangeCache.
+//
+// SaveCoreToken is serialised against in-flight refreshes by acquiring
+// refreshMu and the cross-process lock before mutating the store. Without
+// this, a refresh whose grant is mid-flight could land its persist after
+// a concurrent SaveCoreToken (re-login) and overwrite the new identity
+// with the old account's refreshed credentials. Lock ordering matches
+// refreshLocked: refreshMu first, then processLock. Can block up to
+// ~30s under contention and may return a wrapped lock error. The
+// empty-AccessToken check fires before lock acquisition so an obviously
+// bad call doesn't touch the filesystem.
 func (m *Manager) SaveCoreToken(t tokens.TokenSet) error {
+	if t.AccessToken == "" {
+		return errors.New("save core token: AccessToken is empty")
+	}
+	m.refreshMu.Lock()
+	defer m.refreshMu.Unlock()
+	release, err := m.processLock().Acquire(context.Background())
+	if err != nil {
+		return fmt.Errorf("save core token: acquire lock: %w", err)
+	}
+	defer release()
+	return m.saveCoreTokenLocked(t)
+}
+
+// saveCoreTokenLocked is the lock-free persist path. Caller MUST hold
+// refreshMu and the process lock. Used by SaveCoreToken (which acquires
+// them) and by persistRefreshed (which runs inside refreshLocked where
+// both are already held — a recursive lock attempt here would
+// self-deadlock).
+//
+// The empty-AccessToken check is duplicated here as defence in depth
+// because the locked variant is also reachable from persistRefreshed.
+func (m *Manager) saveCoreTokenLocked(t tokens.TokenSet) error {
 	if t.AccessToken == "" {
 		return errors.New("save core token: AccessToken is empty")
 	}
@@ -319,15 +351,35 @@ func (m *Manager) Refresh(ctx context.Context) (string, error) {
 	return m.ensureFreshLogin(ctx)
 }
 
-// DeleteCoreToken removes the stored core token and any cached
-// exchanges derived from it.
+// DeleteCoreToken removes the stored core token and any cached exchanges
+// derived from it.
 //
-// Order matters: the keyring delete runs first, then the in-memory
-// cache is cleared. If the keyring delete fails the cache is left
-// alone — clearing it pre-emptively would create a window where the
-// CLI thinks it's logged out (no cache entries) but the keyring
+// Order matters within the locked region: the keyring delete runs first,
+// then the in-memory cache is cleared. If the keyring delete fails the
+// cache is left alone — clearing it pre-emptively would create a window
+// where the CLI thinks it's logged out (no cache entries) but the keyring
 // still hands out the core token to the next process.
+//
+// DeleteCoreToken is serialised against in-flight refreshes by acquiring
+// refreshMu and the cross-process lock before mutating the store. Without
+// this, a refresh whose grant is mid-flight could land its persist after
+// a concurrent logout and resurrect the deleted session. Lock ordering
+// matches refreshLocked: refreshMu first, then processLock. Can block up
+// to ~30s under contention and may return a wrapped lock error.
 func (m *Manager) DeleteCoreToken() error {
+	m.refreshMu.Lock()
+	defer m.refreshMu.Unlock()
+	release, err := m.processLock().Acquire(context.Background())
+	if err != nil {
+		return fmt.Errorf("delete core token: acquire lock: %w", err)
+	}
+	defer release()
+	return m.deleteCoreTokenLocked()
+}
+
+// deleteCoreTokenLocked is the lock-free delete path. Caller MUST hold
+// refreshMu and the process lock.
+func (m *Manager) deleteCoreTokenLocked() error {
 	if err := m.cfg.Store.DeleteTokens(m.cfg.Issuer); err != nil {
 		return fmt.Errorf("delete core token: %w", err)
 	}
@@ -731,7 +783,10 @@ func (m *Manager) persistRefreshed(prev tokens.TokenSet, res *tokens.TokenSet) e
 	if merged.TokenType == "" {
 		merged.TokenType = prev.TokenType
 	}
-	if err := m.SaveCoreToken(merged); err != nil {
+	// saveCoreTokenLocked (NOT SaveCoreToken) — persistRefreshed runs from
+	// inside refreshLocked, which already holds refreshMu + processLock.
+	// Re-entering them here would self-deadlock.
+	if err := m.saveCoreTokenLocked(merged); err != nil {
 		return fmt.Errorf("refresh: persist: %w", err)
 	}
 	return nil

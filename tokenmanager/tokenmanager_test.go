@@ -192,6 +192,7 @@ func TestNew_NormalizesIssuer(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New(trailing slash + uppercase): %v", err)
 	}
+	SetProcessLockForTest(t, withTrailing, &recordingLock{})
 	if err := withTrailing.SaveCoreToken(tokens.TokenSet{AccessToken: "core-tok"}); err != nil {
 		t.Fatalf("SaveCoreToken: %v", err)
 	}
@@ -650,6 +651,7 @@ func TestToken_ExchangeFailureSurfaces(t *testing.T) {
 func TestSaveLookupDeleteCoreToken(t *testing.T) {
 	t.Parallel()
 	m := newTestManager(t, newMemStore(), nil)
+	SetProcessLockForTest(t, m, &recordingLock{})
 
 	if got, err := m.LookupCoreToken(); err != nil || got != "" {
 		t.Fatalf("initial lookup: got=%q err=%v, want empty/nil", got, err)
@@ -688,6 +690,7 @@ func TestDeleteCoreToken_ClearsExchangeCache(t *testing.T) {
 		exchangeCalls++
 		return &tokens.TokenSet{AccessToken: "exchanged-old", ExpiresAt: time.Now().Add(time.Hour)}, nil
 	})
+	SetProcessLockForTest(t, m, &recordingLock{})
 
 	// Prime the cache.
 	if _, err := m.TokenForResource(context.Background(), testResource); err != nil {
@@ -731,6 +734,7 @@ func TestDeleteCoreToken_PreservesCacheOnStoreFailure(t *testing.T) {
 		exchangeCalls++
 		return &tokens.TokenSet{AccessToken: "exchanged-1", ExpiresAt: time.Now().Add(time.Hour)}, nil
 	})
+	SetProcessLockForTest(t, m, &recordingLock{})
 
 	if _, err := m.TokenForResource(context.Background(), testResource); err != nil {
 		t.Fatalf("prime: %v", err)
@@ -963,6 +967,7 @@ func TestSaveCoreToken_ClearsExchangeCache(t *testing.T) {
 		calls++
 		return &tokens.TokenSet{AccessToken: "user-a-exchanged"}, nil
 	})
+	SetProcessLockForTest(t, m, &recordingLock{})
 
 	if _, err := m.TokenForResource(context.Background(), testResource); err != nil {
 		t.Fatalf("first call: %v", err)
@@ -1285,6 +1290,7 @@ func TestSaveCoreToken_RejectsEmptyAccessToken(t *testing.T) {
 	t.Parallel()
 
 	m := newTestManager(t, newMemStore(), nil)
+	SetProcessLockForTest(t, m, &recordingLock{})
 
 	err := m.SaveCoreToken(tokens.TokenSet{AccessToken: "", RefreshToken: "rt"})
 	if err == nil {
@@ -1311,6 +1317,7 @@ func TestSaveCoreToken_PersistsFullTokenSet(t *testing.T) {
 
 	store := newMemStore()
 	m := newTestManager(t, store, nil)
+	SetProcessLockForTest(t, m, &recordingLock{})
 
 	want := tokens.TokenSet{
 		AccessToken:  "core-tok",
