@@ -577,8 +577,17 @@ func TestServer_StallNextRefreshBlocksUntilRelease(t *testing.T) {
 		if r.status != 200 {
 			t.Fatalf("status = %d, want 200", r.status)
 		}
-		if r.took < 75*time.Millisecond {
-			t.Errorf("took = %v, expected >75ms (the stall window)", r.took)
+		// Sanity check that the request was actually stalled. The threshold
+		// is well below the parent's 75ms wait because the goroutine's
+		// time.Since(start) is measured from AFTER the goroutine was
+		// scheduled — which is several ms after the parent started its
+		// 75ms timer — so r.took is consistently ~5–10ms below the
+		// wall-clock 75ms window. The "didn't return early" select above
+		// is the proof the stall happened at all; this check just guards
+		// against the request returning in single-digit ms (which would
+		// indicate the stall mechanism didn't engage).
+		if r.took < 50*time.Millisecond {
+			t.Errorf("took = %v, want >= 50ms (request appears not to have stalled)", r.took)
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("request did not unblock after release")
