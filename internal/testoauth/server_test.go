@@ -437,6 +437,46 @@ func TestServer_NowSeamControlsJWTExpiry(t *testing.T) {
 	}
 }
 
+func TestServer_ForceNextRefreshNetworkError(t *testing.T) {
+	t.Parallel()
+	srv := testoauth.NewServer(t, testoauth.Config{})
+	seed := srv.SeedFamily("u", []string{"https://api"})
+
+	release := srv.ForceNextRefresh(testoauth.FailNetworkError)
+	t.Cleanup(release)
+
+	// Use a real http.Client with a tight timeout so the test fails fast
+	// even if the server forgets to close.
+	c := &http.Client{Timeout: 2 * time.Second}
+	body := url.Values{
+		"grant_type":    {"refresh_token"},
+		"refresh_token": {seed.RefreshToken},
+		"client_id":     {"test-cli"},
+	}
+	resp, err := c.Post(srv.URL()+"/oauth/token", "application/x-www-form-urlencoded", strings.NewReader(body.Encode()))
+	if err == nil {
+		// Some responses may surface the error on body read rather than
+		// Post itself, depending on when the server closed.
+		_ = resp.Body.Close()
+		// Probe a follow-up read of body to force the error to surface.
+		// (Best-effort — typically Post itself errors when the server hijacks
+		// and closes before any bytes are written.)
+		t.Fatalf("expected transport error, got nil with status %d", resp.StatusCode)
+	}
+
+	// The one-shot override must be consumed: the next refresh succeeds
+	// normally with the seeded RT (the previous attempt did not consume
+	// it because the server closed before family.Consume ran).
+	resp2, err := c.Post(srv.URL()+"/oauth/token", "application/x-www-form-urlencoded", strings.NewReader(body.Encode()))
+	if err != nil {
+		t.Fatalf("follow-up refresh: %v", err)
+	}
+	drainClose(resp2)
+	if resp2.StatusCode != 200 {
+		t.Fatalf("follow-up refresh status = %d, want 200 (override should be one-shot)", resp2.StatusCode)
+	}
+}
+
 func TestServer_ForceNextRefreshInvalidGrant(t *testing.T) {
 	t.Parallel()
 	srv := testoauth.NewServer(t, testoauth.Config{})

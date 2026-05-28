@@ -24,8 +24,8 @@ const (
 	// FailInvalidGrant makes the next refresh response return 400 invalid_grant
 	// without consuming the refresh token.
 	FailInvalidGrant
-	// FailNetworkError closes the connection mid-response. (Task 4: not yet
-	// implemented in the handler; defined here for API completeness.)
+	// FailNetworkError hijacks the TCP connection and closes it before writing
+	// any response, causing the client to see a transport error.
 	FailNetworkError
 )
 
@@ -190,7 +190,8 @@ func (s *Server) FamilyRevoked(fid string) bool {
 // release function clears the override early (no-op if already consumed).
 //
 // FailInvalidGrant: returns 400 invalid_grant without touching the RT or family.
-// FailNetworkError: not yet implemented (Task 4); currently a no-op.
+// FailNetworkError: hijacks the TCP connection and closes it immediately so the
+// client sees a transport error from http.Client.Do. The RT is not consumed.
 func (s *Server) ForceNextRefresh(mode FailureMode) (release func()) {
 	s.mu.Lock()
 	s.forceNext = mode
@@ -272,7 +273,20 @@ func (s *Server) handleRefresh(w http.ResponseWriter, r *http.Request) {
 		oauthErrorResponse(w, "invalid_grant", "forced failure for test")
 		return
 	}
-	// FailNetworkError: not yet implemented (Task 4).
+	if forced == FailNetworkError {
+		hj, ok := w.(http.Hijacker)
+		if !ok {
+			http.Error(w, "server does not support hijacking", http.StatusInternalServerError)
+			return
+		}
+		conn, _, err := hj.Hijack()
+		if err != nil {
+			http.Error(w, "hijack failed: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+		_ = conn.Close()
+		return
+	}
 
 	rt := r.PostForm.Get("refresh_token")
 	if rt == "" {
