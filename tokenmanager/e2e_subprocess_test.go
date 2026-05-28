@@ -71,6 +71,8 @@ func runHelper(mode string) {
 	switch mode {
 	case "refresh-once":
 		result = helperRefreshOnce()
+	case "refresh-with-timeout":
+		result = helperRefreshWithTimeout()
 	case "logout":
 		result = helperLogout()
 	case "relogin":
@@ -136,6 +138,32 @@ func helperRefreshOnce() helperResult {
 		return helperResult{Error: err.Error()}
 	}
 	return helperResult{OK: true, AccessToken: tok}
+}
+
+func helperRefreshWithTimeout() helperResult {
+	m := newHelperManager()
+	timeoutMs, _ := strconv.Atoi(os.Getenv("AUTHGO_E2E_CTX_TIMEOUT_MS"))
+	if timeoutMs <= 0 {
+		timeoutMs = 150
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(timeoutMs)*time.Millisecond)
+	defer cancel()
+	tok, err := m.Refresh(ctx)
+	r := helperResult{AccessToken: tok}
+	if err == nil {
+		r.OK = true
+		return r
+	}
+	// Ctx cancellation surfaces as either context.DeadlineExceeded, a
+	// wrapped form of it, OR an HTTP transport error that mentions "context"
+	// (depending on which layer caught it first).
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) || strings.Contains(err.Error(), "context") {
+		r.OK = true
+		r.Error = err.Error()
+		return r
+	}
+	r.Error = err.Error()
+	return r
 }
 
 func helperLogout() helperResult {
@@ -712,5 +740,373 @@ func TestE2ESub_ProclockMutualExclusion(t *testing.T) {
 	final := readCounter(counterPath)
 	if final != 40 {
 		t.Fatalf("counter = %d, want 40 (2 procs × 20 rounds each; less means the lock failed)", final)
+	}
+}
+
+// waitForGrantHandlerEntry polls srv.GrantCount until it reaches want or
+// the timeout fires. Used to synchronise the race tests: the parent needs
+// to know helper A's request has reached the server's handler before
+// spawning helper B, so the family-state mutations land in the correct
+// order.
+func waitForGrantHandlerEntry(t *testing.T, srv *testoauth.Server, want int, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for {
+		if srv.GrantCount() >= want {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("server handler did not see %d grants within %v (currently %d)", want, timeout, srv.GrantCount())
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// TestE2ESub_CtxCancelReleasesLocks verifies that a context cancellation
+// mid-refresh releases both refreshMu and the cross-process proclock cleanly.
+// Helper A's 150ms ctx expires while the server is stalled; helper B then
+// succeeds quickly against the same LockDir, proving both locks were freed.
+func TestE2ESub_CtxCancelReleasesLocks(t *testing.T) {
+	if testing.Short() {
+		t.Skip("subprocess test")
+	}
+	t.Parallel()
+
+	srv := testoauth.NewServer(t, testoauth.Config{LoginJWTTTL: time.Hour})
+	seed := srv.SeedFamily("u", []string{srv.URL()})
+
+	storeDir := t.TempDir()
+	lockDir := t.TempDir()
+	parentStore := newFileStore(storeDir)
+	expired := mintExpiredJWT(srv.URL(), "u", time.Now())
+	if err := parentStore.SaveTokens(srv.URL(), tokens.TokenSet{AccessToken: expired, RefreshToken: seed.RefreshToken}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	release := srv.StallNextRefresh()
+	t.Cleanup(release)
+
+	commonEnv := map[string]string{
+		"AUTHGO_E2E_ISSUER":    srv.URL(),
+		"AUTHGO_E2E_CLIENT_ID": "cli",
+		"AUTHGO_E2E_LOCK_DIR":  lockDir,
+		"AUTHGO_E2E_STORE_DIR": storeDir,
+	}
+
+	// Helper A: ctx-cancel during stalled grant.
+	envA := make(map[string]string, len(commonEnv)+1)
+	for k, v := range commonEnv {
+		envA[k] = v
+	}
+	envA["AUTHGO_E2E_CTX_TIMEOUT_MS"] = "150"
+
+	var outA bytes.Buffer
+	cmdA := spawnHelper(t, "refresh-with-timeout", envA, &outA)
+	if err := cmdA.Run(); err != nil {
+		t.Fatalf("helper A: %v\nstdout: %s", err, outA.String())
+	}
+	var resA helperResult
+	if err := json.NewDecoder(strings.NewReader(outA.String())).Decode(&resA); err != nil {
+		t.Fatalf("decode A: %v", err)
+	}
+	if !resA.OK {
+		t.Fatalf("helper A: not OK, error=%q", resA.Error)
+	}
+	// A's ctx had a 150ms budget; the lock-acquire timeout default is 30s.
+	// If the ctx fired correctly mid-grant, A's elapsed should be roughly
+	// 150ms + a bit of startup. We give generous margin for CI: < 5 seconds.
+	if resA.ElapsedMs >= 5000 {
+		t.Fatalf("helper A elapsed = %dms; suggests something other than ctx-cancel fired (lock-acquire timeout?)", resA.ElapsedMs)
+	}
+
+	// Helper B: standard refresh after A's cancellation. Should succeed
+	// quickly — proves the locks were released cleanly.
+	// NOTE: do NOT call release() before B. The server-side stall goroutine
+	// is blocked and has NOT consumed RT_orig yet. B can freely use RT_orig
+	// (the proclock from A's process was released on A's process exit).
+	// After B finishes, release() unblocks the stall goroutine — that server
+	// goroutine will see RT_orig already consumed and get invalid_grant, but
+	// nobody is watching that path any more.
+	var outB bytes.Buffer
+	cmdB := spawnHelper(t, "refresh-once", commonEnv, &outB)
+	if err := cmdB.Run(); err != nil {
+		t.Fatalf("helper B: %v\nstdout: %s", err, outB.String())
+	}
+	var resB helperResult
+	if err := json.NewDecoder(strings.NewReader(outB.String())).Decode(&resB); err != nil {
+		t.Fatalf("decode B: %v", err)
+	}
+	if !resB.OK {
+		t.Fatalf("helper B not OK: %s", resB.Error)
+	}
+	if resB.AccessToken == "" {
+		t.Fatal("helper B returned empty access token")
+	}
+	// If A had orphaned either lock, B would wait up to ~30s on the
+	// cross-process lock acquire. A few seconds is fine — anything in the
+	// teens-of-seconds range indicates the lock wasn't released.
+	if resB.ElapsedMs >= 5000 {
+		t.Fatalf("helper B elapsed = %dms; suggests the previous helper orphaned a lock", resB.ElapsedMs)
+	}
+
+	// Release the stall so the t.Cleanup stall goroutine can drain cleanly.
+	release()
+
+	// Server saw exactly one successful refresh (helper B's). The stall
+	// goroutine will eventually get invalid_grant after RT_orig is consumed
+	// by B, but that doesn't count as a successful refresh grant.
+	if got := srv.RefreshGrantCount(); got != 1 {
+		t.Fatalf("RefreshGrantCount = %d, want 1 (only B's refresh succeeded)", got)
+	}
+
+	// Final store state: B's rotated RT.
+	got, err := parentStore.LoadTokens(srv.URL())
+	if err != nil {
+		t.Fatalf("LoadTokens: %v", err)
+	}
+	if got.RefreshToken == seed.RefreshToken {
+		t.Fatal("stored RT did not rotate after helper B's refresh")
+	}
+}
+
+// TestE2ESub_NonCooperatingRaceStrictRevokes verifies the doRefresh retry
+// path: two helpers with distinct LockDirs share a fileStore. With
+// IdempotencySuccessor: 0 (strict), the loser's first grant gets
+// invalid_grant + family revocation; its retry with cur.RefreshToken also
+// fails (family revoked); surfaces ErrReauthRequired.
+func TestE2ESub_NonCooperatingRaceStrictRevokes(t *testing.T) {
+	if testing.Short() {
+		t.Skip("subprocess test")
+	}
+	t.Parallel()
+
+	srv := testoauth.NewServer(t, testoauth.Config{
+		LoginJWTTTL:          time.Hour,
+		IdempotencySuccessor: 0,
+	})
+	seed := srv.SeedFamily("u", []string{srv.URL()})
+
+	storeDir := t.TempDir()
+	lockDirA := t.TempDir()
+	lockDirB := t.TempDir()
+
+	parentStore := newFileStore(storeDir)
+	expired := mintExpiredJWT(srv.URL(), "u", time.Now())
+	if err := parentStore.SaveTokens(srv.URL(), tokens.TokenSet{AccessToken: expired, RefreshToken: seed.RefreshToken}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	commonStore := map[string]string{
+		"AUTHGO_E2E_ISSUER":    srv.URL(),
+		"AUTHGO_E2E_CLIENT_ID": "cli",
+		"AUTHGO_E2E_STORE_DIR": storeDir,
+	}
+
+	envA := make(map[string]string, len(commonStore)+1)
+	for k, v := range commonStore {
+		envA[k] = v
+	}
+	envA["AUTHGO_E2E_LOCK_DIR"] = lockDirA
+
+	envB := make(map[string]string, len(commonStore)+1)
+	for k, v := range commonStore {
+		envB[k] = v
+	}
+	envB["AUTHGO_E2E_LOCK_DIR"] = lockDirB
+
+	release := srv.StallNextRefresh()
+	t.Cleanup(release)
+
+	// Spawn A in background so the parent can continue while A is stalled.
+	var outA bytes.Buffer
+	cmdA := spawnHelper(t, "refresh-once", envA, &outA)
+	if err := cmdA.Start(); err != nil {
+		t.Fatalf("start A: %v", err)
+	}
+
+	// Wait for A's request to reach the server handler, plus a small
+	// settling time for A to actually be inside the stall wait.
+	waitForGrantHandlerEntry(t, srv, 1, 2*time.Second)
+	time.Sleep(30 * time.Millisecond)
+
+	// Spawn B and wait for it to finish. B is not stalled (one-shot consumed by A).
+	// B consumes RT_orig → gets RT_new1 → persists to shared fileStore.
+	var outB bytes.Buffer
+	cmdB := spawnHelper(t, "refresh-once", envB, &outB)
+	if err := cmdB.Run(); err != nil {
+		t.Fatalf("B: %v\n%s", err, outB.String())
+	}
+	var resB helperResult
+	if err := json.NewDecoder(strings.NewReader(outB.String())).Decode(&resB); err != nil {
+		t.Fatalf("decode B: %v", err)
+	}
+
+	// Release stall, wait for A.
+	release()
+	// A exits with code 1 (resA.OK == false) — don't fatal on that.
+	_ = cmdA.Wait()
+
+	var resA helperResult
+	if err := json.NewDecoder(strings.NewReader(outA.String())).Decode(&resA); err != nil {
+		t.Fatalf("decode A: %v\nraw: %s", err, outA.String())
+	}
+
+	// A's first grant gets invalid_grant + family revocation; retry with
+	// cur.RefreshToken (= RT_new1) also gets invalid_grant (family revoked).
+	// A returns ErrReauthRequired.
+	if resA.OK {
+		t.Fatalf("helper A: expected not OK (ErrReauthRequired), got OK with token=%q", resA.AccessToken)
+	}
+	if !strings.Contains(resA.Error, "reauthentication required") {
+		t.Fatalf("helper A error = %q, want string containing \"reauthentication required\"", resA.Error)
+	}
+
+	if !resB.OK {
+		t.Fatalf("helper B not OK: %s", resB.Error)
+	}
+	if resB.AccessToken == "" {
+		t.Fatal("helper B returned empty access token")
+	}
+
+	// Only B's grant succeeded.
+	if got := srv.RefreshGrantCount(); got != 1 {
+		t.Fatalf("RefreshGrantCount = %d, want 1 (only B succeeded)", got)
+	}
+	// B's success + A's first attempt + A's retry = 3 total handler calls.
+	if got := srv.GrantCount(); got != 3 {
+		t.Fatalf("GrantCount = %d, want 3 (B's success + A's first + A's retry)", got)
+	}
+	// Family was revoked by the strict reuse-detection.
+	if !srv.FamilyRevoked(seed.FamilyID) {
+		t.Fatal("family was not revoked, want revoked (strict IdempotencySuccessor=0)")
+	}
+
+	// Final store state: B's rotated RT (A persisted nothing).
+	stored, err := parentStore.LoadTokens(srv.URL())
+	if err != nil {
+		t.Fatalf("LoadTokens: %v", err)
+	}
+	if stored.RefreshToken == seed.RefreshToken {
+		t.Fatal("stored RT == seed.RefreshToken; expected B's rotated RT")
+	}
+}
+
+// TestE2ESub_NonCooperatingRaceLaxAbsorbs verifies that with a non-zero
+// IdempotencySuccessor window, the loser's grant returns the already-issued
+// successor idempotently — no retry fires, no family revocation.
+func TestE2ESub_NonCooperatingRaceLaxAbsorbs(t *testing.T) {
+	if testing.Short() {
+		t.Skip("subprocess test")
+	}
+	t.Parallel()
+
+	srv := testoauth.NewServer(t, testoauth.Config{
+		LoginJWTTTL:          time.Hour,
+		IdempotencySuccessor: 5 * time.Second,
+	})
+	seed := srv.SeedFamily("u", []string{srv.URL()})
+
+	storeDir := t.TempDir()
+	lockDirA := t.TempDir()
+	lockDirB := t.TempDir()
+
+	parentStore := newFileStore(storeDir)
+	expired := mintExpiredJWT(srv.URL(), "u", time.Now())
+	if err := parentStore.SaveTokens(srv.URL(), tokens.TokenSet{AccessToken: expired, RefreshToken: seed.RefreshToken}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	commonStore := map[string]string{
+		"AUTHGO_E2E_ISSUER":    srv.URL(),
+		"AUTHGO_E2E_CLIENT_ID": "cli",
+		"AUTHGO_E2E_STORE_DIR": storeDir,
+	}
+
+	envA := make(map[string]string, len(commonStore)+1)
+	for k, v := range commonStore {
+		envA[k] = v
+	}
+	envA["AUTHGO_E2E_LOCK_DIR"] = lockDirA
+
+	envB := make(map[string]string, len(commonStore)+1)
+	for k, v := range commonStore {
+		envB[k] = v
+	}
+	envB["AUTHGO_E2E_LOCK_DIR"] = lockDirB
+
+	release := srv.StallNextRefresh()
+	t.Cleanup(release)
+
+	// Spawn A in background so the parent can continue while A is stalled.
+	var outA bytes.Buffer
+	cmdA := spawnHelper(t, "refresh-once", envA, &outA)
+	if err := cmdA.Start(); err != nil {
+		t.Fatalf("start A: %v", err)
+	}
+
+	// Wait for A's request to reach the server handler, plus a small
+	// settling time for A to actually be inside the stall wait.
+	waitForGrantHandlerEntry(t, srv, 1, 2*time.Second)
+	time.Sleep(30 * time.Millisecond)
+
+	// Spawn B and wait for it to finish. B is not stalled (one-shot consumed by A).
+	// B consumes RT_orig → gets RT_new1 → persists to shared fileStore.
+	var outB bytes.Buffer
+	cmdB := spawnHelper(t, "refresh-once", envB, &outB)
+	if err := cmdB.Run(); err != nil {
+		t.Fatalf("B: %v\n%s", err, outB.String())
+	}
+	var resB helperResult
+	if err := json.NewDecoder(strings.NewReader(outB.String())).Decode(&resB); err != nil {
+		t.Fatalf("decode B: %v", err)
+	}
+
+	// Release stall, wait for A.
+	release()
+	if err := cmdA.Wait(); err != nil {
+		t.Logf("A exit: %v (decoded result will confirm OK)", err)
+	}
+
+	var resA helperResult
+	if err := json.NewDecoder(strings.NewReader(outA.String())).Decode(&resA); err != nil {
+		t.Fatalf("decode A: %v\nraw: %s", err, outA.String())
+	}
+
+	// With lax idempotency, A's grant returns RT_new1 idempotently —
+	// no retry fires, both helpers succeed.
+	if !resA.OK {
+		t.Fatalf("helper A not OK: %s", resA.Error)
+	}
+	if resA.AccessToken == "" {
+		t.Fatal("helper A returned empty access token")
+	}
+	if !resB.OK {
+		t.Fatalf("helper B not OK: %s", resB.Error)
+	}
+	if resB.AccessToken == "" {
+		t.Fatal("helper B returned empty access token")
+	}
+
+	// Both grants succeeded (one fresh consume, one idempotent replay).
+	if got := srv.RefreshGrantCount(); got != 2 {
+		t.Fatalf("RefreshGrantCount = %d, want 2 (B's fresh + A's idempotent replay)", got)
+	}
+	// No retry — A succeeded on first attempt.
+	if got := srv.GrantCount(); got != 2 {
+		t.Fatalf("GrantCount = %d, want 2 (no retry on A's path)", got)
+	}
+	// Family must not be revoked (idempotency window absorbed the replay).
+	if srv.FamilyRevoked(seed.FamilyID) {
+		t.Fatal("family was revoked, want not revoked (lax IdempotencySuccessor=5s)")
+	}
+
+	// Final store state: RT_new1 (B persisted it; A's merge is a no-op
+	// since the store already carries RT_new1).
+	stored, err := parentStore.LoadTokens(srv.URL())
+	if err != nil {
+		t.Fatalf("LoadTokens: %v", err)
+	}
+	if stored.RefreshToken == seed.RefreshToken {
+		t.Fatal("stored RT == seed.RefreshToken; expected RT_new1 from B's rotation")
 	}
 }
