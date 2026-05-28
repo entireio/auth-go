@@ -376,9 +376,15 @@ func TestE2ESub_CrossProcessSingleFlight(t *testing.T) {
 	}
 	t.Parallel()
 
-	now := time.Date(2026, 5, 28, 12, 0, 0, 0, time.UTC)
+	// Use real wall time on the server (not a pinned date) so the JWT exp
+	// the server mints into refresh responses (server.now + LoginJWTTTL)
+	// is always live for the test run. Pinning the server clock to a
+	// fixed date while the subprocess Manager uses real time.Now creates
+	// a time-of-day-dependent flake: once wall-clock passes the pinned
+	// exp, the second subprocess sees the persisted token as expired and
+	// refreshes again, breaking the single-flight assertion.
+	now := time.Now()
 	srv := testoauth.NewServer(t, testoauth.Config{
-		Now:         func() time.Time { return now },
 		LoginJWTTTL: time.Hour,
 	})
 	seed := srv.SeedFamily("u", []string{srv.URL()})
@@ -466,9 +472,15 @@ func TestE2ESub_LogoutWinsOverInFlightRefresh(t *testing.T) {
 	}
 	t.Parallel()
 
-	now := time.Date(2026, 5, 28, 12, 0, 0, 0, time.UTC)
+	// Use real wall time on the server (not a pinned date) so the JWT exp
+	// the server mints into refresh responses (server.now + LoginJWTTTL)
+	// is always live for the test run. Pinning the server clock to a
+	// fixed date while the subprocess Manager uses real time.Now creates
+	// a time-of-day-dependent flake: once wall-clock passes the pinned
+	// exp, the second subprocess sees the persisted token as expired and
+	// refreshes again, breaking the single-flight assertion.
+	now := time.Now()
 	srv := testoauth.NewServer(t, testoauth.Config{
-		Now:         func() time.Time { return now },
 		LoginJWTTTL: time.Hour,
 	})
 	seed := srv.SeedFamily("u", []string{srv.URL()})
@@ -561,9 +573,15 @@ func TestE2ESub_ReloginWinsOverInFlightRefresh(t *testing.T) {
 	}
 	t.Parallel()
 
-	now := time.Date(2026, 5, 28, 12, 0, 0, 0, time.UTC)
+	// Use real wall time on the server (not a pinned date) so the JWT exp
+	// the server mints into refresh responses (server.now + LoginJWTTTL)
+	// is always live for the test run. Pinning the server clock to a
+	// fixed date while the subprocess Manager uses real time.Now creates
+	// a time-of-day-dependent flake: once wall-clock passes the pinned
+	// exp, the second subprocess sees the persisted token as expired and
+	// refreshes again, breaking the single-flight assertion.
+	now := time.Now()
 	srv := testoauth.NewServer(t, testoauth.Config{
-		Now:         func() time.Time { return now },
 		LoginJWTTTL: time.Hour,
 	})
 	seed := srv.SeedFamily("u", []string{srv.URL()})
