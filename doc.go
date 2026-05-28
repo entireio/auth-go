@@ -5,6 +5,7 @@
 //
 //   - deviceflow   — RFC 8628 OAuth 2.0 Device Authorization Grant client
 //   - sts          — RFC 8693 Token Exchange client
+//   - refresh      — RFC 6749 §6 refresh_token grant client
 //   - tokens       — TokenSet plus unverified JWT claim parsing
 //   - tokenstore   — pluggable persistence interface with reference impls
 //   - tokenmanager — orchestrates core-token storage + STS exchanges,

@@ -138,59 +138,11 @@ func (r ExchangeRequest) validate() error {
 		// policy. Fail fast at the caller.
 		return errors.New("ClientSecret set without ClientID: credentials would not be sent")
 	}
-	if err := validateClientID(r.ClientID); err != nil {
+	if err := oauthhttp.ValidateClientID(r.ClientID); err != nil {
 		return err
 	}
-	if err := validateClientIDConsistency(r.ClientID, r.Extra); err != nil {
+	if err := oauthhttp.ValidateClientIDConsistency(r.ClientID, r.Extra); err != nil {
 		return err
-	}
-	return nil
-}
-
-// validateClientID enforces the byte-level constraints RFC 6749 §2.3.1
-// and RFC 7617 §2 place on a client_id traveling via HTTP Basic Auth:
-// VSCHAR (printable ASCII, 0x20–0x7E) and no ':' (the Basic Auth field
-// separator). Without this guard, url.QueryEscape in Exchange would
-// percent-encode forbidden bytes, slip them past the wire validator,
-// and surface as opaque server-side rejections after a QueryUnescape
-// round-trip.
-func validateClientID(id string) error {
-	if strings.ContainsRune(id, ':') {
-		return errors.New("ClientID must not contain ':' (RFC 7617 §2)")
-	}
-	for _, r := range id {
-		if r < 0x20 || r > 0x7E {
-			return fmt.Errorf("ClientID contains non-printable or non-ASCII byte %U (RFC 6749 §2.3.1 requires VSCHAR)", r)
-		}
-	}
-	return nil
-}
-
-// validateClientIDConsistency rejects requests that set client_id on
-// both the typed field and Extra to different values. The two surfaces
-// are populated independently — typed field becomes Basic Auth, Extra
-// becomes form body — and a server reading one but not the other would
-// silently accept the wrong identity. Same-value duplication is the
-// documented belt-and-braces pattern and is allowed.
-//
-// Multiple Extra["client_id"] entries are always rejected, even when
-// ClientID is unset: servers that read via r.PostFormValue see only
-// the first; servers that read via r.PostForm["client_id"] see all,
-// so a slice like ["a","b"] succeeds against one and fails against
-// the other in ways the caller can't predict.
-func validateClientIDConsistency(id string, extra url.Values) error {
-	if extra == nil {
-		return nil
-	}
-	extras := extra["client_id"]
-	if len(extras) > 1 {
-		return fmt.Errorf("extra %q must hold at most one value, got %d", "client_id", len(extras))
-	}
-	if id == "" || len(extras) == 0 {
-		return nil
-	}
-	if extras[0] != id {
-		return fmt.Errorf("ClientID (%q) and Extra[\"client_id\"] (%q) disagree", id, extras[0])
 	}
 	return nil
 }
@@ -340,7 +292,7 @@ func (c *Client) Exchange(ctx context.Context, req ExchangeRequest) (*tokens.Tok
 		RefreshToken: raw.RefreshToken,
 		TokenType:    raw.TokenType,
 		Scope:        raw.Scope,
-		ExpiresAt:    c.now().Add(time.Duration(raw.ExpiresIn) * time.Second),
+		ExpiresAt:    c.now().Add(oauthhttp.ExpiresInDuration(raw.ExpiresIn)),
 	}, nil
 }
 

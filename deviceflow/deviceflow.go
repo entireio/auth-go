@@ -421,7 +421,7 @@ func (c *Client) PollDeviceAuth(ctx context.Context, deviceCode string) (*tokens
 		Scope:        raw.Scope,
 	}
 	if raw.ExpiresIn > 0 {
-		t.ExpiresAt = c.now().Add(time.Duration(raw.ExpiresIn) * time.Second)
+		t.ExpiresAt = c.now().Add(oauthhttp.ExpiresInDuration(raw.ExpiresIn))
 	}
 	return t, nil
 }

@@ -8,24 +8,29 @@
 // The package is provider-agnostic: every endpoint, identifier, and
 // default value comes from Config. It has no env-var reads, no
 // implicit URLs, and no embedded provider tables. Tests inject
-// behaviour via SetExchangeForTest / SetNowForTest (see testseams.go)
-// rather than via the public Config — keeping the STS call out of the
-// caller-controllable surface.
+// behaviour via SetExchangeForTest / SetNowForTest / SetRefreshForTest /
+// SetProcessLockForTest (see testseams.go) rather than via the public
+// Config — keeping the STS call out of the caller-controllable surface.
 package tokenmanager
 
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/entireio/auth-go/internal/oauthhttp"
+	"github.com/entireio/auth-go/internal/proclock"
+	"github.com/entireio/auth-go/refresh"
 	"github.com/entireio/auth-go/sts"
 	"github.com/entireio/auth-go/tokens"
 	"github.com/entireio/auth-go/tokenstore"
@@ -44,15 +49,28 @@ const DefaultRequestedTokenType = "urn:ietf:params:oauth:token-type:access_token
 // the worst case (re-exchange one extra time per command) is cheap.
 const exchangeSkew = 30 * time.Second
 
-// ErrNotLoggedIn is returned by Token / TokenForResource when no core
-// token is present in the store. Callers can match on it to render a
-// "run <login>" message.
+// ErrNotLoggedIn is returned by Token / TokenForResource when no core token
+// is present in the store, or when a stored token is expired and carries no
+// refresh token (the session cannot be silently renewed). Callers can match
+// on it to render a "run <login>" message.
 var ErrNotLoggedIn = errors.New("not logged in")
 
 // ErrNoSTSPath is returned when an exchange is needed but Config.STSPath
 // is empty. Single-host deployments hit the same-host shortcut and never
 // reach this; split-host deployments must configure STSPath.
 var ErrNoSTSPath = errors.New("token exchange required but Config.STSPath is empty")
+
+// ErrReauthRequired is returned by Token / Refresh when the stored refresh
+// token is genuinely revoked or expired (server returned invalid_grant and
+// a store re-read confirmed the refresh token was not concurrently
+// rotated). Distinct from ErrNotLoggedIn — there was a credential, the
+// session simply needs a fresh interactive login. Callers can match on it
+// to render "your session expired, log in again".
+var ErrReauthRequired = errors.New("reauthentication required")
+
+// ErrNoRefreshPath is returned when a refresh is needed but
+// Config.RefreshPath is empty. Mirrors ErrNoSTSPath.
+var ErrNoRefreshPath = errors.New("refresh required but Config.RefreshPath is empty")
 
 // Config configures a Manager.
 type Config struct {
@@ -72,6 +90,19 @@ type Config struct {
 	// empty. When empty and an exchange is attempted, runExchange
 	// returns ErrNoSTSPath rather than POSTing to a bogus URL.
 	STSPath string
+
+	// RefreshPath is the token-endpoint path where grant_type=refresh_token
+	// is POSTed to re-mint the login JWT. Optional: when empty and a
+	// refresh is needed, runRefresh returns ErrNoRefreshPath. Often equal
+	// to STSPath or the device-flow token path, since servers typically
+	// multiplex grants at one /oauth/token.
+	RefreshPath string
+
+	// LockDir is the directory holding the cross-process advisory lock
+	// file. Empty → os.UserCacheDir()/auth-go (falling back to the system
+	// temp dir if the user cache dir is unavailable). The lock file holds
+	// no credentials.
+	LockDir string
 
 	// Store persists the core token. Required. Use any tokenstore.Store
 	// implementation; a per-CLI service name keeps credentials isolated
@@ -140,6 +171,17 @@ func (c Config) validate() error {
 type exchangeFunc func(ctx context.Context, req sts.ExchangeRequest) (*tokens.TokenSet, error)
 type nowFuncType func() time.Time
 
+// ProcessLock serialises credential mutations (refresh, save, delete)
+// across processes. Acquire blocks until the lock is held or ctx is done,
+// returning an idempotent release func. On error the returned release func
+// is nil and must not be called. The default implementation is a file lock
+// (internal/proclock); SetProcessLockForTest swaps a fake.
+type ProcessLock interface {
+	Acquire(ctx context.Context) (release func(), err error)
+}
+
+type refreshFunc func(ctx context.Context, req refresh.Request) (*tokens.TokenSet, error)
+
 // Manager orchestrates core-token storage and STS exchanges. Safe for
 // concurrent use.
 type Manager struct {
@@ -155,6 +197,19 @@ type Manager struct {
 	// against test setup/teardown.
 	exchangeOverride atomic.Pointer[exchangeFunc]
 	nowOverride      atomic.Pointer[nowFuncType]
+
+	// refreshMu is the in-process single-flight gate for re-mints. Held
+	// across the cross-process lock + grant so concurrent goroutines
+	// coalesce onto one re-mint (the second waiter re-reads a fresh token).
+	refreshMu sync.Mutex
+
+	// Refresh + process-lock test seams; see SetRefreshForTest /
+	// SetProcessLockForTest. Same atomic.Pointer rationale as above.
+	refreshOverride atomic.Pointer[refreshFunc]
+	lockOverride    atomic.Pointer[ProcessLock]
+
+	lockOnce    sync.Once
+	defaultLock ProcessLock
 }
 
 // now returns the manager's effective clock. Tests can replace it via
@@ -219,7 +274,39 @@ func (m *Manager) Issuer() string { return m.cfg.Issuer }
 // exchanged tokens. The cacheKey already binds entries to the core
 // token's SHA-256 hash, so this is defence-in-depth — see
 // TestSaveCoreToken_ClearsExchangeCache.
+//
+// SaveCoreToken is serialised against in-flight refreshes by acquiring
+// refreshMu and the cross-process lock before mutating the store. Without
+// this, a refresh whose grant is mid-flight could land its persist after
+// a concurrent SaveCoreToken (re-login) and overwrite the new identity
+// with the old account's refreshed credentials. Lock ordering matches
+// refreshLocked: refreshMu first, then processLock. Can block up to
+// ~30s under contention and may return a wrapped lock error. The
+// empty-AccessToken check fires before lock acquisition so an obviously
+// bad call doesn't touch the filesystem.
 func (m *Manager) SaveCoreToken(t tokens.TokenSet) error {
+	if t.AccessToken == "" {
+		return errors.New("save core token: AccessToken is empty")
+	}
+	m.refreshMu.Lock()
+	defer m.refreshMu.Unlock()
+	release, err := m.processLock().Acquire(context.Background())
+	if err != nil {
+		return fmt.Errorf("save core token: acquire lock: %w", err)
+	}
+	defer release()
+	return m.saveCoreTokenLocked(t)
+}
+
+// saveCoreTokenLocked is the lock-free persist path. Caller MUST hold
+// refreshMu and the process lock. Used by SaveCoreToken (which acquires
+// them) and by persistRefreshed (which runs inside refreshLocked where
+// both are already held — a recursive lock attempt here would
+// self-deadlock).
+//
+// The empty-AccessToken check is duplicated here as defence in depth
+// because the locked variant is also reachable from persistRefreshed.
+func (m *Manager) saveCoreTokenLocked(t tokens.TokenSet) error {
 	if t.AccessToken == "" {
 		return errors.New("save core token: AccessToken is empty")
 	}
@@ -246,15 +333,53 @@ func (m *Manager) LookupCoreToken() (string, error) {
 	return t.AccessToken, nil
 }
 
-// DeleteCoreToken removes the stored core token and any cached
-// exchanges derived from it.
+// Refresh ensures a fresh login JWT, re-minting it from the stored refresh
+// token when the current one is expired or near expiry, and returns it.
+// It is idempotent when the token is already fresh (a cheap store read, no
+// grant). Returns ErrNotLoggedIn when no credential is stored (or an
+// expired one carries no refresh token), and ErrReauthRequired when the
+// refresh token is revoked/expired.
 //
-// Order matters: the keyring delete runs first, then the in-memory
-// cache is cleared. If the keyring delete fails the cache is left
-// alone — clearing it pre-emptively would create a window where the
-// CLI thinks it's logged out (no cache entries) but the keyring
+// Callers can use this to warm the session at startup and surface a
+// re-login prompt before the first data call rather than mid-request.
+//
+// Expiry is judged from the login JWT's exp claim. Opaque (non-JWT)
+// stored tokens have no client-visible expiry, so they are treated as
+// live and never trigger a re-mint — the refresh tier assumes a JWT login
+// token (as in the three-tier session model).
+func (m *Manager) Refresh(ctx context.Context) (string, error) {
+	return m.ensureFreshLogin(ctx)
+}
+
+// DeleteCoreToken removes the stored core token and any cached exchanges
+// derived from it.
+//
+// Order matters within the locked region: the keyring delete runs first,
+// then the in-memory cache is cleared. If the keyring delete fails the
+// cache is left alone — clearing it pre-emptively would create a window
+// where the CLI thinks it's logged out (no cache entries) but the keyring
 // still hands out the core token to the next process.
+//
+// DeleteCoreToken is serialised against in-flight refreshes by acquiring
+// refreshMu and the cross-process lock before mutating the store. Without
+// this, a refresh whose grant is mid-flight could land its persist after
+// a concurrent logout and resurrect the deleted session. Lock ordering
+// matches refreshLocked: refreshMu first, then processLock. Can block up
+// to ~30s under contention and may return a wrapped lock error.
 func (m *Manager) DeleteCoreToken() error {
+	m.refreshMu.Lock()
+	defer m.refreshMu.Unlock()
+	release, err := m.processLock().Acquire(context.Background())
+	if err != nil {
+		return fmt.Errorf("delete core token: acquire lock: %w", err)
+	}
+	defer release()
+	return m.deleteCoreTokenLocked()
+}
+
+// deleteCoreTokenLocked is the lock-free delete path. Caller MUST hold
+// refreshMu and the process lock.
+func (m *Manager) deleteCoreTokenLocked() error {
 	if err := m.cfg.Store.DeleteTokens(m.cfg.Issuer); err != nil {
 		return fmt.Errorf("delete core token: %w", err)
 	}
@@ -296,11 +421,15 @@ func (m *Manager) TokenForResource(ctx context.Context, resourceBaseURL string) 
 // Resolution rules:
 //
 //  1. No core token in the store → ErrNotLoggedIn.
-//  2. m.Issuer() == req.Resource (and req.Audience is empty) → use
+//  2. Core (login JWT) expired or near expiry → transparently re-mint it
+//     from the stored refresh token (see Refresh). No refresh token →
+//     ErrNotLoggedIn; refresh token revoked/expired → ErrReauthRequired;
+//     Config.RefreshPath unset → ErrNoRefreshPath.
+//  3. m.Issuer() == req.Resource (and req.Audience is empty) → use
 //     the core token directly. Single-host deployments hit this path.
-//  3. Core token's `aud` claim already includes req.Resource → use
+//  4. Core token's `aud` claim already includes req.Resource → use
 //     the core token directly. Multi-audience tokens skip exchange.
-//  4. Otherwise → RFC 8693 token exchange.
+//  5. Otherwise → RFC 8693 token exchange.
 //
 // Successful exchanges are cached in-memory keyed by (core token,
 // resource, audience, requested-token-type, scope) until expiry.
@@ -313,20 +442,9 @@ func (m *Manager) Token(ctx context.Context, req TokenRequest) (string, error) {
 		return "", err
 	}
 
-	core, err := m.LookupCoreToken()
+	core, err := m.ensureFreshLogin(ctx)
 	if err != nil {
 		return "", err
-	}
-	if core == "" {
-		return "", ErrNotLoggedIn
-	}
-	// Preflight expiry: a long-stored core token would otherwise hit the
-	// resource (or STS) and surface as a confusing "invalid_grant" /
-	// "401". Parse-failure is intentionally not treated as expired —
-	// opaque (non-JWT) access tokens have no client-visible expiry, so
-	// we let them flow and trust the server to reject if necessary.
-	if coreTokenExpired(core, m.now()) {
-		return "", ErrNotLoggedIn
 	}
 
 	// m.cfg.Issuer was normalized at New() time, so no re-normalize here.
@@ -511,6 +629,243 @@ func (m *Manager) cacheStore(key cacheKey, t *tokens.TokenSet) {
 		expiresAt:   t.ExpiresAt,
 		cachedAt:    m.now(),
 	}
+}
+
+// fileLockPath adapts a derived lock path to ProcessLock via
+// internal/proclock. The path field lets tests assert the per-identity
+// derivation without importing proclock.
+type fileLockPath struct {
+	path string
+	lock *proclock.FileLock
+}
+
+func (f *fileLockPath) Acquire(ctx context.Context) (func(), error) {
+	return f.lock.Acquire(ctx) //nolint:wrapcheck // proclock already prefixes "proclock:"
+}
+
+// processLock returns the test override if set, else the lazily-built
+// default file lock. The lock path is keyed on (ClientID, Issuer) — the
+// identity that scopes the stored credential — so unrelated CLIs sharing
+// an issuer don't serialise against each other.
+func (m *Manager) processLock() ProcessLock {
+	if p := m.lockOverride.Load(); p != nil {
+		return *p
+	}
+	m.lockOnce.Do(func() {
+		dir := m.cfg.LockDir
+		if dir == "" {
+			if cache, err := os.UserCacheDir(); err == nil {
+				dir = filepath.Join(cache, "auth-go")
+			} else {
+				dir = filepath.Join(os.TempDir(), "auth-go")
+			}
+		}
+		sum := sha256.Sum256([]byte(m.cfg.ClientID + "\x00" + m.cfg.Issuer))
+		path := filepath.Join(dir, hex.EncodeToString(sum[:])+".lock")
+		m.defaultLock = &fileLockPath{path: path, lock: proclock.New(path)}
+	})
+	return m.defaultLock
+}
+
+// runRefresh dispatches to the test override (if set) else a freshly built
+// refresh.Client pointing at Issuer + RefreshPath. client_id is sent on
+// both surfaces (Basic auth via the typed field, form body via Extra),
+// matching runExchange — see sts.ExchangeRequest.ClientID for the why.
+func (m *Manager) runRefresh(ctx context.Context, refreshToken string) (*tokens.TokenSet, error) {
+	req := refresh.Request{
+		RefreshToken: refreshToken,
+		ClientID:     m.cfg.ClientID,
+		Extra:        url.Values{"client_id": {m.cfg.ClientID}},
+	}
+	if p := m.refreshOverride.Load(); p != nil {
+		return (*p)(ctx, req)
+	}
+	if strings.TrimSpace(m.cfg.RefreshPath) == "" {
+		return nil, ErrNoRefreshPath
+	}
+	client := &refresh.Client{
+		Transport:         m.cfg.Transport,
+		BaseURL:           m.cfg.Issuer,
+		Path:              m.cfg.RefreshPath,
+		UserAgent:         m.cfg.UserAgent,
+		AllowInsecureHTTP: m.cfg.AllowInsecureHTTP,
+	}
+	return client.Refresh(ctx, req) //nolint:wrapcheck // refresh.Refresh already prefixes "refresh token:"
+}
+
+// loadTokenSet reads the full stored TokenSet for the configured issuer.
+// ok=false (with nil error) means no credential is stored; a non-nil error
+// is a genuine store failure (never collapsed to "not logged in").
+func (m *Manager) loadTokenSet() (set tokens.TokenSet, ok bool, err error) {
+	t, err := m.cfg.Store.LoadTokens(m.cfg.Issuer)
+	if errors.Is(err, tokenstore.ErrNotFound) {
+		return tokens.TokenSet{}, false, nil
+	}
+	if err != nil {
+		return tokens.TokenSet{}, false, fmt.Errorf("load core token: %w", err)
+	}
+	return t, true, nil
+}
+
+// doRefresh runs the refresh_token grant for the currently stored refresh
+// token and persists the rotated result. Assumes the caller holds both the
+// in-process mutex and the cross-process lock and has already confirmed the
+// stored login JWT is expired with a refresh token present.
+//
+// On invalid_grant it re-reads the store: if the refresh token changed
+// (a non-cooperating actor rotated it under us) it retries once with the
+// new token; otherwise the family is genuinely dead → ErrReauthRequired.
+// Transport and other errors are returned as-is, never as reauth, and
+// never delete the stored credential.
+func (m *Manager) doRefresh(ctx context.Context) (string, error) {
+	set, ok, err := m.loadTokenSet()
+	if err != nil {
+		return "", err
+	}
+	if !ok || !set.HasRefresh() {
+		return "", ErrNotLoggedIn
+	}
+	sent := set.RefreshToken
+
+	res, err := m.runRefresh(ctx, sent)
+	if err == nil {
+		if perr := m.persistRefreshed(set, res); perr != nil {
+			return "", perr
+		}
+		return res.AccessToken, nil
+	}
+	if !errors.Is(err, refresh.ErrInvalidGrant) {
+		return "", err
+	}
+
+	// Rotation-race recovery: another actor may have rotated the refresh
+	// token between our read and our grant. Re-read; retry once if so.
+	cur, ok, rerr := m.loadTokenSet()
+	if rerr != nil {
+		return "", rerr
+	}
+	if !ok {
+		return "", ErrNotLoggedIn // credential deleted concurrently (e.g. logout)
+	}
+	if !cur.HasRefresh() {
+		return "", ErrNotLoggedIn // refresh token cleared concurrently
+	}
+	if cur.RefreshToken != sent {
+		// A non-cooperating actor rotated the RT under us; retry once.
+		res, err = m.runRefresh(ctx, cur.RefreshToken)
+		if err == nil {
+			if perr := m.persistRefreshed(cur, res); perr != nil {
+				return "", perr
+			}
+			return res.AccessToken, nil
+		}
+		if !errors.Is(err, refresh.ErrInvalidGrant) {
+			return "", err
+		}
+	}
+	return "", ErrReauthRequired
+}
+
+// persistRefreshed merges the grant response onto the prior set and saves
+// it. A non-rotating server (empty refresh_token / scope in the response)
+// must not wipe a still-valid refresh token, so empty fields fall back to
+// the prior values. The new login JWT and ExpiresAt always replace.
+// SaveCoreToken clears the in-process exchange cache as a side effect, so
+// the next Token() re-exchanges against the new login JWT.
+func (m *Manager) persistRefreshed(prev tokens.TokenSet, res *tokens.TokenSet) error {
+	merged := *res
+	if merged.RefreshToken == "" {
+		merged.RefreshToken = prev.RefreshToken
+	}
+	if merged.Scope == "" {
+		merged.Scope = prev.Scope
+	}
+	if merged.TokenType == "" {
+		merged.TokenType = prev.TokenType
+	}
+	// saveCoreTokenLocked (NOT SaveCoreToken) — persistRefreshed runs from
+	// inside refreshLocked, which already holds refreshMu + processLock.
+	// Re-entering them here would self-deadlock.
+	if err := m.saveCoreTokenLocked(merged); err != nil {
+		return fmt.Errorf("refresh: persist: %w", err)
+	}
+	return nil
+}
+
+// ensureFreshLogin returns a usable login JWT, transparently re-minting an
+// expired one from the stored refresh token. The fast path takes no locks:
+// a still-fresh token (the common case) returns immediately. ErrNotLoggedIn
+// when no credential is stored or an expired one has no refresh token;
+// ErrReauthRequired when the refresh token is revoked/expired.
+// The fast path intentionally mirrors freshOrProceed's checks to avoid
+// taking refreshMu on the common case of a still-fresh token; keep the two
+// in sync if you add an early-exit condition.
+func (m *Manager) ensureFreshLogin(ctx context.Context) (string, error) {
+	set, ok, err := m.loadTokenSet()
+	if err != nil {
+		return "", err
+	}
+	if !ok {
+		return "", ErrNotLoggedIn
+	}
+	// A usable token must be non-empty as well as unexpired. A BYO Store
+	// that returns a TokenSet with an empty AccessToken (without
+	// ErrNotFound) must not yield an empty bearer — coreTokenExpired("")
+	// reports not-expired (parse failure), so guard the empty case here.
+	if set.AccessToken != "" && !coreTokenExpired(set.AccessToken, m.now()) {
+		return set.AccessToken, nil
+	}
+	if !set.HasRefresh() {
+		return "", ErrNotLoggedIn
+	}
+	return m.refreshLocked(ctx)
+}
+
+// refreshLocked performs the serialize-and-double-check re-mint: the
+// in-process mutex coalesces goroutines, the cross-process lock coalesces
+// processes, and a store re-read after each gate lets a late waiter return
+// the token a peer just minted instead of re-minting.
+func (m *Manager) refreshLocked(ctx context.Context) (string, error) {
+	m.refreshMu.Lock()
+	defer m.refreshMu.Unlock()
+
+	if tok, done, err := m.freshOrProceed(); done {
+		return tok, err
+	}
+
+	release, err := m.processLock().Acquire(ctx)
+	if err != nil {
+		return "", fmt.Errorf("refresh: acquire lock: %w", err)
+	}
+	defer release()
+
+	if tok, done, err := m.freshOrProceed(); done {
+		return tok, err
+	}
+
+	return m.doRefresh(ctx)
+}
+
+// freshOrProceed re-reads the store and reports whether the caller has a
+// terminal result. done=true means return (tok, err) directly — the token
+// is fresh now, no credential exists, or an expired token has no refresh
+// token. done=false means "still expired with a refresh token — proceed to
+// the re-mint".
+func (m *Manager) freshOrProceed() (string, bool, error) {
+	set, ok, err := m.loadTokenSet()
+	if err != nil {
+		return "", true, err
+	}
+	if !ok {
+		return "", true, ErrNotLoggedIn
+	}
+	if set.AccessToken != "" && !coreTokenExpired(set.AccessToken, m.now()) {
+		return set.AccessToken, true, nil
+	}
+	if !set.HasRefresh() {
+		return "", true, ErrNotLoggedIn
+	}
+	return "", false, nil
 }
 
 // runExchange dispatches to either Config.Exchange (test override) or

@@ -196,6 +196,31 @@ func TestKeyring_LoadTokens_BadExpiresAtReturnsErrMalformed(t *testing.T) {
 	}
 }
 
+// TestKeyring_RoundTripsRefreshToken pins COR-314 sub-deliverable #1: the
+// reference Store must persist and return the refresh token (and the rest
+// of the TokenSet) verbatim. A regression that drops refresh_token at the
+// JSON boundary would silently disable the refresh tier.
+func TestKeyring_RoundTripsRefreshToken(t *testing.T) {
+	k := NewKeyring("auth-go-test")
+	want := tokens.TokenSet{
+		AccessToken:  "login-jwt",
+		RefreshToken: "entr_abc123",
+		TokenType:    "Bearer",
+		ExpiresAt:    time.Date(2026, 5, 27, 20, 0, 0, 0, time.UTC),
+		Scope:        "offline_access cli",
+	}
+	if err := k.SaveTokens("https://auth.example.com", want); err != nil {
+		t.Fatalf("SaveTokens: %v", err)
+	}
+	got, err := k.LoadTokens("https://auth.example.com")
+	if err != nil {
+		t.Fatalf("LoadTokens: %v", err)
+	}
+	if got != want {
+		t.Fatalf("round-trip = %+v, want %+v", got, want)
+	}
+}
+
 // TestKeyring_LoadTokens_EmptyAccessTokenReturnsErrMalformed pins the
 // guard against well-formed JSON that decodes to a zero TokenSet. An
 // unrelated CLI's blob keyed against the same service/profile, or a
