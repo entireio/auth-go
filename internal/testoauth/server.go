@@ -4,6 +4,7 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -37,11 +38,6 @@ type Config struct {
 	// LoginJWTTTL is the access_token (login JWT) lifetime in refresh
 	// and exchange responses. Defaults to 5 * time.Minute.
 	LoginJWTTTL time.Duration
-
-	// RefreshTokenTTL is the wire-level expires_in on refresh_token
-	// responses. The RT itself is opaque; this is informational only.
-	// Defaults to 14 * 24 * time.Hour (CLI tier from the design doc).
-	RefreshTokenTTL time.Duration
 
 	// IdempotencySuccessor is the window during which a replay of a
 	// recently-consumed RT returns the already-issued successor instead
@@ -155,16 +151,24 @@ func (s *Server) SeedFamily(sub string, aud []string) SeededLogin {
 }
 
 // ApproveDeviceCode flips a pending device_code session to approved.
-// Test-driver hook for the device-flow path.
+// Test-driver hook for the device-flow path. Panics if the device_code is
+// unknown — test misuse (typo, wrong order, already-expired code) would
+// otherwise cause a silent 600-second hang on the polling side.
 func (s *Server) ApproveDeviceCode(deviceCode string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if sess, ok := s.sessions[deviceCode]; ok {
-		sess.approved = true
+	sess, ok := s.sessions[deviceCode]
+	if !ok {
+		panic(fmt.Sprintf("testoauth: ApproveDeviceCode: unknown device_code %q (%d sessions registered)", deviceCode, len(s.sessions)))
 	}
+	sess.approved = true
 }
 
-// GrantCount returns the total number of /oauth/token responses (success + failure).
+// GrantCount returns the total number of /oauth/token requests dispatched
+// to a grant-type handler, including forced-failure injections that close
+// the connection without writing a response. Excludes requests rejected
+// before dispatch (wrong HTTP method, malformed form, unsupported
+// grant_type).
 func (s *Server) GrantCount() int {
 	return int(s.totalGrants.Load())
 }

@@ -11,7 +11,8 @@ import (
 
 // Claims are the inputs to MintUnsignedJWT. All time fields are optional
 // (zero = omit). Extra carries additional custom claims merged into the
-// payload — useful for fields tokens.ParseClaims also reads, e.g. "handle".
+// payload. Typed fields above (Subject, Issuer, etc.) take precedence if a
+// key collides — Extra is for fields not modeled here (e.g. "handle").
 type Claims struct {
 	Issuer    string
 	Subject   string
@@ -35,6 +36,10 @@ func MintUnsignedJWT(c Claims) string {
 	headerSeg := encodeSegment(header)
 
 	payload := map[string]any{}
+	// Extra is written first so typed fields below can override on collision.
+	for k, v := range c.Extra {
+		payload[k] = v
+	}
 	if c.Issuer != "" {
 		payload["iss"] = c.Issuer
 	}
@@ -55,9 +60,6 @@ func MintUnsignedJWT(c Claims) string {
 	}
 	if !c.ExpiresAt.IsZero() {
 		payload["exp"] = c.ExpiresAt.Unix()
-	}
-	for k, v := range c.Extra {
-		payload[k] = v
 	}
 	payloadSeg := encodeSegment(payload)
 

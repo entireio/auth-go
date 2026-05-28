@@ -353,6 +353,17 @@ func TestServer_DeviceFlowApprovedYieldsTokens(t *testing.T) {
 	if srv.DeviceGrantCount() != 1 {
 		t.Errorf("DeviceGrantCount = %d, want 1", srv.DeviceGrantCount())
 	}
+
+	claims, err := tokens.ParseClaims(tok.AccessToken)
+	if err != nil {
+		t.Fatalf("ParseClaims(device-flow access token): %v", err)
+	}
+	if claims.Issuer != srv.URL() {
+		t.Errorf("Issuer = %q, want %q", claims.Issuer, srv.URL())
+	}
+	if claims.Subject == "" {
+		t.Error("Subject is empty")
+	}
 }
 
 func TestServer_DeviceFlowPendingReturns400AuthorizationPending(t *testing.T) {

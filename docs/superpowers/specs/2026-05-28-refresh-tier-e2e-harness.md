@@ -66,18 +66,10 @@ type Server struct { /* unexported state */ }
 
 // Config configures a Server. All fields are optional.
 type Config struct {
-    // Issuer is the iss claim minted into JWTs. Defaults to the server URL.
-    Issuer string
-
     // LoginJWTTTL is the access_token (login JWT) lifetime.
     // Defaults to 5 minutes (short enough that tests can advance clocks
     // realistically without burning wall time).
     LoginJWTTTL time.Duration
-
-    // RefreshTokenTTL is the wire-level expires_in on refresh responses
-    // (the refresh token itself is opaque so this is informational; the
-    // family's lifetime is governed by rotation/replay).
-    RefreshTokenTTL time.Duration
 
     // IdempotencySuccessor, when non-zero, returns the already-issued
     // successor RT for a consumed RT replayed within this window — the
@@ -103,10 +95,12 @@ type SeededLogin struct {
     LoginJWT     string
     RefreshToken string
     FamilyID     string
+    Subject      string
+    Audience     []string
 }
 
 // Inspection helpers — tests assert on these rather than the wire.
-func (s *Server) GrantCount() int               // total successful /oauth/token responses
+func (s *Server) GrantCount() int               // total /oauth/token handler invocations (including forced-failure hijacks; excludes pre-dispatch rejections)
 func (s *Server) RefreshGrantCount() int        // refresh_token grants only
 func (s *Server) ExchangeGrantCount() int       // token-exchange grants only
 func (s *Server) FamilyRevoked(fid string) bool // true if reuse-detection fired
@@ -136,14 +130,12 @@ interval and a test-driver method to "approve" it.
 ### Family bookkeeping (`family.go`)
 
 ```go
-type family struct {
-    id       string
-    sub      string
-    aud      []string
-    revoked  bool
-
-    mu       sync.Mutex
-    chain    []rotationEntry // active + consumed RTs, newest last
+type Family struct {
+    id      string
+    sub     string
+    aud     []string
+    revoked bool
+    chain   []rotationEntry // active + consumed RTs, newest last
 }
 
 type rotationEntry struct {
@@ -153,9 +145,9 @@ type rotationEntry struct {
 }
 ```
 
-Concurrency: `family.mu` guards the chain; the server itself holds a
-top-level `sync.Mutex` for the `families`/`rts → family` indices to keep
-the implementation small.
+Concurrency: a single `Registry.mu` guards both the `families`/`rts → family`
+index maps and all chain mutations on individual `Family` values. `Family`
+has no per-instance mutex — all access is serialised through `Registry.mu`.
 
 ### JWT helper (`jwt.go`)
 
@@ -189,35 +181,40 @@ Each test constructs a `Manager` whose `Issuer` is the server URL,
 
 Test list:
 
-1. **`TestE2E_RefreshOnExpiredJWT`** — seed family, store seeded TokenSet
-   under Issuer, fast-forward `m.now()` past `LoginJWTTTL`, call
+1. **`TestE2E_RefreshOnExpiredJWTThenExchange`** — seed family, store seeded
+   TokenSet under Issuer, fast-forward `m.now()` past `LoginJWTTTL`, call
    `m.TokenForResource(...)` against a resource that requires exchange,
    assert: refresh fires once (server `RefreshGrantCount == 1`), exchange
    fires (server `ExchangeGrantCount == 1`), persisted TokenSet has the
    rotated RT.
 
-2. **`TestE2E_SilentRefreshIsTransparent`** — same setup, then advance clock
+2. **`TestE2E_SilentRefreshAcrossTwoCycles`** — same setup, then advance clock
    again past the next expiry, assert second refresh fires and the cache
    correctly invalidates between refreshes.
 
-3. **`TestE2E_RotationReuseDetection`** — seed family, do one refresh (RT
-   rotates to RT2), then directly POST the original RT1 to the server
-   (bypassing `tokenmanager`) → server returns `invalid_grant` AND marks
-   family revoked. Now call `m.Refresh()` (which tries with RT2): server
-   returns `invalid_grant` (family is dead), `m.Refresh` returns
+3. **`TestE2E_RotationReuseDetectionRevokesFamily`** — seed family, do one
+   refresh (RT rotates to RT2), then directly POST the original RT1 to the
+   server (bypassing `tokenmanager`) → server returns `invalid_grant` AND
+   marks family revoked. Now call `m.Refresh()` (which tries with RT2):
+   server returns `invalid_grant` (family is dead), `m.Refresh` returns
    `ErrReauthRequired`, credential NOT deleted from store.
 
-4. **`TestE2E_IdempotencySuccessor`** — configure `IdempotencySuccessor: 1s`,
-   directly POST RT1 twice in quick succession; second call gets the same
-   successor idempotently rather than revoking the family. Pins that
-   `tokenmanager`'s in-process single-flight + this server-side window
-   together absorb a rotation race without breakage. (Not a Manager test —
-   exercises the server's contract directly.)
+4. **`TestE2E_IdempotencySuccessorAbsorbsReplay`** — configure
+   `IdempotencySuccessor: 1s`, directly POST RT1 twice in quick succession;
+   second call gets the same successor idempotently rather than revoking the
+   family. Pins that `tokenmanager`'s in-process single-flight + this
+   server-side window together absorb a rotation race without breakage. (Not
+   a Manager test — exercises the server's contract directly.)
 
 5. **`TestE2E_GoroutineCoalescingAgainstRealServer`** — 8 goroutines call
    `m.TokenForResource(...)` simultaneously against an expired JWT; assert
    `RefreshGrantCount == 1` and `ExchangeGrantCount` matches the resource
    count (typically 1 with cache).
+
+6. **`TestE2E_NetworkFailureNotMisclassifiedAsReauth`** — configure
+   `ForceNextRefresh(FailNetworkError)`, call `m.Refresh(ctx)`, assert the
+   error is a transport error (not `ErrReauthRequired`). Validates the
+   transport-error-on-retry path against a real socket.
 
 ---
 
@@ -236,10 +233,13 @@ func TestMain(m *testing.M) {
     os.Exit(m.Run())
 }
 
-func spawnHelper(t *testing.T, mode string, env ...string) *exec.Cmd {
-    cmd := exec.Command(os.Args[0], "-test.run", "TestE2E_DummyEntryPoint", "-test.v=false")
+func spawnHelper(t *testing.T, mode string, env map[string]string, out *bytes.Buffer) *exec.Cmd {
+    cmd := exec.Command(os.Args[0], "-test.run", "TestE2ESub_Helper", "-test.v=false")
     cmd.Env = append(os.Environ(), "AUTHGO_E2E_HELPER="+mode)
-    cmd.Env = append(cmd.Env, env...)
+    for k, v := range env {
+        cmd.Env = append(cmd.Env, k+"="+v)
+    }
+    cmd.Stdout = out
     return cmd
 }
 ```
@@ -250,9 +250,10 @@ Helper modes (each is a small `runHelper_*` function):
   resulting AccessToken to stdout, exit 0 / nonzero on error.
 - `logout` — call `m.DeleteCoreToken()`, exit.
 - `relogin` — `m.SaveCoreToken(newSet)`, exit.
-- `refresh-blocking` — call refresh against a server endpoint that
-  intentionally stalls (via a test-driver-controlled gate), to let the
-  parent observe a real in-flight grant.
+
+In-flight concurrency control is achieved via `srv.StallNextRefresh()` in
+the parent combined with the ordinary `refresh-once` helper mode — there is
+no separate `refresh-blocking` mode.
 
 Test list:
 
@@ -263,16 +264,16 @@ Test list:
    (one minted it, the other read it back from the store after the lock
    serialised them).
 
-2. **`TestE2ESub_CrossProcessLogoutWinsOverInFlightRefresh`** — subprocess A
-   runs `refresh-blocking` against a stalled server, parent waits for the
-   stall, subprocess B runs `logout`, parent releases the stall. Assert B
-   blocks until A completes (measurable by timing — B's exit time is after
-   the stall release), and the final store is empty (logout wins as the
-   later-acquiring writer). This is the *cross-process* version of fix A's
-   in-process test.
+2. **`TestE2ESub_LogoutWinsOverInFlightRefresh`** — subprocess A runs
+   `refresh-once` against a server stalled via `srv.StallNextRefresh()`,
+   parent waits for the stall, subprocess B runs `logout`, parent releases
+   the stall. Assert B blocks until A completes (measurable by timing — B's
+   exit time is after the stall release), and the final store is empty
+   (logout wins as the later-acquiring writer). This is the *cross-process*
+   version of fix A's in-process test.
 
-3. **`TestE2ESub_CrossProcessReloginWinsOverInFlightRefresh`** — same shape
-   with `relogin` instead of `logout`. Final store has the new user.
+3. **`TestE2ESub_ReloginWinsOverInFlightRefresh`** — same shape with `relogin`
+   instead of `logout`. Final store has the new user.
 
 4. **`TestE2ESub_ProclockMutualExclusion`** — pure proclock test, no
    OAuth server. Two subprocesses repeatedly `Acquire` the same path with
@@ -291,9 +292,9 @@ Test list:
   inside `httptest.Server`.
 - Subprocesses share a `LockDir` (parent-provided `t.TempDir()`); the
   parent ensures cleanup via `t.Cleanup`.
-- Helper subprocesses get their `Context` deadline from a parent-passed
-  env var so the parent can bound their lifetime; helpers respect ctx
-  cancellation and exit on parent's `cmd.Cancel()` if needed.
+- Helper subprocesses use a hardcoded 10-second timeout on the refresh
+  context. The parent bounds subprocess lifetime implicitly via `cmd.Wait`
+  and `t.Cleanup(release)` on `StallNextRefresh`.
 
 ---
 
