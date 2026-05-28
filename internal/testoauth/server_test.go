@@ -539,7 +539,7 @@ func TestServer_StallNextRefreshBlocksUntilRelease(t *testing.T) {
 	srv := testoauth.NewServer(t, testoauth.Config{})
 	seed := srv.SeedFamily("u", nil)
 
-	release := srv.StallNextRefresh()
+	release, _ := srv.StallNextRefresh()
 
 	type result struct {
 		status int
