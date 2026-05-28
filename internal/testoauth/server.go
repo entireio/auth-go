@@ -91,6 +91,11 @@ type Server struct {
 	// forceNext overrides the next refresh handler call. Guards by mu.
 	forceNext FailureMode
 
+	// stallActive and stallRelease implement the one-shot stall used by
+	// StallNextRefresh. Both are guarded by mu.
+	stallActive  bool
+	stallRelease chan struct{}
+
 	// per-category atomic counters.
 	totalGrants    atomic.Int64
 	refreshGrants  atomic.Int64
@@ -206,6 +211,38 @@ func (s *Server) ForceNextRefresh(mode FailureMode) (release func()) {
 	}
 }
 
+// StallNextRefresh causes the next /oauth/token refresh_token request to
+// block in the handler until release is called, then proceed normally
+// (rotation + JWT mint). Parent tests use this to keep a refresh
+// in-flight across processes while exercising concurrent mutations.
+// One-shot: only the next refresh stalls; subsequent refreshes go
+// through immediately. Returns release; calling release while a request
+// is stalled unblocks it. Calling release before any request stalls
+// clears the override so no future request stalls.
+//
+// While stalled, the request still holds refreshMu + processLock on the
+// CLIENT side (the Manager that initiated it) — that's the whole point.
+// Server-side, the family is NOT consumed until release; if the parent
+// abandons the stalled request without releasing, the test will hang.
+func (s *Server) StallNextRefresh() (release func()) {
+	ch := make(chan struct{})
+	s.mu.Lock()
+	s.stallActive = true
+	s.stallRelease = ch
+	s.mu.Unlock()
+
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			s.mu.Lock()
+			s.stallActive = false
+			s.stallRelease = nil
+			s.mu.Unlock()
+			close(ch)
+		})
+	}
+}
+
 // mintLoginJWT mints a login JWT for the given family using the server clock.
 func (s *Server) mintLoginJWT(f *Family, now time.Time) string {
 	ttl := s.cfg.loginJWTTTL()
@@ -260,6 +297,20 @@ func (s *Server) handleToken(w http.ResponseWriter, r *http.Request) {
 // handleRefresh implements the refresh_token grant.
 func (s *Server) handleRefresh(w http.ResponseWriter, r *http.Request) {
 	s.totalGrants.Add(1)
+
+	// Check for one-shot stall override (before forced-failure check).
+	// Pop the stall atomically so only the very next request blocks.
+	s.mu.Lock()
+	var stallCh chan struct{}
+	if s.stallActive {
+		stallCh = s.stallRelease
+		s.stallActive = false
+		s.stallRelease = nil
+	}
+	s.mu.Unlock()
+	if stallCh != nil {
+		<-stallCh
+	}
 
 	// Check for forced failure override (one-shot).
 	s.mu.Lock()

@@ -522,3 +522,54 @@ func TestServer_ForceNextRefreshInvalidGrant(t *testing.T) {
 		t.Errorf("RefreshGrantCount = %d, want 1 (only second call succeeded)", srv.RefreshGrantCount())
 	}
 }
+
+func TestServer_StallNextRefreshBlocksUntilRelease(t *testing.T) {
+	t.Parallel()
+	srv := testoauth.NewServer(t, testoauth.Config{})
+	seed := srv.SeedFamily("u", nil)
+
+	release := srv.StallNextRefresh()
+
+	type result struct {
+		status int
+		err    error
+		took   time.Duration
+	}
+	done := make(chan result, 1)
+	go func() {
+		start := time.Now()
+		c := &http.Client{Timeout: 5 * time.Second}
+		form := url.Values{"grant_type": {"refresh_token"}, "refresh_token": {seed.RefreshToken}, "client_id": {"cli"}}
+		resp, err := c.Post(srv.URL()+"/oauth/token", "application/x-www-form-urlencoded", strings.NewReader(form.Encode()))
+		var st int
+		if resp != nil {
+			st = resp.StatusCode
+			_ = resp.Body.Close()
+		}
+		done <- result{st, err, time.Since(start)}
+	}()
+
+	// Confirm the request is genuinely stalled (no response yet).
+	select {
+	case r := <-done:
+		t.Fatalf("request completed before release: status=%d err=%v took=%v", r.status, r.err, r.took)
+	case <-time.After(75 * time.Millisecond):
+		// Expected: still stalled.
+	}
+
+	release()
+	select {
+	case r := <-done:
+		if r.err != nil {
+			t.Fatalf("post-release error: %v", r.err)
+		}
+		if r.status != 200 {
+			t.Fatalf("status = %d, want 200", r.status)
+		}
+		if r.took < 75*time.Millisecond {
+			t.Errorf("took = %v, expected >75ms (the stall window)", r.took)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("request did not unblock after release")
+	}
+}
