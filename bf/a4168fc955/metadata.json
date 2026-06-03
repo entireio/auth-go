@@ -1,0 +1,34 @@
+{
+  "cli_version": "dev",
+  "checkpoint_id": "bfa4168fc955",
+  "strategy": "manual-commit",
+  "branch": "review-decode",
+  "checkpoints_count": 4,
+  "files_touched": [
+    "CHANGELOG.md",
+    "deviceflow/deviceflow.go",
+    "internal/oauthhttp/form.go",
+    "internal/oauthhttp/form_test.go",
+    "internal/oauthhttp/jsonresp.go",
+    "internal/oauthhttp/jsonresp_bench_test.go",
+    "internal/oauthhttp/jsonresp_test.go",
+    "refresh/refresh.go",
+    "sts/sts.go",
+    "sts/sts_bench_test.go"
+  ],
+  "sessions": [
+    {
+      "metadata": "/bf/a4168fc955/0/metadata.json",
+      "transcript": "/bf/a4168fc955/0/full.jsonl",
+      "content_hash": "/bf/a4168fc955/0/content_hash.txt",
+      "prompt": "/bf/a4168fc955/0/prompt.txt"
+    }
+  ],
+  "token_usage": {
+    "input_tokens": 145,
+    "cache_creation_tokens": 327279,
+    "cache_read_tokens": 12027169,
+    "output_tokens": 72718,
+    "api_call_count": 111
+  }
+}

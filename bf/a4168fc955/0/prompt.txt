@@ -1,0 +1,13 @@
+Review internal/oauthhttp/jsonresp.go. Focus on performance and security. Can errors leak tokens or sensitive information? Is there any additional performance improvement available to make the token process as efficient as possible? Let's make some bench tests to ensure that is the case.
+
+---
+
+Let's go for a one-liner
+
+---
+
+Is HTTP/2 enabled across the token/sts? Any additional optimisation that can take place on the hot path?
+
+---
+
+Lets go for 1-3, with benchmarks to confirm the improvement. Any concerns around internal/oauthhttp/httpclient.go?
