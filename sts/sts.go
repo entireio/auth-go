@@ -205,9 +205,12 @@ func (c *Client) now() time.Time {
 // Exchange performs one RFC 8693 token exchange.
 //
 // Returns a TokenSet with absolute ExpiresAt derived from the server's
-// expires_in. Returns an error wrapping the response body when the
-// server responds with a non-2xx status; callers can match on the
-// returned error message for known OAuth error codes.
+// expires_in. When the server responds with a non-2xx status carrying a
+// structured RFC 6749 OAuth error, the returned error is an
+// *ExchangeError — use errors.As to inspect its Code, Description, and
+// StatusCode rather than substring-matching the message. Non-OAuth
+// failures (network errors, non-JSON/empty bodies) surface as plain
+// wrapped errors.
 func (c *Client) Exchange(ctx context.Context, req ExchangeRequest) (*tokens.TokenSet, error) {
 	if err := req.validate(); err != nil {
 		return nil, fmt.Errorf("token exchange: %w", err)
@@ -388,17 +391,42 @@ func resolveURL(baseURL, path string, allowInsecureHTTP bool) (string, error) {
 	return oauthhttp.ResolveURL(baseURL, path, allowInsecureHTTP) //nolint:wrapcheck // pass through with sentinel-preserving semantics
 }
 
+// ExchangeError is returned by Exchange when the token endpoint replies
+// with a structured RFC 6749 OAuth error (a JSON body carrying an `error`
+// code). It exposes the parsed code, description, and HTTP status so
+// callers can branch on the failure mode — e.g. errors.As + Code ==
+// "invalid_target" — instead of substring-matching the rendered message.
+//
+// Code and Description are sanitised (RFC 6749 §4.1.2.1 constrains the
+// code to a small ASCII alphabet, but the AS is its only enforcer, so we
+// neutralise a hostile/buggy server painting the terminal via either
+// field). Error() renders the same string this package returned before
+// the type existed, so message-matching callers are unaffected.
+//
+// Non-OAuth failures (a network error, or a non-JSON/empty error body)
+// are NOT this type — they surface as plain wrapped errors, since there
+// is no code to expose.
+type ExchangeError struct {
+	StatusCode  int
+	Code        string
+	Description string
+}
+
+func (e *ExchangeError) Error() string {
+	if e.Description != "" {
+		return fmt.Sprintf("token exchange: status %d: %s: %s", e.StatusCode, e.Code, e.Description)
+	}
+	return fmt.Sprintf("token exchange: status %d: %s", e.StatusCode, e.Code)
+}
+
 func readAPIError(resp *http.Response) error {
 	apiErr, parseErr := oauthhttp.ReadOAuthError(resp)
 	if parseErr != nil {
 		return fmt.Errorf("token exchange: %w", parseErr)
 	}
-	// RFC 6749 §4.1.2.1 constrains the error code to a small ASCII
-	// alphabet, but the AS is its only enforcer — sanitise to neutralise
-	// a hostile/buggy server painting the terminal via the code field.
-	code := oauthhttp.SanitizeDescription(apiErr.Error)
-	if desc := oauthhttp.SanitizeDescription(apiErr.ErrorDescription); desc != "" {
-		return fmt.Errorf("token exchange: status %d: %s: %s", resp.StatusCode, code, desc)
+	return &ExchangeError{
+		StatusCode:  resp.StatusCode,
+		Code:        oauthhttp.SanitizeDescription(apiErr.Error),
+		Description: oauthhttp.SanitizeDescription(apiErr.ErrorDescription),
 	}
-	return fmt.Errorf("token exchange: status %d: %s", resp.StatusCode, code)
 }

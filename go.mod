@@ -1,6 +1,6 @@
 module github.com/entireio/auth-go
 
-go 1.26.3
+go 1.26.4
 
 require (
 	github.com/zalando/go-keyring v0.2.8

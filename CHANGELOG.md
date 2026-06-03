@@ -1,5 +1,25 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+
+- Bumped the Go toolchain (and the `go.mod` minimum) to 1.26.4, picking
+  up the standard-library security fixes GO-2026-5037 (`crypto/x509`
+  hostname parsing) and GO-2026-5039 (`net/textproto`). Consumers now
+  require Go ≥ 1.26.4.
+
+### Added
+
+- `sts.ExchangeError` — a typed error returned by `Client.Exchange` when
+  the token endpoint replies with a structured RFC 6749 OAuth error.
+  Exposes the parsed `Code`, `Description`, and `StatusCode` so callers
+  can branch on the failure mode (e.g. `errors.As` + `Code ==
+  "invalid_target"`) instead of substring-matching the message. `Error()`
+  renders the same string as before, so message-matching callers are
+  unaffected; non-OAuth failures (network errors, non-JSON bodies) remain
+  plain wrapped errors.
+
 ## v0.4.0 — 2026-05-28
 
 ### Added

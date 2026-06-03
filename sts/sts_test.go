@@ -546,6 +546,82 @@ func TestExchange_SanitisesErrorCode(t *testing.T) {
 	if !strings.Contains(err.Error(), "invalid_grant") {
 		t.Fatalf("error = %q, expected sanitised code remnant to remain", err.Error())
 	}
+	// Sanitisation happens in the struct, not at render time, so the
+	// typed Code field a caller branches on must be clean too — not just
+	// the rendered message.
+	var xe *ExchangeError
+	if !errors.As(err, &xe) {
+		t.Fatalf("error %v (%T) is not an *ExchangeError", err, err)
+	}
+	if strings.ContainsRune(xe.Code, '\u009b') || strings.ContainsRune(xe.Code, '\x1b') {
+		t.Fatalf("Code = %q carried control bytes through", xe.Code)
+	}
+}
+
+// TestExchange_ReturnsTypedExchangeError pins that a structured OAuth
+// error response surfaces as *ExchangeError with the parsed code, status,
+// and description — letting callers branch on the failure mode without
+// substring-matching — while Error() still renders the legacy string.
+func TestExchange_ReturnsTypedExchangeError(t *testing.T) {
+	t.Parallel()
+
+	c := newTestClient(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+		writeBody(t, w, `{"error":"invalid_target","error_description":"no mirror at this URL"}`)
+	})
+
+	_, err := c.Exchange(context.Background(), ExchangeRequest{
+		SubjectToken:       "sub",
+		SubjectTokenType:   SubjectTokenTypeJWT,
+		RequestedTokenType: "urn:example:t",
+	})
+	var xe *ExchangeError
+	if !errors.As(err, &xe) {
+		t.Fatalf("error %v (%T) is not an *ExchangeError", err, err)
+	}
+	if xe.Code != "invalid_target" {
+		t.Errorf("Code = %q, want invalid_target", xe.Code)
+	}
+	if xe.StatusCode != http.StatusBadRequest {
+		t.Errorf("StatusCode = %d, want %d", xe.StatusCode, http.StatusBadRequest)
+	}
+	if xe.Description != "no mirror at this URL" {
+		t.Errorf("Description = %q, want %q", xe.Description, "no mirror at this URL")
+	}
+	// Rendered message must match the pre-typed-error format byte-for-byte.
+	if want := "token exchange: status 400: invalid_target: no mirror at this URL"; err.Error() != want {
+		t.Errorf("Error() = %q, want %q", err.Error(), want)
+	}
+}
+
+// TestExchange_ExchangeErrorWithoutDescription exercises the
+// no-description branch of ExchangeError.Error(): error_description is
+// OPTIONAL per RFC 6749 §5.2, so an AS may send `error` alone. The typed
+// Description must be empty and the rendered message must drop the
+// trailing ": <desc>" rather than render a dangling separator.
+func TestExchange_ExchangeErrorWithoutDescription(t *testing.T) {
+	t.Parallel()
+
+	c := newTestClient(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+		writeBody(t, w, `{"error":"invalid_target"}`)
+	})
+
+	_, err := c.Exchange(context.Background(), ExchangeRequest{
+		SubjectToken:       "sub",
+		SubjectTokenType:   SubjectTokenTypeJWT,
+		RequestedTokenType: "urn:example:t",
+	})
+	var xe *ExchangeError
+	if !errors.As(err, &xe) {
+		t.Fatalf("error %v (%T) is not an *ExchangeError", err, err)
+	}
+	if xe.Description != "" {
+		t.Errorf("Description = %q, want empty", xe.Description)
+	}
+	if want := "token exchange: status 400: invalid_target"; err.Error() != want {
+		t.Errorf("Error() = %q, want %q", err.Error(), want)
+	}
 }
 
 func TestExchange_ServerErrorWithoutJSON(t *testing.T) {

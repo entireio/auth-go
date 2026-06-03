@@ -1,6 +1,6 @@
 [tools]
 # Keep this aligned with go.mod.
-go = '1.26.3'
+go = '1.26.4'
 golangci-lint = '2.12.2'
 "go:golang.org/x/vuln/cmd/govulncheck" = 'latest'
 
