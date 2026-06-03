@@ -1,0 +1,5 @@
+Transport is now snapshotted on first use and later mutations are silently ignored in sts/sts.go:337, refresh/refresh.go:97, and deviceflow/deviceflow.go:147. That is security-
+    relevant because Transport is the public hook for proxies, mTLS/pinning, and observability, while these calls send bearer-bearing form bodies. Before this commit, each request read the
+    current c.Transport; now a first call with nil or an old transport permanently routes subsequent calls through that stale client.
+
+Let's keep per-call construction.

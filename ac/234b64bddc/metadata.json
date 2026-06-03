@@ -1,0 +1,28 @@
+{
+  "cli_version": "dev",
+  "checkpoint_id": "ac234b64bddc",
+  "strategy": "manual-commit",
+  "branch": "review-decode",
+  "checkpoints_count": 1,
+  "files_touched": [
+    "CHANGELOG.md",
+    "deviceflow/deviceflow.go",
+    "refresh/refresh.go",
+    "sts/sts.go"
+  ],
+  "sessions": [
+    {
+      "metadata": "/ac/234b64bddc/0/metadata.json",
+      "transcript": "/ac/234b64bddc/0/full.jsonl",
+      "content_hash": "/ac/234b64bddc/0/content_hash.txt",
+      "prompt": "/ac/234b64bddc/0/prompt.txt"
+    }
+  ],
+  "token_usage": {
+    "input_tokens": 28,
+    "cache_creation_tokens": 12718,
+    "cache_read_tokens": 3196263,
+    "output_tokens": 8756,
+    "api_call_count": 18
+  }
+}
