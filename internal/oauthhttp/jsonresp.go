@@ -51,21 +51,53 @@ func ReadAndDecodeJSON(r io.Reader, dest any, strict bool) error {
 		return ErrNonJSONResponse
 	}
 
-	dec := json.NewDecoder(bytes.NewReader(body))
+	// Strict path: DisallowUnknownFields is decoder-only, so we keep
+	// *json.Decoder here. Reject trailing data with a single-pass scan
+	// of the unconsumed bytes (see hasTrailingNonWhitespace) rather
+	// than a second Decode — avoids an `any` allocation and parser
+	// error text derived from attacker-controlled bytes.
 	if strict {
+		dec := json.NewDecoder(bytes.NewReader(body))
 		dec.DisallowUnknownFields()
-	}
-	if err := dec.Decode(dest); err != nil {
-		return fmt.Errorf("decode JSON response: %w", err)
-	}
-	var trailing any
-	if err := dec.Decode(&trailing); err != io.EOF {
-		if err == nil {
+		if err := dec.Decode(dest); err != nil {
+			return fmt.Errorf("decode JSON response: %w", err)
+		}
+		if hasTrailingNonWhitespace(body[dec.InputOffset():]) {
 			return errors.New("decode JSON response: trailing data after JSON value")
 		}
-		return fmt.Errorf("decode JSON response after first JSON value: %w", err)
+		return nil
+	}
+
+	// Non-strict (hot) path: json.Unmarshal bypasses *json.Decoder and
+	// *bytes.Reader, validates the whole body in one byte scan via
+	// stdlib's checkValid, and short-circuits on the first non-whitespace
+	// trailing byte — so a hostile body can't trick us into parsing a
+	// second JSON document. Net: −2 allocs per token response vs the
+	// decoder path. The trade-off is the trailing-data error message:
+	// stdlib emits "json: invalid character 'X' after top-level value"
+	// rather than our "trailing data after JSON value" — one byte of
+	// attacker-controlled input ends up in the error text. Acceptable
+	// for token endpoints (the byte is %q-escaped and the error never
+	// gets surfaced to a terminal without going through
+	// SanitizeDescription first).
+	if err := json.Unmarshal(body, dest); err != nil {
+		return fmt.Errorf("decode JSON response: %w", err)
 	}
 	return nil
+}
+
+// hasTrailingNonWhitespace reports whether b contains any byte that
+// encoding/json would not treat as inter-token whitespace. Mirrors the
+// JSON spec's whitespace set (RFC 8259 §2): space, tab, LF, CR.
+func hasTrailingNonWhitespace(b []byte) bool {
+	for _, c := range b {
+		switch c {
+		case ' ', '\t', '\n', '\r':
+			continue
+		}
+		return true
+	}
+	return false
 }
 
 // looksLikeHTML reports whether body's first non-whitespace byte is

@@ -137,7 +137,8 @@ func (c *Client) now() time.Time {
 
 // httpClient builds the *http.Client used for one request. See
 // oauthhttp.HTTPClient for the construction policy (fresh per call,
-// shared underlying Transport, no Client.Timeout).
+// shared underlying Transport, no Client.Timeout). Built per-call by
+// design: see sts.Client.httpClient for the rationale.
 func (c *Client) httpClient() *http.Client {
 	return oauthhttp.HTTPClient(c.Transport)
 }
@@ -437,7 +438,7 @@ func (c *Client) postForm(ctx context.Context, path string, body url.Values) (*h
 		return nil, fmt.Errorf("resolve URL %s: %w", path, err)
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, strings.NewReader(body.Encode()))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, strings.NewReader(oauthhttp.EncodeForm(body)))
 	if err != nil {
 		return nil, fmt.Errorf("create request: %w", err)
 	}

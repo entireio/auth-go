@@ -116,10 +116,64 @@ func TestReadAndDecodeJSON_RejectsOversizedBody(t *testing.T) {
 func TestReadAndDecodeJSON_RejectsTrailingData(t *testing.T) {
 	t.Parallel()
 
-	var dest map[string]any
-	err := ReadAndDecodeJSON(strings.NewReader(`{"a":1} {"b":2}`), &dest, false)
-	if err == nil || !strings.Contains(err.Error(), "trailing data") {
-		t.Fatalf("error = %v, want trailing data error", err)
+	tests := []struct {
+		name string
+		body string
+	}{
+		{"trailing JSON value", `{"a":1} {"b":2}`},
+		{"trailing garbage", `{"a":1} not json`},
+		{"trailing single byte", `{"a":1}x`},
+		{"trailing whitespace then garbage", "{\"a\":1}\n\tx"},
+	}
+	// In strict mode we route through *json.Decoder and emit our own
+	// "trailing data after JSON value" message; in non-strict mode
+	// json.Unmarshal's "after top-level value" surfaces. Either is
+	// acceptable — both name the trailing condition explicitly. The
+	// test pins the rejection rather than the exact wording.
+	wantSubstrs := []string{"trailing data", "after top-level value"}
+	containsAny := func(s string, subs []string) bool {
+		for _, sub := range subs {
+			if strings.Contains(s, sub) {
+				return true
+			}
+		}
+		return false
+	}
+	for _, tc := range tests {
+		for _, strict := range []bool{false, true} {
+			t.Run(tc.name, func(t *testing.T) {
+				t.Parallel()
+				var dest map[string]any
+				err := ReadAndDecodeJSON(strings.NewReader(tc.body), &dest, strict)
+				if err == nil || !containsAny(err.Error(), wantSubstrs) {
+					t.Fatalf("strict=%v error = %v, want trailing-data marker", strict, err)
+				}
+			})
+		}
+	}
+}
+
+// TestReadAndDecodeJSON_AcceptsTrailingWhitespace pins the JSON-spec
+// whitespace set (RFC 8259 §2: space, tab, LF, CR) as the only bytes
+// allowed after the top-level value.
+func TestReadAndDecodeJSON_AcceptsTrailingWhitespace(t *testing.T) {
+	t.Parallel()
+
+	bodies := []string{
+		`{"a":1}`,
+		`{"a":1} `,
+		"{\"a\":1}\n",
+		"{\"a\":1}\r\n",
+		"{\"a\":1}\t \n  ",
+	}
+	for _, body := range bodies {
+		t.Run(body, func(t *testing.T) {
+			t.Parallel()
+			var dest map[string]any
+			if err := ReadAndDecodeJSON(strings.NewReader(body), &dest, false); err != nil {
+				t.Fatalf("body=%q err=%v", body, err)
+			}
+		})
 	}
 }
 

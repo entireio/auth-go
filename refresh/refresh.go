@@ -86,6 +86,8 @@ func (c *Client) now() time.Time {
 	return time.Now()
 }
 
+// httpClient builds the *http.Client used for one Refresh call. Built
+// per-call by design: see sts.Client.httpClient for the rationale.
 func (c *Client) httpClient() *http.Client { return oauthhttp.HTTPClient(c.Transport) }
 
 // New validates a Client's required fields at construction time rather than
@@ -190,7 +192,7 @@ func (c *Client) Refresh(ctx context.Context, req Request) (*tokens.TokenSet, er
 		defer cancel()
 	}
 
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, strings.NewReader(form.Encode()))
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, strings.NewReader(oauthhttp.EncodeForm(form)))
 	if err != nil {
 		return nil, fmt.Errorf("refresh token: create request: %w", err)
 	}

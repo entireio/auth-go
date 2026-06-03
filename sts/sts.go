@@ -229,7 +229,7 @@ func (c *Client) Exchange(ctx context.Context, req ExchangeRequest) (*tokens.Tok
 		defer cancel()
 	}
 
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, strings.NewReader(form.Encode()))
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, strings.NewReader(oauthhttp.EncodeForm(form)))
 	if err != nil {
 		return nil, fmt.Errorf("token exchange: create request: %w", err)
 	}
@@ -327,6 +327,11 @@ func buildForm(req ExchangeRequest) url.Values {
 
 // httpClient builds the *http.Client used for one Exchange call. See
 // oauthhttp.HTTPClient for the construction policy.
+//
+// Built per-call by design: c.Transport is the public hook for proxies,
+// mTLS / cert pinning, and observability wrappers, and is read on
+// every request so a caller can swap it at runtime without the cached
+// snapshot silently routing through the stale transport.
 func (c *Client) httpClient() *http.Client {
 	return oauthhttp.HTTPClient(c.Transport)
 }
