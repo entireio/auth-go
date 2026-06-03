@@ -205,9 +205,12 @@ func (c *Client) now() time.Time {
 // Exchange performs one RFC 8693 token exchange.
 //
 // Returns a TokenSet with absolute ExpiresAt derived from the server's
-// expires_in. Returns an error wrapping the response body when the
-// server responds with a non-2xx status; callers can match on the
-// returned error message for known OAuth error codes.
+// expires_in. When the server responds with a non-2xx status carrying a
+// structured RFC 6749 OAuth error, the returned error is an
+// *ExchangeError — use errors.As to inspect its Code, Description, and
+// StatusCode rather than substring-matching the message. Non-OAuth
+// failures (network errors, non-JSON/empty bodies) surface as plain
+// wrapped errors.
 func (c *Client) Exchange(ctx context.Context, req ExchangeRequest) (*tokens.TokenSet, error) {
 	if err := req.validate(); err != nil {
 		return nil, fmt.Errorf("token exchange: %w", err)
