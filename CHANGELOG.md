@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+### Changed
+
+- Bumped the Go toolchain (and the `go.mod` minimum) to 1.26.4, picking
+  up the standard-library security fixes GO-2026-5037 (`crypto/x509`
+  hostname parsing) and GO-2026-5039 (`net/textproto`). Consumers now
+  require Go ≥ 1.26.4.
+
 ### Added
 
 - `sts.ExchangeError` — a typed error returned by `Client.Exchange` when
