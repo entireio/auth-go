@@ -1,0 +1,98 @@
+{
+  "cli_version": "dev",
+  "checkpoint_id": "d2f79443bed0",
+  "session_id": "9bdf5c9b-da28-495b-a231-e23973d577bd",
+  "strategy": "manual-commit",
+  "created_at": "2026-06-03T13:56:44.520865431Z",
+  "branch": "review-decode",
+  "checkpoints_count": 1,
+  "files_touched": [
+    "CHANGELOG.md",
+    "deviceflow/deviceflow.go",
+    "internal/oauthhttp/form.go",
+    "internal/oauthhttp/form_test.go",
+    "internal/oauthhttp/jsonresp.go",
+    "internal/oauthhttp/jsonresp_bench_test.go",
+    "internal/oauthhttp/jsonresp_test.go",
+    "refresh/refresh.go",
+    "sts/sts.go",
+    "sts/sts_bench_test.go"
+  ],
+  "agent": "Claude Code",
+  "model": "claude-opus-4-7[1m]",
+  "turn_id": "2142f0530cc4",
+  "checkpoint_transcript_start": 462,
+  "transcript_lines_at_start": 462,
+  "token_usage": {
+    "input_tokens": 23,
+    "cache_creation_tokens": 3090,
+    "cache_read_tokens": 1502203,
+    "output_tokens": 6186,
+    "api_call_count": 8
+  },
+  "skill_events_version": 1,
+  "skill_events": [
+    {
+      "id": "claude-skill-toolu_0169YtHDxwuBkLdzSmm3G6hP",
+      "event_type": "tool_invocation",
+      "skill": {
+        "name": "go-security-review"
+      },
+      "source": {
+        "agent": "claude-code",
+        "signal": "skill_tool_use",
+        "confidence": "explicit"
+      },
+      "turn_id": "2142f0530cc4",
+      "transcript_anchor": {
+        "unit": "line",
+        "start": 12,
+        "end": 13,
+        "entry_ids": [
+          "d4487301-ff25-43db-8fde-ef24965e1014"
+        ],
+        "tool_use_id": "toolu_0169YtHDxwuBkLdzSmm3G6hP"
+      },
+      "native": {
+        "tool_name": "Skill",
+        "tool_use_id": "toolu_0169YtHDxwuBkLdzSmm3G6hP"
+      },
+      "collapse": {
+        "target": "tool_pair",
+        "label": "Skill: go-security-review",
+        "default_collapsed": true
+      }
+    }
+  ],
+  "session_metrics": {
+    "turn_count": 9
+  },
+  "initial_attribution": {
+    "calculated_at": "2026-06-03T13:56:44.500799229Z",
+    "agent_lines": 0,
+    "agent_removed": 0,
+    "human_added": 0,
+    "human_modified": 0,
+    "human_removed": 0,
+    "total_committed": 0,
+    "total_lines_changed": 0,
+    "agent_percentage": 0,
+    "metric_version": 2
+  },
+  "prompt_attributions": [
+    {
+      "checkpoint_number": 1,
+      "user_lines_added": 0,
+      "user_lines_removed": 0,
+      "agent_lines_added": 0,
+      "agent_lines_removed": 0
+    },
+    {
+      "checkpoint_number": 2,
+      "user_lines_added": 0,
+      "user_lines_removed": 0,
+      "agent_lines_added": 454,
+      "agent_lines_removed": 16
+    }
+  ]
+}
