@@ -8,6 +8,13 @@
   up the standard-library security fixes GO-2026-5037 (`crypto/x509`
   hostname parsing) and GO-2026-5039 (`net/textproto`). Consumers now
   require Go ≥ 1.26.4.
+- Token hot-path allocation reductions across `sts`, `refresh`, and
+  `deviceflow`: `internal/oauthhttp.ReadAndDecodeJSON` rejects trailing
+  data with a single-pass scan (no second `Decoder.Decode` call) and
+  routes the non-strict path through `json.Unmarshal`; form bodies are
+  encoded via `oauthhttp.EncodeForm` (unsorted, pre-sized) instead of
+  `url.Values.Encode`. Net: ~−9 allocations per Exchange/Refresh/poll,
+  no behaviour change.
 
 ### Added
 
