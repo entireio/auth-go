@@ -319,6 +319,38 @@ func TestWait_ContextCancelled(t *testing.T) {
 	}
 }
 
+// TestWait_ResultWinsOverCancelledContext locks in the guarantee that a
+// genuine callback result is returned even when the context is already
+// cancelled (or the listener has closed) at the moment Wait runs. Go's
+// select picks at random among ready cases, so without the non-blocking
+// resultCh re-check this fails ~half the time; the loop makes a regression
+// astronomically unlikely to pass.
+func TestWait_ResultWinsOverCancelledContext(t *testing.T) {
+	t.Parallel()
+
+	for i := 0; i < 200; i++ {
+		c := newTestClient(t, func(http.ResponseWriter, *http.Request) {})
+		c.CallbackTimeout = -1 // rely solely on the caller's context
+		f, err := c.Start(context.Background())
+		if err != nil {
+			t.Fatalf("Start() error = %v", err)
+		}
+
+		f.signal(callbackResult{code: "the-code"})
+
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+
+		code, err := f.Wait(ctx)
+		if err != nil {
+			t.Fatalf("iter %d: Wait() error = %v, want nil", i, err)
+		}
+		if code != "the-code" {
+			t.Fatalf("iter %d: Wait() code = %q, want %q", i, code, "the-code")
+		}
+	}
+}
+
 func TestExchange_InvalidGrant(t *testing.T) {
 	t.Parallel()
 
