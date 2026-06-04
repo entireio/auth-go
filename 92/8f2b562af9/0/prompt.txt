@@ -1,0 +1,2 @@
+One gap worth more than the style nit: is there a regression test? This commit is logic-only. A test that buffers resultCh and fires ctx.Done() simultaneously (or just pre-buffers then
+  passes an already-cancelled ctx) would lock in the "result wins" guarantee. Want me to check the branch for one / add it?
