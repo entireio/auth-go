@@ -1,0 +1,17 @@
+the current PR description is bad.  especially this bit:
+
+The library shipped device-flow-only on purpose — and for headless/CI that's still the right default. But we want the smoothest UX where it's available:
+
+    On a local, interactive machine with a browser, loopback code flow is genuinely nicer: nothing to type, no polling latency.
+    Mature CLIs (gh, gcloud, aws sso) ship both and fall back to device flow when there's no usable browser/localhost.
+
+This PR adds the building block so the CLI can default to the browser flow interactively and fall back to device flow otherwise. (CLI wiring is a follow-up PR.)
+
+  - The stated reason is an unbacked assertion. README.md:203 says "CLIs almost never need code flow." That's an opinion, not a documented analysis. It happens to be defensible (the
+  headless/SSH/container portability argument from before is real), but your colleague never wrote that argument down.
+
+also, for CI and headless, our tools (other repos) support an ENTIRE_TOKEN which can be passed in from outside, no device flow needed.
+
+---
+
+❯ is this legit? https://github.com/entireio/auth-go/pull/16#discussion_r3355031289 what's the simplest possible fix we can apply?
