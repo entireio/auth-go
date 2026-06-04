@@ -4,7 +4,7 @@
 [![Lint](https://github.com/entireio/auth-go/actions/workflows/lint.yml/badge.svg)](https://github.com/entireio/auth-go/actions/workflows/lint.yml)
 [![Go Reference](https://pkg.go.dev/badge/github.com/entireio/auth-go.svg)](https://pkg.go.dev/github.com/entireio/auth-go)
 
-Provider-agnostic Go library for CLIs that authenticate end-users via OAuth 2.0 device flow (RFC 8628), present resource-scoped bearer tokens to data APIs, and (when the auth host and data API live on different origins) exchange tokens via RFC 8693 STS.
+Provider-agnostic Go library for CLIs that authenticate end-users via OAuth 2.0 device flow (RFC 8628) or loopback authorization code + PKCE (RFC 8252), present resource-scoped bearer tokens to data APIs, and (when the auth host and data API live on different origins) exchange tokens via RFC 8693 STS.
 
 No global state, no env-var reads, no implicit URLs. Every endpoint, identifier, and default value is supplied by the embedding CLI through a `Config` struct.
 
@@ -17,6 +17,7 @@ go get github.com/entireio/auth-go@latest
 | Package | What it does |
 |---|---|
 | [`deviceflow`](./deviceflow/) | RFC 8628 OAuth 2.0 Device Authorization Grant client. Polls the token endpoint, surfaces RFC 8628 §3.5 error codes (`authorization_pending`, `slow_down`, `access_denied`, `expired_token`, `invalid_grant`) as Go sentinels with optional `error_description`. |
+| [`authcode`](./authcode/) | RFC 8252 OAuth 2.0 Authorization Code Grant client for native apps: PKCE (RFC 7636, S256) over a `127.0.0.1` loopback redirect. `Start` binds the listener and builds the browser URL; `Wait` blocks for the redirect; `Exchange` redeems the code. Opening the browser stays the caller's job. |
 | [`sts`](./sts/) | RFC 8693 OAuth 2.0 Token Exchange client. Provider-agnostic — caller supplies endpoint path, `subject_token_type`, `requested_token_type`, optional `audience` / `resource` / `scope`, and any provider-specific `Extra` form fields (e.g. `client_id`). |
 | [`tokens`](./tokens/) | `TokenSet` value type plus unverified JWT claim parsing. Rejects `alg:none` (RFC 7515 / RFC 7518 §3.6 known attack vector). The package never validates signatures — that's the issuing server's responsibility. Callers use `Claims` for routing decisions (which issuer, which audience) and UX (display the principal handle), not as a security boundary. |
 | [`tokenstore`](./tokenstore/) | `Store` interface for token persistence + `Keyring` reference impl backed by `github.com/zalando/go-keyring`. Each CLI passes its own service name so credentials are isolated across CLIs sharing this library. Returns `ErrNotFound` for unknown profiles and `ErrMalformed` (wrapped) when a stored entry exists but can't be decoded — used by upgrade fallbacks. |
@@ -200,7 +201,6 @@ window to ship a fix before the report becomes searchable.
 ## Non-goals
 
 - **OIDC discovery / ID tokens.** This library is OAuth 2.0 only. If you need OIDC `/.well-known/openid-configuration` + ID-token verification, layer `coreos/go-oidc` on top.
-- **PKCE / authorization code flow.** Device flow only; CLIs almost never need code flow.
 - **Server-side OIDC.** If you're building an *issuer*, look at `zitadel/oidc`'s `op` package.
 
 ## Status

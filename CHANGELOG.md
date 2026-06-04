@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+### Added
+
+- New `authcode` package: an RFC 8252 OAuth 2.0 Authorization Code Grant
+  client for native apps, using PKCE (RFC 7636, S256) and a loopback
+  redirect. `Client.Start` binds a `127.0.0.1` listener and returns a
+  `Flow` with the browser `AuthorizationURL`; `Flow.Wait` blocks for the
+  redirect and returns the authorization code; `Flow.Exchange` redeems it
+  at the token endpoint for a `tokens.TokenSet`. Opening the browser stays
+  the caller's responsibility, as with `deviceflow`. Exposes
+  `ErrAccessDenied`, `ErrInvalidGrant`, `ErrMissingCode`,
+  `ErrListenerClosed`, and re-exports `ErrInsecureBaseURL` / `ErrAbsolutePath`.
+
 ### Changed
 
 - Bumped the Go toolchain (and the `go.mod` minimum) to 1.26.4, picking
