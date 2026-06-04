@@ -387,6 +387,18 @@ func (f *Flow) signal(res callbackResult) {
 	}
 }
 
+// tryResult non-blockingly reads a buffered callback result, if any. Wait
+// uses it to let a successful callback win over a concurrently-ready failure
+// or deadline signal (a select with multiple ready cases chooses at random).
+func (f *Flow) tryResult() (callbackResult, bool) {
+	select {
+	case res := <-f.resultCh:
+		return res, true
+	default:
+		return callbackResult{}, false
+	}
+}
+
 // callbackError maps an authorization-server error code (RFC 6749 §4.1.2.1)
 // to a sentinel where one exists, attaching the sanitised description.
 func callbackError(code, desc string) error {
@@ -419,11 +431,19 @@ func (f *Flow) Wait(ctx context.Context) (code string, err error) {
 	case res := <-f.resultCh:
 		return res.code, res.err
 	case serr := <-f.srvErrCh:
+		// A genuine callback may have raced the failure signal; select offers
+		// no priority, so prefer an already-buffered result over the error.
+		if res, ok := f.tryResult(); ok {
+			return res.code, res.err
+		}
 		if errors.Is(serr, http.ErrServerClosed) {
 			return "", ErrListenerClosed
 		}
 		return "", fmt.Errorf("loopback listener: %w", serr)
 	case <-ctx.Done():
+		if res, ok := f.tryResult(); ok {
+			return res.code, res.err
+		}
 		return "", fmt.Errorf("wait for browser sign-in: %w", ctx.Err())
 	}
 }
