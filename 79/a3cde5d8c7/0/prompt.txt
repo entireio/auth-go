@@ -1,0 +1,9 @@
+push.
+
+---
+
+really? https://github.com/entireio/auth-go/pull/16#discussion_r3356930595
+
+---
+
+yep, add the minimal fix in one commit, then test it in another commit.
