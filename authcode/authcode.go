@@ -250,6 +250,7 @@ type Flow struct {
 	verifier  string
 	state     string
 	srv       *http.Server
+	signalMu  sync.Mutex
 	resultCh  chan callbackResult
 	srvErrCh  chan error
 	closeOnce sync.Once
@@ -377,14 +378,25 @@ func (f *Flow) handleCallback(w http.ResponseWriter, r *http.Request) {
 	f.signal(callbackResult{code: code})
 }
 
-// signal delivers res to Wait without blocking. resultCh is buffered with
-// capacity 1; a second callback (double-submit, retry) is dropped because
-// the first already won.
+// signal delivers res to Wait. resultCh is buffered with capacity 1. The
+// first success wins; a later duplicate (double-submit, retry) is dropped.
+// A success does, however, displace an already-buffered error, so a forged
+// or stray error callback that arrives before the genuine redirect can't
+// sink the login (the listener is loopback-only, but state leaks via the
+// browser-open command line). signalMu serialises the read-modify-write so
+// concurrent handler goroutines can't both observe an empty buffer.
 func (f *Flow) signal(res callbackResult) {
+	f.signalMu.Lock()
+	defer f.signalMu.Unlock()
 	select {
-	case f.resultCh <- res:
+	case prev := <-f.resultCh:
+		// Keep the buffered result unless we're upgrading an error to a success.
+		if prev.err == nil || res.err != nil {
+			res = prev
+		}
 	default:
 	}
+	f.resultCh <- res
 }
 
 // tryResult non-blockingly reads a buffered callback result, if any. Wait
