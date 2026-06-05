@@ -351,6 +351,59 @@ func TestWait_ResultWinsOverCancelledContext(t *testing.T) {
 	}
 }
 
+// TestSignal_SuccessDisplacesBufferedError locks in signal's precedence
+// rules: a success displaces an earlier buffered error, but a success is
+// never displaced by anything that follows it.
+func TestSignal_SuccessDisplacesBufferedError(t *testing.T) {
+	t.Parallel()
+
+	newFlow := func() *Flow { return &Flow{resultCh: make(chan callbackResult, 1)} }
+
+	t.Run("success after error wins", func(t *testing.T) {
+		t.Parallel()
+		f := newFlow()
+		f.signal(callbackResult{err: ErrAccessDenied})
+		f.signal(callbackResult{code: "the-code"})
+		got := <-f.resultCh
+		if got.err != nil || got.code != "the-code" {
+			t.Fatalf("got %+v, want code=the-code err=nil", got)
+		}
+	})
+
+	t.Run("first success survives later error", func(t *testing.T) {
+		t.Parallel()
+		f := newFlow()
+		f.signal(callbackResult{code: "the-code"})
+		f.signal(callbackResult{err: ErrAccessDenied})
+		got := <-f.resultCh
+		if got.err != nil || got.code != "the-code" {
+			t.Fatalf("got %+v, want code=the-code err=nil", got)
+		}
+	})
+
+	t.Run("first success survives later success", func(t *testing.T) {
+		t.Parallel()
+		f := newFlow()
+		f.signal(callbackResult{code: "first"})
+		f.signal(callbackResult{code: "second"})
+		got := <-f.resultCh
+		if got.code != "first" {
+			t.Fatalf("got code %q, want first", got.code)
+		}
+	})
+
+	t.Run("error stands when no success follows", func(t *testing.T) {
+		t.Parallel()
+		f := newFlow()
+		f.signal(callbackResult{err: ErrMissingCode})
+		f.signal(callbackResult{err: ErrAccessDenied})
+		got := <-f.resultCh
+		if !errors.Is(got.err, ErrMissingCode) {
+			t.Fatalf("got err %v, want ErrMissingCode", got.err)
+		}
+	})
+}
+
 func TestExchange_InvalidGrant(t *testing.T) {
 	t.Parallel()
 
