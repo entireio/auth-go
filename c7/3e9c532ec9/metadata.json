@@ -1,0 +1,26 @@
+{
+  "cli_version": "dev",
+  "checkpoint_id": "c73e9c532ec9",
+  "strategy": "manual-commit",
+  "branch": "authcode-loopback-flow",
+  "checkpoints_count": 0,
+  "files_touched": [
+    "authcode/authcode.go",
+    "authcode/authcode_test.go"
+  ],
+  "sessions": [
+    {
+      "metadata": "/c7/3e9c532ec9/0/metadata.json",
+      "transcript": "/c7/3e9c532ec9/0/full.jsonl",
+      "content_hash": "/c7/3e9c532ec9/0/content_hash.txt",
+      "prompt": ""
+    }
+  ],
+  "token_usage": {
+    "input_tokens": 3587,
+    "cache_creation_tokens": 9591,
+    "cache_read_tokens": 525371,
+    "output_tokens": 5151,
+    "api_call_count": 7
+  }
+}
