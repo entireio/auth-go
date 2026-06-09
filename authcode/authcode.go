@@ -358,6 +358,12 @@ func (c *Client) Start(ctx context.Context) (*Flow, error) {
 	f.srv = &http.Server{
 		Handler:           mux,
 		ReadHeaderTimeout: 5 * time.Second,
+		// Bound the response write and any keep-alive idle so a stalled
+		// browser connection can't pin a handler goroutine open for the whole
+		// callback window. The page is a few hundred bytes over loopback, so
+		// these never bite a real client.
+		WriteTimeout: 10 * time.Second,
+		IdleTimeout:  10 * time.Second,
 	}
 	go func() { f.srvErrCh <- f.srv.Serve(listener) }()
 
@@ -520,7 +526,14 @@ func (f *Flow) Close() error {
 	f.closeOnce.Do(func() {
 		shutCtx, cancel := context.WithTimeout(context.Background(), time.Second)
 		defer cancel()
-		f.closeErr = f.srv.Shutdown(shutCtx)
+		if err := f.srv.Shutdown(shutCtx); err != nil {
+			// Graceful shutdown timed out — Shutdown leaves any still-active
+			// connection (e.g. a callback response writing to a stalled
+			// client) running rather than interrupting it. Force it closed so
+			// the listener and its handler goroutines are gone when we return;
+			// otherwise the timeout would be a silent connection/goroutine leak.
+			f.closeErr = f.srv.Close()
+		}
 	})
 	return f.closeErr
 }
