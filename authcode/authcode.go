@@ -250,7 +250,6 @@ type Flow struct {
 	verifier  string
 	state     string
 	srv       *http.Server
-	signalMu  sync.Mutex
 	resultCh  chan callbackResult
 	srvErrCh  chan error
 	closeOnce sync.Once
@@ -378,25 +377,27 @@ func (f *Flow) handleCallback(w http.ResponseWriter, r *http.Request) {
 	f.signal(callbackResult{code: code})
 }
 
-// signal delivers res to Wait. resultCh is buffered with capacity 1. The
-// first success wins; a later duplicate (double-submit, retry) is dropped.
-// A success does, however, displace an already-buffered error, so a forged
-// or stray error callback that arrives before the genuine redirect can't
-// sink the login (the listener is loopback-only, but state leaks via the
-// browser-open command line). signalMu serialises the read-modify-write so
-// concurrent handler goroutines can't both observe an empty buffer.
+// signal delivers res to Wait over the capacity-1 resultCh. The first
+// matching-state callback wins and is terminal: once a result is buffered,
+// later callbacks — duplicates (double-submit, retry) or a stray/forged
+// follow-up that guessed state — are dropped, never overwriting it.
+//
+// Immutability is the security property. state leaks via the browser-open
+// command line, so a local observer could revisit the live authorization
+// request and complete it against their own account. If a later success
+// could displace an earlier result, that observer's code would overwrite
+// the genuine user's access_denied and sign the CLI into the attacker's
+// account. A sunk login (forged error winning the race) is recoverable and
+// obvious; silently signing into the wrong account is not — so first-wins.
+//
+// The buffered-channel send-or-drop is itself atomic, so no mutex is needed
+// to serialise concurrent handler goroutines: exactly one send fills the
+// slot, the rest hit the default and drop.
 func (f *Flow) signal(res callbackResult) {
-	f.signalMu.Lock()
-	defer f.signalMu.Unlock()
 	select {
-	case prev := <-f.resultCh:
-		// Keep the buffered result unless we're upgrading an error to a success.
-		if prev.err == nil || res.err != nil {
-			res = prev
-		}
+	case f.resultCh <- res:
 	default:
 	}
-	f.resultCh <- res
 }
 
 // tryResult non-blockingly reads a buffered callback result, if any. Wait

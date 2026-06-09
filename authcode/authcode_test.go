@@ -351,22 +351,23 @@ func TestWait_ResultWinsOverCancelledContext(t *testing.T) {
 	}
 }
 
-// TestSignal_SuccessDisplacesBufferedError locks in signal's precedence
-// rules: a success displaces an earlier buffered error, but a success is
-// never displaced by anything that follows it.
-func TestSignal_SuccessDisplacesBufferedError(t *testing.T) {
+// TestSignal_FirstResultIsImmutable locks in signal's precedence: the first
+// matching-state callback wins and nothing that follows — success or error
+// — can displace it. The error→success case is the security-critical one:
+// it stops a later forged success from overwriting a genuine denial.
+func TestSignal_FirstResultIsImmutable(t *testing.T) {
 	t.Parallel()
 
 	newFlow := func() *Flow { return &Flow{resultCh: make(chan callbackResult, 1)} }
 
-	t.Run("success after error wins", func(t *testing.T) {
+	t.Run("first error survives later success", func(t *testing.T) {
 		t.Parallel()
 		f := newFlow()
 		f.signal(callbackResult{err: ErrAccessDenied})
 		f.signal(callbackResult{code: "the-code"})
 		got := <-f.resultCh
-		if got.err != nil || got.code != "the-code" {
-			t.Fatalf("got %+v, want code=the-code err=nil", got)
+		if !errors.Is(got.err, ErrAccessDenied) || got.code != "" {
+			t.Fatalf("got %+v, want ErrAccessDenied with no code", got)
 		}
 	})
 
@@ -392,7 +393,7 @@ func TestSignal_SuccessDisplacesBufferedError(t *testing.T) {
 		}
 	})
 
-	t.Run("error stands when no success follows", func(t *testing.T) {
+	t.Run("first error survives later error", func(t *testing.T) {
 		t.Parallel()
 		f := newFlow()
 		f.signal(callbackResult{err: ErrMissingCode})
