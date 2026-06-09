@@ -1,0 +1,9 @@
+/codex:setup
+
+---
+
+/codex:adversarial-review
+
+---
+
+sounds good.  address the 3 findings in separate commits.

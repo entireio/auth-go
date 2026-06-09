@@ -1,0 +1,94 @@
+{
+  "cli_version": "dev",
+  "checkpoint_id": "56afd4bf01ca",
+  "session_id": "23166850-5572-4f7c-a77d-7c80118552d2",
+  "strategy": "manual-commit",
+  "created_at": "2026-06-09T08:10:22.894297Z",
+  "branch": "authcode-loopback-flow",
+  "checkpoints_count": 0,
+  "files_touched": [
+    "authcode/authcode.go",
+    "authcode/authcode_test.go"
+  ],
+  "agent": "Claude Code",
+  "model": "claude-opus-4-8[1m]",
+  "turn_id": "fffcfdca28a1",
+  "token_usage": {
+    "input_tokens": 6125,
+    "cache_creation_tokens": 72165,
+    "cache_read_tokens": 749719,
+    "output_tokens": 16605,
+    "api_call_count": 17
+  },
+  "skill_events_version": 1,
+  "skill_events": [
+    {
+      "id": "prompt-skill-claude-code-codex:setup-2026-06-09T07:58:06.095724Z",
+      "event_type": "prompt_invocation",
+      "skill": {
+        "name": "codex:setup"
+      },
+      "source": {
+        "agent": "claude-code",
+        "signal": "prompt_slash_command",
+        "confidence": "explicit"
+      },
+      "turn_id": "4a6348ad2a8e",
+      "timestamp": "2026-06-09T07:58:06.095724Z",
+      "native": {
+        "command": "/codex:setup"
+      },
+      "collapse": {
+        "target": "user_message",
+        "label": "/codex:setup",
+        "default_collapsed": true
+      }
+    },
+    {
+      "id": "prompt-skill-claude-code-codex:adversarial-review-2026-06-09T07:58:17.616812Z",
+      "event_type": "prompt_invocation",
+      "skill": {
+        "name": "codex:adversarial-review"
+      },
+      "source": {
+        "agent": "claude-code",
+        "signal": "prompt_slash_command",
+        "confidence": "explicit"
+      },
+      "turn_id": "a01aa7ff0965",
+      "timestamp": "2026-06-09T07:58:17.616812Z",
+      "native": {
+        "command": "/codex:adversarial-review"
+      },
+      "collapse": {
+        "target": "user_message",
+        "label": "/codex:adversarial-review",
+        "default_collapsed": true
+      }
+    }
+  ],
+  "session_metrics": {
+    "turn_count": 2
+  },
+  "initial_attribution": {
+    "calculated_at": "2026-06-09T08:10:22.88581Z",
+    "agent_lines": 26,
+    "agent_removed": 24,
+    "human_added": 0,
+    "human_modified": 0,
+    "human_removed": 0,
+    "total_committed": 26,
+    "total_lines_changed": 50,
+    "agent_percentage": 100,
+    "metric_version": 2
+  },
+  "prompt_attributions": [
+    {
+      "checkpoint_number": 1,
+      "user_lines_added": 0,
+      "user_lines_removed": 0,
+      "agent_lines_added": 0,
+      "agent_lines_removed": 0
+    }
+  ]
+}
