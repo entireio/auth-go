@@ -1,0 +1,9 @@
+/codex:adversarial-review
+
+---
+
+is this true and reasonable?
+
+---
+
+how big of a change would both fixes be?  Apply them both in separate commits.
