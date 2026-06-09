@@ -256,6 +256,32 @@ type Flow struct {
 	closeErr  error
 }
 
+// String redacts the PKCE verifier and CSRF state. Both are live secrets
+// during the auth window: the verifier redeems the authorization code, and
+// state is the only gate on which callback this Flow accepts. Without this,
+// a stray fmt.Printf("%+v", flow) in caller code would dump them to logs —
+// the same hazard tokens.TokenSet, deviceflow.DeviceCode, and
+// sts.ExchangeRequest guard against. AuthorizationURL and RedirectURI are
+// exported, user-facing, and handled by the caller directly, so they're
+// shown (AuthorizationURL still carries state in its query by construction;
+// this method only stops reflection-based formatting from being a second,
+// silent path to the bare secret fields).
+func (f *Flow) String() string {
+	if f == nil {
+		return "<nil>"
+	}
+	return fmt.Sprintf(
+		"Flow{AuthorizationURL:%q RedirectURI:%q verifier:%s state:%s}",
+		f.AuthorizationURL,
+		f.RedirectURI,
+		tokens.ElideSecret(f.verifier),
+		tokens.ElideSecret(f.state),
+	)
+}
+
+// GoString delegates to String so %#v in fmt also redacts.
+func (f *Flow) GoString() string { return f.String() }
+
 // callbackResult is the outcome the callback handler hands to Wait over
 // resultCh: either an authorization code or a terminal error.
 type callbackResult struct {

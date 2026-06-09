@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -456,6 +457,31 @@ func TestHandleCallback_SignalsBeforeWritingPage(t *testing.T) {
 	}
 	close(release)
 	<-done
+}
+
+// TestFlow_StringRedactsSecrets ensures fmt verbs that callers reach for
+// (%v, %+v, %#v) can't leak the live PKCE verifier or CSRF state.
+func TestFlow_StringRedactsSecrets(t *testing.T) {
+	t.Parallel()
+
+	f := &Flow{
+		AuthorizationURL: "https://issuer.example/authorize?x=1",
+		RedirectURI:      "http://127.0.0.1:5000/callback",
+		verifier:         "super-secret-verifier-value",
+		state:            "super-secret-state-value",
+	}
+	for _, verb := range []string{"%v", "%+v", "%#v", "%s"} {
+		out := fmt.Sprintf(verb, f)
+		if strings.Contains(out, f.verifier) {
+			t.Errorf("%s leaked verifier: %s", verb, out)
+		}
+		if strings.Contains(out, f.state) {
+			t.Errorf("%s leaked state: %s", verb, out)
+		}
+	}
+	if got := (*Flow)(nil).String(); got != "<nil>" {
+		t.Errorf("nil Flow String() = %q, want <nil>", got)
+	}
 }
 
 func TestExchange_InvalidGrant(t *testing.T) {
