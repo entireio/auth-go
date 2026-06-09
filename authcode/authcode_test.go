@@ -464,8 +464,10 @@ func TestHandleCallback_SignalsBeforeWritingPage(t *testing.T) {
 func TestFlow_StringRedactsSecrets(t *testing.T) {
 	t.Parallel()
 
+	// AuthorizationURL embeds state in its query (as Start builds it), so the
+	// redaction has to reach into the URL too, not just the bare field.
 	f := &Flow{
-		AuthorizationURL: "https://issuer.example/authorize?x=1",
+		AuthorizationURL: "https://issuer.example/authorize?client_id=cli&state=super-secret-state-value&x=1",
 		RedirectURI:      "http://127.0.0.1:5000/callback",
 		verifier:         "super-secret-verifier-value",
 		state:            "super-secret-state-value",

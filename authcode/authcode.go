@@ -261,22 +261,41 @@ type Flow struct {
 // state is the only gate on which callback this Flow accepts. Without this,
 // a stray fmt.Printf("%+v", flow) in caller code would dump them to logs —
 // the same hazard tokens.TokenSet, deviceflow.DeviceCode, and
-// sts.ExchangeRequest guard against. AuthorizationURL and RedirectURI are
-// exported, user-facing, and handled by the caller directly, so they're
-// shown (AuthorizationURL still carries state in its query by construction;
-// this method only stops reflection-based formatting from being a second,
-// silent path to the bare secret fields).
+// sts.ExchangeRequest guard against. AuthorizationURL carries the same state
+// in its query by construction, so it's shown with that one parameter
+// scrubbed (see redactedAuthorizationURL); otherwise fmt would be a second,
+// silent path to the bare secret. RedirectURI holds no secret and is shown
+// verbatim.
 func (f *Flow) String() string {
 	if f == nil {
 		return "<nil>"
 	}
 	return fmt.Sprintf(
 		"Flow{AuthorizationURL:%q RedirectURI:%q verifier:%s state:%s}",
-		f.AuthorizationURL,
+		f.redactedAuthorizationURL(),
 		f.RedirectURI,
 		tokens.ElideSecret(f.verifier),
 		tokens.ElideSecret(f.state),
 	)
+}
+
+// redactedAuthorizationURL returns AuthorizationURL with the state query
+// parameter's value masked, for safe inclusion in String. The raw field
+// stays untouched — only this diagnostic rendering is scrubbed. On a parse
+// failure we return a marker rather than risk emitting the unredacted URL.
+func (f *Flow) redactedAuthorizationURL() string {
+	if f.AuthorizationURL == "" {
+		return ""
+	}
+	u, err := url.Parse(f.AuthorizationURL)
+	if err != nil {
+		return "<unparseable authorization URL>"
+	}
+	if q := u.Query(); q.Has("state") {
+		q.Set("state", "<redacted>")
+		u.RawQuery = q.Encode()
+	}
+	return u.String()
 }
 
 // GoString delegates to String so %#v in fmt also redacts.
