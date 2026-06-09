@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v0.5.0 — 2026-06-09
+
 ### Added
 
 - New `authcode` package: an RFC 8252 OAuth 2.0 Authorization Code Grant
@@ -13,16 +15,9 @@
   the caller's responsibility, as with `deviceflow`. Exposes
   `ErrAccessDenied`, `ErrInvalidGrant`, `ErrMissingCode`,
   `ErrListenerClosed`, and re-exports `ErrInsecureBaseURL` / `ErrAbsolutePath`.
-
-### Changed
-
-- Bumped the Go toolchain (and the `go.mod` minimum) to 1.26.4, picking
-  up the standard-library security fixes GO-2026-5037 (`crypto/x509`
-  hostname parsing) and GO-2026-5039 (`net/textproto`). Consumers now
-  require Go ≥ 1.26.4.
-
-### Added
-
+  The first matching-state callback is terminal (a later forged success
+  can't displace a genuine denial), and `Flow` redacts its PKCE verifier
+  and CSRF state from `fmt` output like the other secret-bearing types.
 - `sts.ExchangeError` — a typed error returned by `Client.Exchange` when
   the token endpoint replies with a structured RFC 6749 OAuth error.
   Exposes the parsed `Code`, `Description`, and `StatusCode` so callers
@@ -31,6 +26,13 @@
   renders the same string as before, so message-matching callers are
   unaffected; non-OAuth failures (network errors, non-JSON bodies) remain
   plain wrapped errors.
+
+### Changed
+
+- Bumped the Go toolchain (and the `go.mod` minimum) to 1.26.4, picking
+  up the standard-library security fixes GO-2026-5037 (`crypto/x509`
+  hostname parsing) and GO-2026-5039 (`net/textproto`). Consumers now
+  require Go ≥ 1.26.4.
 
 ## v0.4.0 — 2026-05-28
 
