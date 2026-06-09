@@ -1,0 +1,64 @@
+{
+  "cli_version": "dev",
+  "checkpoint_id": "e58e9668768c",
+  "session_id": "b8e4e31b-68d9-4466-9041-84a004d82768",
+  "strategy": "manual-commit",
+  "created_at": "2026-06-09T08:28:20.202994Z",
+  "branch": "authcode-loopback-flow",
+  "checkpoints_count": 0,
+  "files_touched": [
+    "authcode/authcode.go"
+  ],
+  "agent": "Claude Code",
+  "model": "",
+  "turn_id": "886466b7d1c4",
+  "checkpoint_transcript_start": 94,
+  "transcript_lines_at_start": 94,
+  "token_usage": {
+    "input_tokens": 139,
+    "cache_creation_tokens": 2053,
+    "cache_read_tokens": 367045,
+    "output_tokens": 1489,
+    "api_call_count": 5
+  },
+  "skill_events_version": 1,
+  "skill_events": [
+    {
+      "id": "prompt-skill-claude-code-codex:adversarial-review-2026-06-09T08:15:47.30328Z",
+      "event_type": "prompt_invocation",
+      "skill": {
+        "name": "codex:adversarial-review"
+      },
+      "source": {
+        "agent": "claude-code",
+        "signal": "prompt_slash_command",
+        "confidence": "explicit"
+      },
+      "turn_id": "191e6fc4bd1d",
+      "timestamp": "2026-06-09T08:15:47.30328Z",
+      "native": {
+        "command": "/codex:adversarial-review"
+      },
+      "collapse": {
+        "target": "user_message",
+        "label": "/codex:adversarial-review",
+        "default_collapsed": true
+      }
+    }
+  ],
+  "session_metrics": {
+    "turn_count": 2
+  },
+  "initial_attribution": {
+    "calculated_at": "2026-06-09T08:28:20.1955Z",
+    "agent_lines": 14,
+    "agent_removed": 1,
+    "human_added": 0,
+    "human_modified": 0,
+    "human_removed": 0,
+    "total_committed": 14,
+    "total_lines_changed": 15,
+    "agent_percentage": 100,
+    "metric_version": 2
+  }
+}
