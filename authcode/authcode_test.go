@@ -405,6 +405,59 @@ func TestSignal_FirstResultIsImmutable(t *testing.T) {
 	})
 }
 
+// blockingResponseWriter runs onWrite once, on the first Write, before
+// returning. It lets a test stall handleCallback mid-response.
+type blockingResponseWriter struct {
+	header  http.Header
+	onWrite func()
+	once    sync.Once
+}
+
+func (b *blockingResponseWriter) Header() http.Header { return b.header }
+func (b *blockingResponseWriter) WriteHeader(int)     {}
+func (b *blockingResponseWriter) Write(p []byte) (int, error) {
+	b.once.Do(b.onWrite)
+	return len(p), nil
+}
+
+// TestHandleCallback_SignalsBeforeWritingPage guards the ordering fix for
+// the timeout/cancel race: the callback outcome must be buffered before the
+// (potentially blocking) browser-page write, so a write that stalls past
+// Wait's deadline can't turn a successful redirect into a false timeout. We
+// stall the handler on its first Write and assert the result is already
+// buffered at that point — which fails if signal moves back after the write.
+func TestHandleCallback_SignalsBeforeWritingPage(t *testing.T) {
+	t.Parallel()
+
+	f := &Flow{state: "s", resultCh: make(chan callbackResult, 1)}
+
+	writing := make(chan struct{})
+	release := make(chan struct{})
+	w := &blockingResponseWriter{
+		header:  http.Header{},
+		onWrite: func() { close(writing); <-release },
+	}
+	req := httptest.NewRequest(http.MethodGet, "/callback?code=abc&state=s", nil)
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		f.handleCallback(w, req)
+	}()
+
+	<-writing // the handler has reached the browser-page write
+	select {
+	case res := <-f.resultCh:
+		if res.code != "abc" || res.err != nil {
+			t.Fatalf("buffered result = %+v, want code=abc err=nil", res)
+		}
+	default:
+		t.Fatal("result not buffered before the browser-page write")
+	}
+	close(release)
+	<-done
+}
+
 func TestExchange_InvalidGrant(t *testing.T) {
 	t.Parallel()
 

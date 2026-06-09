@@ -348,6 +348,13 @@ func (c *Client) authorizationURL(redirectURI, challenge, state string) (string,
 // handleCallback is the loopback redirect handler. It validates state,
 // surfaces an OAuth error parameter, extracts the authorization code, and
 // signals Wait over the buffered resultCh.
+//
+// The outcome is recorded (f.signal) BEFORE the response is written. The
+// browser-page write can block — a slow or stalled client connection — and
+// if Wait's deadline or the caller's context fires during that write, Wait
+// re-checks the buffer (tryResult) and must find the result already there.
+// Signalling after the write would let a redirect that genuinely succeeded
+// surface as a false timeout while the browser shows "Signed in".
 func (f *Flow) handleCallback(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 
@@ -361,20 +368,20 @@ func (f *Flow) handleCallback(w http.ResponseWriter, r *http.Request) {
 
 	if oerr := q.Get("error"); oerr != "" {
 		desc := oauthhttp.SanitizeDescription(q.Get("error_description"))
-		writeBrowserPage(w, http.StatusBadRequest, "Sign-in failed", "You can close this tab and return to your terminal.")
 		f.signal(callbackResult{err: callbackError(oerr, desc)})
+		writeBrowserPage(w, http.StatusBadRequest, "Sign-in failed", "You can close this tab and return to your terminal.")
 		return
 	}
 
 	code := q.Get("code")
 	if code == "" {
-		http.Error(w, "missing authorization code", http.StatusBadRequest)
 		f.signal(callbackResult{err: ErrMissingCode})
+		http.Error(w, "missing authorization code", http.StatusBadRequest)
 		return
 	}
 
-	writeBrowserPage(w, http.StatusOK, "Signed in", "You're signed in. You can close this tab and return to your terminal.")
 	f.signal(callbackResult{code: code})
+	writeBrowserPage(w, http.StatusOK, "Signed in", "You're signed in. You can close this tab and return to your terminal.")
 }
 
 // signal delivers res to Wait over the capacity-1 resultCh. The first
