@@ -1,0 +1,80 @@
+{
+  "cli_version": "dev",
+  "checkpoint_id": "fdaea1bf5749",
+  "session_id": "5c7298d0-aeab-4312-b0db-9432417ff7b8",
+  "strategy": "manual-commit",
+  "created_at": "2026-06-10T00:48:10.34393Z",
+  "branch": "authcode-loopback-flow",
+  "checkpoints_count": 1,
+  "files_touched": [
+    "CHANGELOG.md",
+    "authcode/authcode.go",
+    "authcode/authcode_test.go"
+  ],
+  "agent": "Claude Code",
+  "model": "",
+  "turn_id": "f42ee17a587d",
+  "token_usage": {
+    "input_tokens": 6356,
+    "cache_creation_tokens": 86653,
+    "cache_read_tokens": 1374784,
+    "output_tokens": 15878,
+    "api_call_count": 30
+  },
+  "skill_events_version": 1,
+  "skill_events": [
+    {
+      "id": "prompt-skill-claude-code-codex:adversarial-review-2026-06-09T08:29:45.400501Z",
+      "event_type": "prompt_invocation",
+      "skill": {
+        "name": "codex:adversarial-review"
+      },
+      "source": {
+        "agent": "claude-code",
+        "signal": "prompt_slash_command",
+        "confidence": "explicit"
+      },
+      "turn_id": "8756bbb07ba3",
+      "timestamp": "2026-06-09T08:29:45.400501Z",
+      "native": {
+        "command": "/codex:adversarial-review"
+      },
+      "collapse": {
+        "target": "user_message",
+        "label": "/codex:adversarial-review",
+        "default_collapsed": true
+      }
+    }
+  ],
+  "session_metrics": {
+    "turn_count": 3
+  },
+  "initial_attribution": {
+    "calculated_at": "2026-06-10T00:48:10.33625Z",
+    "agent_lines": 34,
+    "agent_removed": 1,
+    "human_added": 0,
+    "human_modified": 0,
+    "human_removed": 0,
+    "total_committed": 34,
+    "total_lines_changed": 35,
+    "agent_percentage": 100,
+    "metric_version": 2
+  },
+  "prompt_attributions": [
+    {
+      "checkpoint_number": 1,
+      "user_lines_added": 0,
+      "user_lines_removed": 0,
+      "agent_lines_added": 0,
+      "agent_lines_removed": 0
+    },
+    {
+      "checkpoint_number": 2,
+      "user_lines_added": 0,
+      "user_lines_removed": 0,
+      "agent_lines_added": 34,
+      "agent_lines_removed": 1
+    }
+  ]
+}

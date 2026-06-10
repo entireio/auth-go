@@ -1,0 +1,13 @@
+/codex:adversarial-review
+
+---
+
+it sounds like finding 1 is a security feature, no?  What would a fix to issue 2 look like - only show a success message in the browser once we're sure we were successful?
+
+---
+
+ok, let's apply the fixes you suggest:
+
+1. fail loud.
+
+2. leave it alone.
