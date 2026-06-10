@@ -1,0 +1,603 @@
+package authcode
+
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/base64"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+)
+
+const (
+	testClientID      = "cli"
+	testAuthorizePath = "/authorize"
+	testTokenPath     = "/oauth/token"
+	testScope         = "cli offline_access"
+)
+
+func writeBody(t *testing.T, w io.Writer, body string) {
+	t.Helper()
+	if _, err := io.WriteString(w, body); err != nil {
+		t.Fatalf("write body: %v", err)
+	}
+}
+
+func newTestClient(t *testing.T, h http.HandlerFunc) *Client {
+	t.Helper()
+	srv := httptest.NewServer(h)
+	t.Cleanup(srv.Close)
+
+	return &Client{
+		Transport:         srv.Client().Transport,
+		BaseURL:           srv.URL,
+		ClientID:          testClientID,
+		Scope:             testScope,
+		AuthorizePath:     testAuthorizePath,
+		TokenPath:         testTokenPath,
+		AllowInsecureHTTP: true, // httptest.NewServer is http://
+	}
+}
+
+// hitCallback simulates the browser being redirected back to the loopback
+// listener. resultCh is buffered, so calling this before Wait is safe.
+func hitCallback(t *testing.T, redirectURI string, params url.Values) *http.Response {
+	t.Helper()
+	resp, err := http.Get(redirectURI + "?" + params.Encode()) //nolint:noctx,bodyclose // test helper; caller closes
+	if err != nil {
+		t.Fatalf("GET callback: %v", err)
+	}
+	return resp
+}
+
+// authParams parses the query off a Flow's AuthorizationURL.
+func authParams(t *testing.T, f *Flow) url.Values {
+	t.Helper()
+	u, err := url.Parse(f.AuthorizationURL)
+	if err != nil {
+		t.Fatalf("parse AuthorizationURL: %v", err)
+	}
+	return u.Query()
+}
+
+func pkceChallenge(verifier string) string {
+	sum := sha256.Sum256([]byte(verifier))
+	return base64.RawURLEncoding.EncodeToString(sum[:])
+}
+
+func TestStart_BuildsAuthorizationURL(t *testing.T) {
+	t.Parallel()
+
+	c := newTestClient(t, func(http.ResponseWriter, *http.Request) {})
+	f, err := c.Start(context.Background())
+	if err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	t.Cleanup(func() { _ = f.Close() })
+
+	q := authParams(t, f)
+	if got := q.Get("response_type"); got != "code" {
+		t.Errorf("response_type = %q, want code", got)
+	}
+	if got := q.Get("client_id"); got != testClientID {
+		t.Errorf("client_id = %q, want %q", got, testClientID)
+	}
+	if got := q.Get("code_challenge_method"); got != "S256" {
+		t.Errorf("code_challenge_method = %q, want S256", got)
+	}
+	if q.Get("code_challenge") == "" {
+		t.Error("code_challenge is empty")
+	}
+	if q.Get("state") == "" {
+		t.Error("state is empty")
+	}
+	if got := q.Get("scope"); got != testScope {
+		t.Errorf("scope = %q, want %q", got, testScope)
+	}
+	if got := q.Get("redirect_uri"); got != f.RedirectURI {
+		t.Errorf("redirect_uri = %q, want %q", got, f.RedirectURI)
+	}
+	if !strings.HasPrefix(f.RedirectURI, "http://127.0.0.1:") || !strings.HasSuffix(f.RedirectURI, callbackPath) {
+		t.Errorf("RedirectURI = %q, want http://127.0.0.1:<port>%s", f.RedirectURI, callbackPath)
+	}
+}
+
+func TestStart_OmitsScopeWhenEmpty(t *testing.T) {
+	t.Parallel()
+
+	c := newTestClient(t, func(http.ResponseWriter, *http.Request) {})
+	c.Scope = ""
+	f, err := c.Start(context.Background())
+	if err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	t.Cleanup(func() { _ = f.Close() })
+
+	if authParams(t, f).Has("scope") {
+		t.Error("scope should not be set when Client.Scope is empty")
+	}
+}
+
+func TestFlow_HappyPath(t *testing.T) {
+	t.Parallel()
+
+	var (
+		mu          sync.Mutex
+		gotVerifier string
+		gotForm     url.Values
+	)
+	c := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != testTokenPath {
+			t.Errorf("token request path = %q", r.URL.Path)
+		}
+		if err := r.ParseForm(); err != nil {
+			t.Fatalf("parse form: %v", err)
+		}
+		mu.Lock()
+		gotVerifier = r.PostForm.Get("code_verifier")
+		gotForm = r.PostForm
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		writeBody(t, w, `{"access_token":"at-1","refresh_token":"rt-1","token_type":"Bearer","expires_in":3600,"scope":"cli offline_access"}`)
+	})
+
+	f, err := c.Start(context.Background())
+	if err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+
+	q := authParams(t, f)
+	resp := hitCallback(t, f.RedirectURI, url.Values{
+		"code":  {"auth-code-123"},
+		"state": {q.Get("state")},
+	})
+	_ = resp.Body.Close()
+
+	code, err := f.Wait(context.Background())
+	if err != nil {
+		t.Fatalf("Wait() error = %v", err)
+	}
+	if code != "auth-code-123" {
+		t.Fatalf("code = %q, want auth-code-123", code)
+	}
+
+	ts, err := f.Exchange(context.Background(), code)
+	if err != nil {
+		t.Fatalf("Exchange() error = %v", err)
+	}
+	if ts.AccessToken != "at-1" || ts.RefreshToken != "rt-1" {
+		t.Fatalf("TokenSet = %+v", ts)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if pkceChallenge(gotVerifier) != q.Get("code_challenge") {
+		t.Error("token exchange code_verifier does not hash to the authorize code_challenge")
+	}
+	if got := gotForm.Get("grant_type"); got != authCodeGrantType {
+		t.Errorf("grant_type = %q, want %q", got, authCodeGrantType)
+	}
+	if got := gotForm.Get("redirect_uri"); got != f.RedirectURI {
+		t.Errorf("redirect_uri = %q, want %q", got, f.RedirectURI)
+	}
+	if got := gotForm.Get("code"); got != "auth-code-123" {
+		t.Errorf("code = %q, want auth-code-123", got)
+	}
+}
+
+func TestExchange_SetsAbsoluteExpiry(t *testing.T) {
+	t.Parallel()
+
+	c := newTestClient(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		writeBody(t, w, `{"access_token":"at","token_type":"Bearer","expires_in":3600}`)
+	})
+	frozen := time.Date(2026, 6, 4, 12, 0, 0, 0, time.UTC)
+	SetNowForTest(t, c, func() time.Time { return frozen })
+
+	f, err := c.Start(context.Background())
+	if err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	t.Cleanup(func() { _ = f.Close() })
+
+	ts, err := f.Exchange(context.Background(), "code")
+	if err != nil {
+		t.Fatalf("Exchange() error = %v", err)
+	}
+	if want := frozen.Add(time.Hour); !ts.ExpiresAt.Equal(want) {
+		t.Fatalf("ExpiresAt = %s, want %s", ts.ExpiresAt, want)
+	}
+}
+
+func TestWait_StateMismatchIgnoredThenSuccess(t *testing.T) {
+	t.Parallel()
+
+	c := newTestClient(t, func(http.ResponseWriter, *http.Request) {})
+	f, err := c.Start(context.Background())
+	if err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+
+	// A forged/stray callback with the wrong state is rejected (400) and
+	// must NOT abort the still-pending login.
+	bad := hitCallback(t, f.RedirectURI, url.Values{"code": {"x"}, "state": {"wrong"}})
+	if bad.StatusCode != http.StatusBadRequest {
+		t.Errorf("bad-state status = %d, want 400", bad.StatusCode)
+	}
+	_ = bad.Body.Close()
+
+	q := authParams(t, f)
+	good := hitCallback(t, f.RedirectURI, url.Values{"code": {"real-code"}, "state": {q.Get("state")}})
+	_ = good.Body.Close()
+
+	code, err := f.Wait(context.Background())
+	if err != nil {
+		t.Fatalf("Wait() error = %v", err)
+	}
+	if code != "real-code" {
+		t.Fatalf("code = %q, want real-code", code)
+	}
+}
+
+func TestWait_AccessDenied(t *testing.T) {
+	t.Parallel()
+
+	c := newTestClient(t, func(http.ResponseWriter, *http.Request) {})
+	f, err := c.Start(context.Background())
+	if err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+
+	q := authParams(t, f)
+	resp := hitCallback(t, f.RedirectURI, url.Values{
+		"error":             {"access_denied"},
+		"error_description": {"user declined"},
+		"state":             {q.Get("state")},
+	})
+	_ = resp.Body.Close()
+
+	if _, err := f.Wait(context.Background()); !errors.Is(err, ErrAccessDenied) {
+		t.Fatalf("Wait() error = %v, want ErrAccessDenied", err)
+	}
+}
+
+func TestWait_MissingCode(t *testing.T) {
+	t.Parallel()
+
+	c := newTestClient(t, func(http.ResponseWriter, *http.Request) {})
+	f, err := c.Start(context.Background())
+	if err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+
+	q := authParams(t, f)
+	resp := hitCallback(t, f.RedirectURI, url.Values{"state": {q.Get("state")}})
+	_ = resp.Body.Close()
+
+	if _, err := f.Wait(context.Background()); !errors.Is(err, ErrMissingCode) {
+		t.Fatalf("Wait() error = %v, want ErrMissingCode", err)
+	}
+}
+
+func TestWait_Timeout(t *testing.T) {
+	t.Parallel()
+
+	c := newTestClient(t, func(http.ResponseWriter, *http.Request) {})
+	c.CallbackTimeout = 50 * time.Millisecond
+	f, err := c.Start(context.Background())
+	if err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+
+	_, err = f.Wait(context.Background())
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Wait() error = %v, want context.DeadlineExceeded", err)
+	}
+}
+
+func TestWait_ContextCancelled(t *testing.T) {
+	t.Parallel()
+
+	c := newTestClient(t, func(http.ResponseWriter, *http.Request) {})
+	c.CallbackTimeout = -1 // rely solely on the caller's context
+	f, err := c.Start(context.Background())
+	if err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := f.Wait(ctx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("Wait() error = %v, want context.Canceled", err)
+	}
+}
+
+// TestWait_ResultWinsOverCancelledContext locks in the guarantee that a
+// genuine callback result is returned even when the context is already
+// cancelled (or the listener has closed) at the moment Wait runs. Go's
+// select picks at random among ready cases, so without the non-blocking
+// resultCh re-check this fails ~half the time; the loop makes a regression
+// astronomically unlikely to pass.
+func TestWait_ResultWinsOverCancelledContext(t *testing.T) {
+	t.Parallel()
+
+	for i := 0; i < 200; i++ {
+		c := newTestClient(t, func(http.ResponseWriter, *http.Request) {})
+		c.CallbackTimeout = -1 // rely solely on the caller's context
+		f, err := c.Start(context.Background())
+		if err != nil {
+			t.Fatalf("Start() error = %v", err)
+		}
+
+		f.signal(callbackResult{code: "the-code"})
+
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+
+		code, err := f.Wait(ctx)
+		if err != nil {
+			t.Fatalf("iter %d: Wait() error = %v, want nil", i, err)
+		}
+		if code != "the-code" {
+			t.Fatalf("iter %d: Wait() code = %q, want %q", i, code, "the-code")
+		}
+	}
+}
+
+// TestSignal_FirstResultIsImmutable locks in signal's precedence: the first
+// matching-state callback wins and nothing that follows — success or error
+// — can displace it. The error→success case is the security-critical one:
+// it stops a later forged success from overwriting a genuine denial.
+func TestSignal_FirstResultIsImmutable(t *testing.T) {
+	t.Parallel()
+
+	newFlow := func() *Flow { return &Flow{resultCh: make(chan callbackResult, 1)} }
+
+	t.Run("first error survives later success", func(t *testing.T) {
+		t.Parallel()
+		f := newFlow()
+		f.signal(callbackResult{err: ErrAccessDenied})
+		f.signal(callbackResult{code: "the-code"})
+		got := <-f.resultCh
+		if !errors.Is(got.err, ErrAccessDenied) || got.code != "" {
+			t.Fatalf("got %+v, want ErrAccessDenied with no code", got)
+		}
+	})
+
+	t.Run("first success survives later error", func(t *testing.T) {
+		t.Parallel()
+		f := newFlow()
+		f.signal(callbackResult{code: "the-code"})
+		f.signal(callbackResult{err: ErrAccessDenied})
+		got := <-f.resultCh
+		if got.err != nil || got.code != "the-code" {
+			t.Fatalf("got %+v, want code=the-code err=nil", got)
+		}
+	})
+
+	t.Run("first success survives later success", func(t *testing.T) {
+		t.Parallel()
+		f := newFlow()
+		f.signal(callbackResult{code: "first"})
+		f.signal(callbackResult{code: "second"})
+		got := <-f.resultCh
+		if got.code != "first" {
+			t.Fatalf("got code %q, want first", got.code)
+		}
+	})
+
+	t.Run("first error survives later error", func(t *testing.T) {
+		t.Parallel()
+		f := newFlow()
+		f.signal(callbackResult{err: ErrMissingCode})
+		f.signal(callbackResult{err: ErrAccessDenied})
+		got := <-f.resultCh
+		if !errors.Is(got.err, ErrMissingCode) {
+			t.Fatalf("got err %v, want ErrMissingCode", got.err)
+		}
+	})
+}
+
+// blockingResponseWriter runs onWrite once, on the first Write, before
+// returning. It lets a test stall handleCallback mid-response.
+type blockingResponseWriter struct {
+	header  http.Header
+	onWrite func()
+	once    sync.Once
+}
+
+func (b *blockingResponseWriter) Header() http.Header { return b.header }
+func (b *blockingResponseWriter) WriteHeader(int)     {}
+func (b *blockingResponseWriter) Write(p []byte) (int, error) {
+	b.once.Do(b.onWrite)
+	return len(p), nil
+}
+
+// TestHandleCallback_SignalsBeforeWritingPage guards the ordering fix for
+// the timeout/cancel race: the callback outcome must be buffered before the
+// (potentially blocking) browser-page write, so a write that stalls past
+// Wait's deadline can't turn a successful redirect into a false timeout. We
+// stall the handler on its first Write and assert the result is already
+// buffered at that point — which fails if signal moves back after the write.
+func TestHandleCallback_SignalsBeforeWritingPage(t *testing.T) {
+	t.Parallel()
+
+	f := &Flow{state: "s", resultCh: make(chan callbackResult, 1)}
+
+	writing := make(chan struct{})
+	release := make(chan struct{})
+	w := &blockingResponseWriter{
+		header:  http.Header{},
+		onWrite: func() { close(writing); <-release },
+	}
+	req := httptest.NewRequest(http.MethodGet, "/callback?code=abc&state=s", nil)
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		f.handleCallback(w, req)
+	}()
+
+	<-writing // the handler has reached the browser-page write
+	select {
+	case res := <-f.resultCh:
+		if res.code != "abc" || res.err != nil {
+			t.Fatalf("buffered result = %+v, want code=abc err=nil", res)
+		}
+	default:
+		t.Fatal("result not buffered before the browser-page write")
+	}
+	close(release)
+	<-done
+}
+
+func TestWriteBrowserPage_RendersEscapedTitleAndMessage(t *testing.T) {
+	t.Parallel()
+
+	rec := httptest.NewRecorder()
+	writeBrowserPage(rec, http.StatusBadRequest, "Sign-in <failed>", "Go back & retry.")
+
+	if rec.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want %d", rec.Code, http.StatusBadRequest)
+	}
+	if ct := rec.Header().Get("Content-Type"); ct != "text/html; charset=utf-8" {
+		t.Errorf("Content-Type = %q, want text/html", ct)
+	}
+	body := rec.Body.String()
+	for _, want := range []string{"Sign-in &lt;failed&gt;", "Go back &amp; retry.", `class="marvin"`} {
+		if !strings.Contains(body, want) {
+			t.Errorf("body missing %q", want)
+		}
+	}
+	if strings.Contains(body, "{{") {
+		t.Error("body contains an unreplaced placeholder")
+	}
+}
+
+// TestFlow_StringRedactsSecrets ensures fmt verbs that callers reach for
+// (%v, %+v, %#v) can't leak the live PKCE verifier or CSRF state.
+func TestFlow_StringRedactsSecrets(t *testing.T) {
+	t.Parallel()
+
+	// AuthorizationURL embeds state in its query (as Start builds it), so the
+	// redaction has to reach into the URL too, not just the bare field.
+	f := &Flow{
+		AuthorizationURL: "https://issuer.example/authorize?client_id=cli&state=super-secret-state-value&x=1",
+		RedirectURI:      "http://127.0.0.1:5000/callback",
+		verifier:         "super-secret-verifier-value",
+		state:            "super-secret-state-value",
+	}
+	for _, verb := range []string{"%v", "%+v", "%#v", "%s"} {
+		out := fmt.Sprintf(verb, f)
+		if strings.Contains(out, f.verifier) {
+			t.Errorf("%s leaked verifier: %s", verb, out)
+		}
+		if strings.Contains(out, f.state) {
+			t.Errorf("%s leaked state: %s", verb, out)
+		}
+	}
+	if got := (*Flow)(nil).String(); got != "<nil>" {
+		t.Errorf("nil Flow String() = %q, want <nil>", got)
+	}
+}
+
+func TestExchange_InvalidGrant(t *testing.T) {
+	t.Parallel()
+
+	c := newTestClient(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		writeBody(t, w, `{"error":"invalid_grant","error_description":"code already redeemed"}`)
+	})
+	f, err := c.Start(context.Background())
+	if err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	t.Cleanup(func() { _ = f.Close() })
+
+	if _, err := f.Exchange(context.Background(), "stale"); !errors.Is(err, ErrInvalidGrant) {
+		t.Fatalf("Exchange() error = %v, want ErrInvalidGrant", err)
+	}
+}
+
+func TestExchange_NoAccessToken(t *testing.T) {
+	t.Parallel()
+
+	c := newTestClient(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		writeBody(t, w, `{"token_type":"Bearer"}`)
+	})
+	f, err := c.Start(context.Background())
+	if err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	t.Cleanup(func() { _ = f.Close() })
+
+	if _, err := f.Exchange(context.Background(), "code"); err == nil {
+		t.Fatal("Exchange() error = nil, want missing-access-token error")
+	}
+}
+
+func TestNew_Validation(t *testing.T) {
+	t.Parallel()
+
+	cases := map[string]*Client{
+		"nil":           nil,
+		"no base URL":   {ClientID: "c", AuthorizePath: "/a", TokenPath: "/t"},
+		"no client ID":  {BaseURL: "https://e", AuthorizePath: "/a", TokenPath: "/t"},
+		"no authorize":  {BaseURL: "https://e", ClientID: "c", TokenPath: "/t"},
+		"no token path": {BaseURL: "https://e", ClientID: "c", AuthorizePath: "/a"},
+	}
+	for name, c := range cases {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			if _, err := New(c); err == nil {
+				t.Errorf("New(%s) error = nil, want non-nil", name)
+			}
+		})
+	}
+
+	ok := &Client{BaseURL: "https://e", ClientID: "c", AuthorizePath: "/a", TokenPath: "/t"}
+	if _, err := New(ok); err != nil {
+		t.Errorf("New(valid) error = %v", err)
+	}
+}
+
+func TestStart_RejectsInsecureBaseURL(t *testing.T) {
+	t.Parallel()
+
+	c := &Client{
+		BaseURL:       "http://auth.example.com", // non-loopback http
+		ClientID:      testClientID,
+		AuthorizePath: testAuthorizePath,
+		TokenPath:     testTokenPath,
+	}
+	if _, err := c.Start(context.Background()); !errors.Is(err, ErrInsecureBaseURL) {
+		t.Fatalf("Start() error = %v, want ErrInsecureBaseURL", err)
+	}
+}
+
+func TestStart_RejectsAuthorizePathQuery(t *testing.T) {
+	t.Parallel()
+
+	// A query on AuthorizePath would be silently overwritten by the OAuth
+	// query the client builds, dropping whatever the caller intended
+	// (audience, resource, access_type, ...). Start must fail loud instead.
+	c := &Client{
+		BaseURL:       "https://auth.example.com",
+		ClientID:      testClientID,
+		AuthorizePath: testAuthorizePath + "?audience=https://api.example.com",
+		TokenPath:     testTokenPath,
+	}
+	if _, err := c.Start(context.Background()); !errors.Is(err, ErrAuthorizeQuery) {
+		t.Fatalf("Start() error = %v, want ErrAuthorizeQuery", err)
+	}
+}

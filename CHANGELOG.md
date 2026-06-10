@@ -2,15 +2,28 @@
 
 ## Unreleased
 
-### Changed
-
-- Bumped the Go toolchain (and the `go.mod` minimum) to 1.26.4, picking
-  up the standard-library security fixes GO-2026-5037 (`crypto/x509`
-  hostname parsing) and GO-2026-5039 (`net/textproto`). Consumers now
-  require Go ≥ 1.26.4.
+## v0.5.0 — 2026-06-10
 
 ### Added
 
+- New `authcode` package: an RFC 8252 OAuth 2.0 Authorization Code Grant
+  client for native apps, using PKCE (RFC 7636, S256) and a loopback
+  redirect. `Client.Start` binds a `127.0.0.1` listener and returns a
+  `Flow` with the browser `AuthorizationURL`; `Flow.Wait` blocks for the
+  redirect and returns the authorization code; `Flow.Exchange` redeems it
+  at the token endpoint for a `tokens.TokenSet`. Opening the browser stays
+  the caller's responsibility, as with `deviceflow`. Exposes
+  `ErrAccessDenied`, `ErrInvalidGrant`, `ErrMissingCode`,
+  `ErrListenerClosed`, `ErrAuthorizeQuery` (a query on `AuthorizePath` is
+  rejected rather than silently overwritten by the OAuth query), and
+  re-exports `ErrInsecureBaseURL` / `ErrAbsolutePath`.
+  The first matching-state callback is terminal (a later forged success
+  can't displace a genuine denial), and `Flow` redacts its PKCE verifier
+  and CSRF state from `fmt` output like the other secret-bearing types.
+  The loopback callback's browser page ("Signed in" / "Sign-in failed")
+  is styled to match entire-core's CLI login pages — Marvin logo, card
+  layout, light/dark via `prefers-color-scheme` — while staying a single
+  self-contained response: no scripts, no external resources.
 - `sts.ExchangeError` — a typed error returned by `Client.Exchange` when
   the token endpoint replies with a structured RFC 6749 OAuth error.
   Exposes the parsed `Code`, `Description`, and `StatusCode` so callers
@@ -19,6 +32,13 @@
   renders the same string as before, so message-matching callers are
   unaffected; non-OAuth failures (network errors, non-JSON bodies) remain
   plain wrapped errors.
+
+### Changed
+
+- Bumped the Go toolchain (and the `go.mod` minimum) to 1.26.4, picking
+  up the standard-library security fixes GO-2026-5037 (`crypto/x509`
+  hostname parsing) and GO-2026-5039 (`net/textproto`). Consumers now
+  require Go ≥ 1.26.4.
 
 ## v0.4.0 — 2026-05-28
 
