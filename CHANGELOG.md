@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+### Changed
+
+- `authcode`: the loopback callback's browser page ("Signed in" / "Sign-in
+  failed") is now styled to match entire-core's CLI login pages — Marvin
+  logo, card layout, light/dark via `prefers-color-scheme`. Still a single
+  self-contained response: no scripts, no external resources.
+
 ## v0.5.0 — 2026-06-09
 
 ### Added

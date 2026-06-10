@@ -459,6 +459,29 @@ func TestHandleCallback_SignalsBeforeWritingPage(t *testing.T) {
 	<-done
 }
 
+func TestWriteBrowserPage_RendersEscapedTitleAndMessage(t *testing.T) {
+	t.Parallel()
+
+	rec := httptest.NewRecorder()
+	writeBrowserPage(rec, http.StatusBadRequest, "Sign-in <failed>", "Go back & retry.")
+
+	if rec.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want %d", rec.Code, http.StatusBadRequest)
+	}
+	if ct := rec.Header().Get("Content-Type"); ct != "text/html; charset=utf-8" {
+		t.Errorf("Content-Type = %q, want text/html", ct)
+	}
+	body := rec.Body.String()
+	for _, want := range []string{"Sign-in &lt;failed&gt;", "Go back &amp; retry.", `class="marvin"`} {
+		if !strings.Contains(body, want) {
+			t.Errorf("body missing %q", want)
+		}
+	}
+	if strings.Contains(body, "{{") {
+		t.Error("body contains an unreplaced placeholder")
+	}
+}
+
 // TestFlow_StringRedactsSecrets ensures fmt verbs that callers reach for
 // (%v, %+v, %#v) can't leak the live PKCE verifier or CSRF state.
 func TestFlow_StringRedactsSecrets(t *testing.T) {

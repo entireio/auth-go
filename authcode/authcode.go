@@ -30,6 +30,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"html"
 	"io"
 	"net"
 	"net/http"
@@ -692,14 +693,98 @@ func randomB64URL(nbytes int) (string, error) {
 	return base64.RawURLEncoding.EncodeToString(buf), nil
 }
 
-// writeBrowserPage renders a minimal self-contained HTML page for the user
-// who just completed (or failed) consent in their browser. Kept tiny and
-// dependency-free; the real UX is back in the terminal.
+// browserPageHTML is the page shown to the user who just completed (or
+// failed) consent in their browser. Styled to match entire-core's CLI
+// login pages (Marvin logo, card layout, light/dark via a
+// prefers-color-scheme media query) so the whole login reads as one flow,
+// but still self-contained: no scripts, no external resources — the real
+// UX is back in the terminal.
+const browserPageHTML = `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>{{title}} — Entire CLI</title>
+<style>
+  :root {
+    --surface-base: #fafafa;
+    --surface-raised: #ffffff;
+    --text-default: #161616;
+    --text-muted: #5d5d5d;
+    --border-card: rgb(10 10 10 / 0.06);
+    --font-headline: ui-sans-serif, system-ui, sans-serif;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --surface-base: #0c0c0c;
+      --surface-raised: #181818;
+      --text-default: #ebebeb;
+      --text-muted: #aeaeae;
+      --border-card: rgb(250 250 250 / 0.05);
+    }
+  }
+
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    min-height: 100vh;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 1.5rem;
+    background: var(--surface-base);
+    color: var(--text-default);
+    font-family: var(--font-headline);
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
+  .card {
+    width: 100%;
+    max-width: 28rem;
+    border: 1px solid var(--border-card);
+    background: var(--surface-raised);
+    padding: 2.5rem 2rem;
+    text-align: center;
+  }
+  .marvin { display: block; margin: 0 auto 1.25rem; color: var(--text-default); }
+  h1 { margin: 0 0 0.5rem; font-size: 1.5rem; font-weight: 600; line-height: 1.25; }
+  .note { margin: 0; color: var(--text-muted); font-size: 0.95rem; line-height: 1.5; }
+</style>
+</head>
+<body>
+<div class="card">
+  <svg class="marvin" width="44" height="44" viewBox="0 0 32 32" fill="currentColor" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+    <path d="M17.6.22c1.61-.43,3.33-.21,4.77.61l7.47,4.25c.31.18.25.64-.09.73l-16.75,4.49c-1.69.45-2.69,2.19-2.24,3.88l.82,3.06c.45,1.69,2.19,2.69,3.88,2.24l9.57-2.5,4.61,4.74c.89.89,1.39,2.1,1.39,3.36v2.54c0,1.65-1.27,3.03-2.92,3.16l-15.61,1.2c-1.85.14-3.67-.53-4.98-1.85l-5.11-5.14c-.88-.89-1.38-2.09-1.38-3.35v-2.55c0-1.65,1.5-3.08,3-3.08h2l-3.85-3.04c-.6-.43-1.04-1.05-1.23-1.76l-.81-3.03c-.45-1.69.55-3.43,2.24-3.88L17.6.22Z" />
+    <g transform="rotate(-18.8 17.52 13.94)">
+      <ellipse cx="17.52" cy="13.94" rx="2.5" ry="2.5">
+        <animate attributeName="ry" values="2.5;2.5;0.1;0.1;2.5" keyTimes="0;0.9231;0.9538;0.9615;1" calcMode="spline" keySplines="0 0 1 1;0.4 0 0.2 1;0 0 1 1;0 0.5 0.4 1" dur="3.25s" repeatCount="indefinite" />
+      </ellipse>
+    </g>
+    <g transform="rotate(-18.8 25.52 11.94)">
+      <ellipse cx="25.52" cy="11.94" rx="2.5" ry="2.5">
+        <animate attributeName="ry" values="2.5;2.5;0.1;0.1;2.5" keyTimes="0;0.9231;0.9538;0.9615;1" calcMode="spline" keySplines="0 0 1 1;0.4 0 0.2 1;0 0 1 1;0 0.5 0.4 1" dur="3.25s" repeatCount="indefinite" />
+      </ellipse>
+    </g>
+  </svg>
+  <h1>{{title}}</h1>
+  <p class="note">{{message}}</p>
+</div>
+</body>
+</html>
+`
+
+// writeBrowserPage renders browserPageHTML with the given title and
+// message. Both are HTML-escaped even though current callers only pass
+// constants — the escaping is what keeps that a local invariant rather
+// than a load-bearing one.
 func writeBrowserPage(w http.ResponseWriter, status int, title, message string) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-store")
 	w.WriteHeader(status)
-	_, _ = io.WriteString(w, "<!doctype html><html><head><meta charset=\"utf-8\"><title>"+
-		title+"</title></head><body style=\"font-family:system-ui,sans-serif;text-align:center;padding:3rem\">"+
-		"<h1>"+title+"</h1><p>"+message+"</p></body></html>")
+	page := strings.NewReplacer(
+		"{{title}}", html.EscapeString(title),
+		"{{message}}", html.EscapeString(message),
+	).Replace(browserPageHTML)
+	_, _ = io.WriteString(w, page)
 }
