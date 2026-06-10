@@ -2,14 +2,7 @@
 
 ## Unreleased
 
-### Changed
-
-- `authcode`: the loopback callback's browser page ("Signed in" / "Sign-in
-  failed") is now styled to match entire-core's CLI login pages — Marvin
-  logo, card layout, light/dark via `prefers-color-scheme`. Still a single
-  self-contained response: no scripts, no external resources.
-
-## v0.5.0 — 2026-06-09
+## v0.5.0 — 2026-06-10
 
 ### Added
 
@@ -27,6 +20,10 @@
   The first matching-state callback is terminal (a later forged success
   can't displace a genuine denial), and `Flow` redacts its PKCE verifier
   and CSRF state from `fmt` output like the other secret-bearing types.
+  The loopback callback's browser page ("Signed in" / "Sign-in failed")
+  is styled to match entire-core's CLI login pages — Marvin logo, card
+  layout, light/dark via `prefers-color-scheme` — while staying a single
+  self-contained response: no scripts, no external resources.
 - `sts.ExchangeError` — a typed error returned by `Client.Exchange` when
   the token endpoint replies with a structured RFC 6749 OAuth error.
   Exposes the parsed `Code`, `Description`, and `StatusCode` so callers
