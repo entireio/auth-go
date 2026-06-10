@@ -561,3 +561,20 @@ func TestStart_RejectsInsecureBaseURL(t *testing.T) {
 		t.Fatalf("Start() error = %v, want ErrInsecureBaseURL", err)
 	}
 }
+
+func TestStart_RejectsAuthorizePathQuery(t *testing.T) {
+	t.Parallel()
+
+	// A query on AuthorizePath would be silently overwritten by the OAuth
+	// query the client builds, dropping whatever the caller intended
+	// (audience, resource, access_type, ...). Start must fail loud instead.
+	c := &Client{
+		BaseURL:       "https://auth.example.com",
+		ClientID:      testClientID,
+		AuthorizePath: testAuthorizePath + "?audience=https://api.example.com",
+		TokenPath:     testTokenPath,
+	}
+	if _, err := c.Start(context.Background()); !errors.Is(err, ErrAuthorizeQuery) {
+		t.Fatalf("Start() error = %v, want ErrAuthorizeQuery", err)
+	}
+}

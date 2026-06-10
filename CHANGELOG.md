@@ -14,7 +14,9 @@
   at the token endpoint for a `tokens.TokenSet`. Opening the browser stays
   the caller's responsibility, as with `deviceflow`. Exposes
   `ErrAccessDenied`, `ErrInvalidGrant`, `ErrMissingCode`,
-  `ErrListenerClosed`, and re-exports `ErrInsecureBaseURL` / `ErrAbsolutePath`.
+  `ErrListenerClosed`, `ErrAuthorizeQuery` (a query on `AuthorizePath` is
+  rejected rather than silently overwritten by the OAuth query), and
+  re-exports `ErrInsecureBaseURL` / `ErrAbsolutePath`.
   The first matching-state callback is terminal (a later forged success
   can't displace a genuine denial), and `Flow` redacts its PKCE verifier
   and CSRF state from `fmt` output like the other secret-bearing types.

@@ -104,6 +104,14 @@ var (
 	// ErrListenerClosed — the loopback listener stopped before any
 	// callback arrived (e.g. Close was called concurrently). Terminal.
 	ErrListenerClosed = errors.New("loopback listener closed before callback arrived")
+
+	// ErrAuthorizeQuery — AuthorizePath carries query parameters. The client
+	// owns the authorization request's query string (response_type, client_id,
+	// redirect_uri, the PKCE challenge, state, scope) and sets it wholesale, so
+	// a query on the configured path would be silently discarded. Rather than
+	// drop it — and issue a request missing whatever the caller intended
+	// (audience, resource, access_type, a tenant hint) — Start fails loud.
+	ErrAuthorizeQuery = errors.New("AuthorizePath must not carry query parameters")
 )
 
 // ErrInsecureBaseURL is re-exported from internal/oauthhttp so callers
@@ -381,6 +389,12 @@ func (c *Client) authorizationURL(redirectURI, challenge, state string) (string,
 	u, err := url.Parse(endpoint)
 	if err != nil {
 		return "", fmt.Errorf("parse authorize URL: %w", err)
+	}
+	// We overwrite u.RawQuery below, so any query already on the resolved
+	// endpoint (i.e. configured on AuthorizePath) would vanish without trace.
+	// Reject it instead of silently dropping caller-intended parameters.
+	if u.RawQuery != "" {
+		return "", fmt.Errorf("%w: got %q", ErrAuthorizeQuery, c.AuthorizePath)
 	}
 	q := url.Values{}
 	q.Set("response_type", "code")
