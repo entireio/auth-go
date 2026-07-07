@@ -396,6 +396,63 @@ func (m *Manager) Refresh(ctx context.Context) (string, error) {
 	return m.ensureFreshLogin(ctx)
 }
 
+// ForceRefresh re-mints the login JWT via the refresh grant even when the
+// stored one has not yet expired locally. Use it from a reactive 401 path:
+// the server has rejected staleToken despite a live-looking exp claim
+// (signing-key rotation, revocation ahead of expiry), so local expiry is not
+// trustworthy and Refresh — whose fast path returns any locally-unexpired
+// token — would hand back the same rejected JWT.
+//
+// staleToken is the access token the caller just had rejected. After
+// acquiring refreshMu and the cross-process lock (the same gates as
+// Refresh's re-mint path) the store is re-read: if it now holds a different,
+// locally-live token, a cooperating peer already re-minted while we waited
+// for the locks, and that token is returned WITHOUT running a grant. This is
+// the anti-stampede property — N goroutines/processes reacting to the same
+// 401 coalesce onto a single grant instead of burning N rotations. If the
+// store still holds staleToken (or a locally-expired successor), the grant
+// runs via the same path as Refresh, sharing its persist-retry and
+// invalid_grant/rotation-race semantics.
+//
+// staleToken == "" is an unconditional forced re-mint: there is nothing to
+// compare against, so the peer check is skipped and the grant always runs
+// (still under both locks, and still granting from a fresh store re-read of
+// the refresh token). Concurrent callers doing this each burn a rotation, so
+// prefer passing the rejected token when you have it.
+//
+// Sentinels match Refresh: ErrNotLoggedIn when no credential (or no refresh
+// token) is stored, ErrReauthRequired when the refresh token itself is
+// revoked/expired. Persist failures wrap ErrPersistFailed.
+func (m *Manager) ForceRefresh(ctx context.Context, staleToken string) (string, error) {
+	m.refreshMu.Lock()
+	defer m.refreshMu.Unlock()
+
+	release, err := m.processLock().Acquire(ctx)
+	if err != nil {
+		return "", fmt.Errorf("force refresh: acquire lock: %w", err)
+	}
+	defer release()
+
+	if staleToken != "" {
+		set, ok, err := m.loadTokenSet()
+		if err != nil {
+			return "", err
+		}
+		if !ok {
+			return "", ErrNotLoggedIn
+		}
+		if set.AccessToken != "" && set.AccessToken != staleToken &&
+			!coreTokenExpired(set.AccessToken, m.now()) {
+			// A cooperating peer already re-minted while we waited for the
+			// locks; its token is what the server currently expects. A
+			// differing but locally-expired token falls through to the grant
+			// instead — returning it would just earn another 401.
+			return set.AccessToken, nil
+		}
+	}
+	return m.doRefresh(ctx)
+}
+
 // DeleteCoreToken removes the stored core token and any cached exchanges
 // derived from it.
 //
@@ -754,8 +811,9 @@ func (m *Manager) loadTokenSet() (set tokens.TokenSet, ok bool, err error) {
 
 // doRefresh runs the refresh_token grant for the currently stored refresh
 // token and persists the rotated result. Assumes the caller holds both the
-// in-process mutex and the cross-process lock and has already confirmed the
-// stored login JWT is expired with a refresh token present.
+// in-process mutex and the cross-process lock, and has decided a re-mint is
+// warranted (refreshLocked: the stored login JWT is expired; ForceRefresh:
+// the server rejected it regardless of local expiry).
 //
 // On invalid_grant it re-reads the store: if the refresh token changed
 // (a non-cooperating actor rotated it under us) it retries once with the

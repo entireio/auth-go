@@ -2,6 +2,24 @@
 
 ## Unreleased
 
+## v0.5.2 — 2026-07-07
+
+### Added
+
+- `tokenmanager.Manager.ForceRefresh(ctx, staleToken)` — re-mints the login
+  JWT via the refresh grant even when the stored one has not expired
+  locally. For reactive 401 paths: when the server rejects a token whose
+  `exp` still looks live (signing-key rotation, revocation ahead of
+  expiry), `Refresh`'s fast path would return the same rejected token.
+  Under the usual refresh + process locks the store is re-read first: if it
+  already holds a different, locally-live token, a cooperating peer
+  re-minted while we waited and that token is returned with no grant
+  (anti-stampede — concurrent reactions to the same 401 coalesce onto one
+  rotation). `staleToken == ""` skips the peer check and forces the grant
+  unconditionally. Sentinels match `Refresh` (`ErrNotLoggedIn`,
+  `ErrReauthRequired`; persist failures wrap `ErrPersistFailed`).
+  `Refresh`'s fast path is unchanged.
+
 ## v0.5.1 — 2026-07-07
 
 ### Fixed
