@@ -840,12 +840,15 @@ func (m *Manager) persistRefreshed(prev tokens.TokenSet, res *tokens.TokenSet) e
 	// Re-entering them here would self-deadlock.
 	var lastErr error
 	for attempt := 1; attempt <= persistMaxAttempts; attempt++ {
-		if err := m.saveCoreTokenLocked(merged); err == nil {
+		err := m.saveCoreTokenLocked(merged)
+		if err == nil {
 			return nil
-		} else {
-			lastErr = err
 		}
+		lastErr = err
 		if attempt < persistMaxAttempts {
+			// Deliberately not context-aware: total backoff is bounded
+			// (~200ms) and we're inside the held refresh critical section,
+			// so plumbing ctx through isn't worth it.
 			m.sleep(persistRetryBackoff)
 		}
 	}
