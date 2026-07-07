@@ -646,6 +646,180 @@ func TestRefresh_ExportedReMintsWhenExpired(t *testing.T) {
 	}
 }
 
+// TestForceRefresh_ReMintsLocallyLiveToken pins the reason ForceRefresh
+// exists: the server rejected a token whose exp hasn't passed locally
+// (signing-key rotation, revocation ahead of expiry). Refresh's fast path
+// returns the same rejected token; ForceRefresh must run the grant.
+func TestForceRefresh_ReMintsLocallyLiveToken(t *testing.T) {
+	t.Parallel()
+	rejected := freshJWT(t) // locally live, server-side dead
+	store := newMemStore()
+	store.data[testIssuer] = tokens.TokenSet{AccessToken: rejected, RefreshToken: "rt-1"}
+	m, _ := New(Config{Issuer: testIssuer, ClientID: testClientID, RefreshPath: "/p", Store: store})
+
+	grants := 0
+	reminted := makeJWTWithExp(t, time.Date(2098, 1, 1, 0, 0, 0, 0, time.UTC), nil)
+	SetRefreshForTest(t, m, func(_ context.Context, req refresh.Request) (*tokens.TokenSet, error) {
+		grants++
+		if req.RefreshToken != "rt-1" {
+			t.Errorf("grant used RT %q, want rt-1", req.RefreshToken)
+		}
+		return &tokens.TokenSet{AccessToken: reminted, RefreshToken: "rt-2"}, nil
+	})
+
+	// Refresh sees a locally-live token and (correctly, for its contract)
+	// returns it without a grant — this is exactly the reactive-401 gap.
+	if got, err := m.Refresh(context.Background()); err != nil || got != rejected {
+		t.Fatalf("Refresh = (%q, %v), want the stored token / nil", got, err)
+	}
+	if grants != 0 {
+		t.Fatalf("grants after Refresh = %d, want 0", grants)
+	}
+
+	got, err := m.ForceRefresh(context.Background(), rejected)
+	if err != nil {
+		t.Fatalf("ForceRefresh: %v", err)
+	}
+	if got != reminted || grants != 1 {
+		t.Fatalf("ForceRefresh = %q after %d grants, want re-minted token after 1", got, grants)
+	}
+	if saved := store.data[testIssuer]; saved.AccessToken != reminted || saved.RefreshToken != "rt-2" {
+		t.Fatalf("persisted %q / %q, want reminted / rt-2", saved.AccessToken, saved.RefreshToken)
+	}
+}
+
+// TestForceRefresh_PeerAlreadyReMintedSkipsGrant pins the anti-stampede
+// property: if the store already holds a different, locally-live token by the
+// time the locks are acquired, a cooperating peer re-minted first and
+// ForceRefresh returns that token without burning another rotation.
+func TestForceRefresh_PeerAlreadyReMintedSkipsGrant(t *testing.T) {
+	t.Parallel()
+	rejected := freshJWT(t)
+	peerMinted := makeJWTWithExp(t, time.Date(2098, 1, 1, 0, 0, 0, 0, time.UTC), nil)
+	store := newMemStore()
+	store.data[testIssuer] = tokens.TokenSet{AccessToken: peerMinted, RefreshToken: "rt-2"}
+	m, _ := New(Config{Issuer: testIssuer, ClientID: testClientID, RefreshPath: "/p", Store: store})
+
+	SetRefreshForTest(t, m, func(_ context.Context, _ refresh.Request) (*tokens.TokenSet, error) {
+		t.Fatal("grant must not run when a peer already re-minted")
+		return nil, errors.New("unreachable")
+	})
+
+	got, err := m.ForceRefresh(context.Background(), rejected)
+	if err != nil || got != peerMinted {
+		t.Fatalf("ForceRefresh = (%q, %v), want peer-minted token / nil", got, err)
+	}
+}
+
+// TestForceRefresh_ExpiredPeerTokenStillGrants pins the peer-check guard:
+// a stored token that differs from staleToken but is locally expired is not
+// good enough — returning it would just earn another 401, so the grant runs.
+func TestForceRefresh_ExpiredPeerTokenStillGrants(t *testing.T) {
+	t.Parallel()
+	store := newMemStore()
+	store.data[testIssuer] = tokens.TokenSet{AccessToken: expiredJWT(t), RefreshToken: "rt-1"}
+	m, _ := New(Config{Issuer: testIssuer, ClientID: testClientID, RefreshPath: "/p", Store: store})
+
+	fresh := freshJWT(t)
+	grants := 0
+	SetRefreshForTest(t, m, func(_ context.Context, _ refresh.Request) (*tokens.TokenSet, error) {
+		grants++
+		return &tokens.TokenSet{AccessToken: fresh, RefreshToken: "rt-2"}, nil
+	})
+
+	got, err := m.ForceRefresh(context.Background(), "some-other-rejected-token")
+	if err != nil || got != fresh {
+		t.Fatalf("ForceRefresh = (%q, %v), want re-minted token / nil", got, err)
+	}
+	if grants != 1 {
+		t.Fatalf("grants = %d, want 1 (expired store token must not satisfy the peer check)", grants)
+	}
+}
+
+// TestForceRefresh_EmptyStaleTokenAlwaysGrants pins the documented ""
+// semantics: no comparator means no peer check — an unconditional forced
+// re-mint even when the stored token is locally live.
+func TestForceRefresh_EmptyStaleTokenAlwaysGrants(t *testing.T) {
+	t.Parallel()
+	store := newMemStore()
+	store.data[testIssuer] = tokens.TokenSet{AccessToken: freshJWT(t), RefreshToken: "rt-1"}
+	m, _ := New(Config{Issuer: testIssuer, ClientID: testClientID, RefreshPath: "/p", Store: store})
+
+	reminted := makeJWTWithExp(t, time.Date(2098, 1, 1, 0, 0, 0, 0, time.UTC), nil)
+	grants := 0
+	SetRefreshForTest(t, m, func(_ context.Context, _ refresh.Request) (*tokens.TokenSet, error) {
+		grants++
+		return &tokens.TokenSet{AccessToken: reminted, RefreshToken: "rt-2"}, nil
+	})
+
+	got, err := m.ForceRefresh(context.Background(), "")
+	if err != nil || got != reminted {
+		t.Fatalf("ForceRefresh = (%q, %v), want re-minted token / nil", got, err)
+	}
+	if grants != 1 {
+		t.Fatalf("grants = %d, want 1 (empty staleToken forces the grant)", grants)
+	}
+}
+
+// TestForceRefresh_TerminalInvalidGrantIsReauth pins sentinel parity with
+// Refresh: a genuinely dead refresh token surfaces as ErrReauthRequired.
+func TestForceRefresh_TerminalInvalidGrantIsReauth(t *testing.T) {
+	t.Parallel()
+	rejected := freshJWT(t)
+	store := newMemStore()
+	store.data[testIssuer] = tokens.TokenSet{AccessToken: rejected, RefreshToken: "rt-1"}
+	m, _ := New(Config{Issuer: testIssuer, ClientID: testClientID, RefreshPath: "/p", Store: store})
+
+	SetRefreshForTest(t, m, func(_ context.Context, _ refresh.Request) (*tokens.TokenSet, error) {
+		return nil, refresh.ErrInvalidGrant
+	})
+
+	if _, err := m.ForceRefresh(context.Background(), rejected); !errors.Is(err, ErrReauthRequired) {
+		t.Fatalf("err = %v, want ErrReauthRequired", err)
+	}
+}
+
+// TestForceRefresh_NoCredentialIsNotLoggedIn pins sentinel parity for the
+// missing-credential case, on both the peer-check and the ""-path.
+func TestForceRefresh_NoCredentialIsNotLoggedIn(t *testing.T) {
+	t.Parallel()
+	m, _ := New(Config{Issuer: testIssuer, ClientID: testClientID, RefreshPath: "/p", Store: newMemStore()})
+
+	if _, err := m.ForceRefresh(context.Background(), "whatever"); !errors.Is(err, ErrNotLoggedIn) {
+		t.Fatalf("err = %v, want ErrNotLoggedIn (peer-check path)", err)
+	}
+	if _, err := m.ForceRefresh(context.Background(), ""); !errors.Is(err, ErrNotLoggedIn) {
+		t.Fatalf("err = %v, want ErrNotLoggedIn (unconditional path)", err)
+	}
+}
+
+// TestForceRefresh_AcquiresAndReleasesLock pins that the whole operation runs
+// under the cross-process lock, acquired and released exactly once.
+func TestForceRefresh_AcquiresAndReleasesLock(t *testing.T) {
+	t.Parallel()
+	rejected := freshJWT(t)
+	store := newMemStore()
+	store.data[testIssuer] = tokens.TokenSet{AccessToken: rejected, RefreshToken: "rt-1"}
+	m, _ := New(Config{Issuer: testIssuer, ClientID: testClientID, RefreshPath: "/p", Store: store})
+
+	lock := &recordingLock{}
+	SetProcessLockForTest(t, m, lock)
+	SetRefreshForTest(t, m, func(_ context.Context, _ refresh.Request) (*tokens.TokenSet, error) {
+		// The grant runs while the lock is held.
+		if a, r := lock.counts(); a != 1 || r != 0 {
+			t.Errorf("mid-grant lock acquired=%d released=%d, want 1/0", a, r)
+		}
+		return &tokens.TokenSet{AccessToken: makeJWTWithExp(t, time.Date(2098, 1, 1, 0, 0, 0, 0, time.UTC), nil), RefreshToken: "rt-2"}, nil
+	})
+
+	if _, err := m.ForceRefresh(context.Background(), rejected); err != nil {
+		t.Fatalf("ForceRefresh: %v", err)
+	}
+	if a, r := lock.counts(); a != 1 || r != 1 {
+		t.Fatalf("lock acquired=%d released=%d, want 1/1", a, r)
+	}
+}
+
 // errAcquireLock is a ProcessLock whose Acquire always fails, exercising
 // refreshLocked's lock-acquisition error path.
 type errAcquireLock struct{ err error }
