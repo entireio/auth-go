@@ -2,6 +2,32 @@
 
 ## Unreleased
 
+### Fixed
+
+- `tokenmanager` now retries persisting rotated credentials after a
+  successful refresh grant (up to 3 attempts with a short backoff) instead
+  of discarding them on the first `Store.SaveTokens` failure. The refresh
+  grant is single-use: the server rotates and thereby consumes the previous
+  refresh token, so a dropped save previously left the store holding a dead
+  predecessor and guaranteed the session would fail at the next refresh
+  (observed as forced re-logins after a transient keyring hiccup). The
+  refresh + process locks are held across all attempts, so no peer can read
+  the stale predecessor mid-retry.
+
+### Added
+
+- `tokenmanager.ErrPersistFailed` — a sentinel wrapped into the error
+  returned when a refresh grant succeeded but persisting the rotated
+  credentials failed on every retry. Callers can `errors.Is` it to detect
+  the doomed-session case (the rotation was consumed server-side, so the
+  session needs an interactive re-login) and distinguish it from ordinary
+  transport/grant failures. In this case the access token is deliberately
+  NOT returned: a working command that hides a session guaranteed to die at
+  the next refresh is worse than a loud failure now.
+- `tokenmanager.SetSleepForTest` — a test seam (mirroring the existing
+  `SetNowForTest` / `SetRefreshForTest` idiom, requiring a `testing.TB`)
+  that drives the persist-retry backoff without real wall-clock sleeps.
+
 ## v0.5.0 — 2026-06-10
 
 ### Added
