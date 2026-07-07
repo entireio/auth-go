@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v0.5.2 — 2026-07-07
+
 ### Added
 
 - `tokenmanager.Manager.ForceRefresh(ctx, staleToken)` — re-mints the login
