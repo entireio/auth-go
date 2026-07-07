@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v0.5.1 — 2026-07-07
+
 ### Fixed
 
 - `tokenmanager` now retries persisting rotated credentials after a
