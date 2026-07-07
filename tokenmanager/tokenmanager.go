@@ -72,6 +72,29 @@ var ErrReauthRequired = errors.New("reauthentication required")
 // Config.RefreshPath is empty. Mirrors ErrNoSTSPath.
 var ErrNoRefreshPath = errors.New("refresh required but Config.RefreshPath is empty")
 
+// ErrPersistFailed is wrapped into the error returned when a refresh grant
+// succeeded (the server rotated and thereby consumed the previous refresh
+// token) but persisting the rotated credentials to the Store failed on every
+// retry. Callers can match on it with errors.Is to distinguish this
+// doomed-session case — the store still holds the now-consumed predecessor,
+// so the session will fail at the next refresh and needs an interactive
+// re-login — from ordinary transport/grant failures. The token is NOT
+// returned in this case (see persistRefreshed): a working command that hides
+// a session guaranteed to die at the next refresh is worse than a loud
+// failure now.
+var ErrPersistFailed = errors.New("refresh: rotated credentials could not be persisted; session will require re-login")
+
+// persistMaxAttempts bounds how many times persistRefreshed tries to save the
+// rotated credentials after a successful grant. The refresh + process locks
+// are held across all attempts, so a peer can't read the stale predecessor
+// token mid-retry. persistRetryBackoff is the (fixed, short) pause between
+// attempts; kept small because the whole point is to ride out a transient
+// keyring hiccup, not to wait out a long outage.
+const (
+	persistMaxAttempts  = 3
+	persistRetryBackoff = 100 * time.Millisecond
+)
+
 // Config configures a Manager.
 type Config struct {
 	// Issuer is the auth host base URL where the device-flow login
@@ -181,6 +204,7 @@ type ProcessLock interface {
 }
 
 type refreshFunc func(ctx context.Context, req refresh.Request) (*tokens.TokenSet, error)
+type sleepFuncType func(ctx context.Context, d time.Duration) error
 
 // Manager orchestrates core-token storage and STS exchanges. Safe for
 // concurrent use.
@@ -208,6 +232,10 @@ type Manager struct {
 	refreshOverride atomic.Pointer[refreshFunc]
 	lockOverride    atomic.Pointer[ProcessLock]
 
+	// sleepOverride lets tests drive the persist-retry backoff without real
+	// wall-clock sleeps (and assert on/observe it). See SetSleepForTest.
+	sleepOverride atomic.Pointer[sleepFuncType]
+
 	lockOnce    sync.Once
 	defaultLock ProcessLock
 }
@@ -219,6 +247,23 @@ func (m *Manager) now() time.Time {
 		return (*p)()
 	}
 	return time.Now()
+}
+
+// sleep pauses for d or until ctx is done, whichever comes first, returning
+// ctx.Err() on cancellation and nil after a full sleep. Used only for the
+// persist-retry backoff; tests replace it via SetSleepForTest.
+func (m *Manager) sleep(ctx context.Context, d time.Duration) error {
+	if p := m.sleepOverride.Load(); p != nil {
+		return (*p)(ctx, d)
+	}
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err() //nolint:wrapcheck // callers want the bare ctx error
+	case <-t.C:
+		return nil
+	}
 }
 
 // New builds a Manager from cfg. Returns an error when required
@@ -729,7 +774,7 @@ func (m *Manager) doRefresh(ctx context.Context) (string, error) {
 
 	res, err := m.runRefresh(ctx, sent)
 	if err == nil {
-		if perr := m.persistRefreshed(set, res); perr != nil {
+		if perr := m.persistRefreshed(ctx, set, res); perr != nil {
 			return "", perr
 		}
 		return res.AccessToken, nil
@@ -754,7 +799,7 @@ func (m *Manager) doRefresh(ctx context.Context) (string, error) {
 		// A non-cooperating actor rotated the RT under us; retry once.
 		res, err = m.runRefresh(ctx, cur.RefreshToken)
 		if err == nil {
-			if perr := m.persistRefreshed(cur, res); perr != nil {
+			if perr := m.persistRefreshed(ctx, cur, res); perr != nil {
 				return "", perr
 			}
 			return res.AccessToken, nil
@@ -772,7 +817,29 @@ func (m *Manager) doRefresh(ctx context.Context) (string, error) {
 // the prior values. The new login JWT and ExpiresAt always replace.
 // SaveCoreToken clears the in-process exchange cache as a side effect, so
 // the next Token() re-exchanges against the new login JWT.
-func (m *Manager) persistRefreshed(prev tokens.TokenSet, res *tokens.TokenSet) error {
+//
+// The save is retried up to persistMaxAttempts times with a short backoff:
+// the grant already rotated (and so consumed) the previous refresh token
+// server-side, so a dropped save leaves the store holding a dead predecessor
+// and dooms the session at the next refresh — worth a few retries to ride
+// out a transient keyring hiccup (the entire CLI bounds keyring calls at 5s).
+// The refresh + process locks are held by our caller across every attempt,
+// so no peer can read the stale predecessor and fire its own grant mid-retry.
+//
+// If every attempt fails the rotation still stands server-side, so we do NOT
+// hand back the (working) access token: that would let the current command
+// succeed while hiding a session guaranteed to die at the next refresh.
+// Instead we return an error wrapping ErrPersistFailed so callers can detect
+// the doomed-session case and prompt an interactive re-login.
+//
+// The backoff is context-aware, with one deliberate wrinkle: if ctx is
+// cancelled mid-backoff, the grant has ALREADY succeeded — the rotation is
+// consumed server-side — so abandoning the persist outright would recreate
+// the exact lost-rotation bug this retry loop exists to fix. Cancellation
+// therefore triggers one final immediate save attempt (no sleep); only if
+// that also fails do we return, wrapping ErrPersistFailed, the store error,
+// and ctx.Err() so callers can see both what failed and why we stopped.
+func (m *Manager) persistRefreshed(ctx context.Context, prev tokens.TokenSet, res *tokens.TokenSet) error {
 	merged := *res
 	if merged.RefreshToken == "" {
 		merged.RefreshToken = prev.RefreshToken
@@ -786,10 +853,27 @@ func (m *Manager) persistRefreshed(prev tokens.TokenSet, res *tokens.TokenSet) e
 	// saveCoreTokenLocked (NOT SaveCoreToken) — persistRefreshed runs from
 	// inside refreshLocked, which already holds refreshMu + processLock.
 	// Re-entering them here would self-deadlock.
-	if err := m.saveCoreTokenLocked(merged); err != nil {
-		return fmt.Errorf("refresh: persist: %w", err)
+	var lastErr error
+	for attempt := 1; attempt <= persistMaxAttempts; attempt++ {
+		err := m.saveCoreTokenLocked(merged)
+		if err == nil {
+			return nil
+		}
+		lastErr = err
+		if attempt < persistMaxAttempts {
+			if ctxErr := m.sleep(ctx, persistRetryBackoff); ctxErr != nil {
+				// Cancelled mid-backoff. The rotation is already consumed
+				// server-side, so make one last immediate attempt before
+				// giving up (see the function comment).
+				err := m.saveCoreTokenLocked(merged)
+				if err == nil {
+					return nil
+				}
+				return fmt.Errorf("%w (cancelled during retry backoff: %w): %w", ErrPersistFailed, ctxErr, err)
+			}
+		}
 	}
-	return nil
+	return fmt.Errorf("%w (after %d attempts): %w", ErrPersistFailed, persistMaxAttempts, lastErr)
 }
 
 // ensureFreshLogin returns a usable login JWT, transparently re-minting an

@@ -12,6 +12,7 @@ import (
 	"github.com/entireio/auth-go/refresh"
 	"github.com/entireio/auth-go/sts"
 	"github.com/entireio/auth-go/tokens"
+	"github.com/entireio/auth-go/tokenstore"
 )
 
 // TestDeleteCoreToken_SerializesWithInFlightRefresh pins the lock invariant
@@ -369,6 +370,12 @@ func (l *recordingLock) Acquire(_ context.Context) (func(), error) {
 	}, nil
 }
 
+func (l *recordingLock) counts() (acquired, released int) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.acquired, l.released
+}
+
 // syncStore is a mutex-guarded tokenstore.Store for the concurrency test.
 // memStore is a bare map; the coalescing test reads it on the fast path
 // while a peer writes it via SaveCoreToken, which would be a concurrent
@@ -674,20 +681,293 @@ func TestEnsureFreshLogin_LockAcquireFailureSurfaces(t *testing.T) {
 
 // TestDoRefresh_PersistFailureSurfaces pins that a keyring write failure
 // after a successful grant surfaces (rather than returning the new token as
-// if the rotated refresh token had been saved).
+// if the rotated refresh token had been saved). The failure is distinguishable
+// as ErrPersistFailed and still carries the underlying store error.
 func TestDoRefresh_PersistFailureSurfaces(t *testing.T) {
 	t.Parallel()
 	store := &erroringStore{inner: newMemStore(), saveErr: errors.New("keyring locked")}
 	store.inner.data[testIssuer] = tokens.TokenSet{AccessToken: expiredJWT(t), RefreshToken: "rt-1"}
 	m, _ := New(Config{Issuer: testIssuer, ClientID: testClientID, RefreshPath: "/p", Store: store})
+	SetSleepForTest(t, m, func(context.Context, time.Duration) error { return nil }) // don't actually back off
 
 	SetRefreshForTest(t, m, func(_ context.Context, _ refresh.Request) (*tokens.TokenSet, error) {
 		return &tokens.TokenSet{AccessToken: freshJWT(t), RefreshToken: "rt-2"}, nil
 	})
 
-	_, err := m.doRefresh(context.Background())
-	if err == nil || !strings.Contains(err.Error(), "keyring locked") {
-		t.Fatalf("err = %v, want persist error to surface", err)
+	tok, err := m.doRefresh(context.Background())
+	if !errors.Is(err, ErrPersistFailed) {
+		t.Fatalf("err = %v, want wrapped ErrPersistFailed", err)
+	}
+	if !strings.Contains(err.Error(), "keyring locked") {
+		t.Fatalf("err = %v, want underlying store error surfaced", err)
+	}
+	if tok != "" {
+		t.Fatalf("tok = %q, want empty (must not hand back a token on a doomed session)", tok)
+	}
+}
+
+// flakyStore fails its first failSaves SaveTokens calls, then behaves
+// normally. It counts save/load calls and guards all state with a mutex so
+// the retry/lock tests stay race-clean. Seed via data before use.
+type flakyStore struct {
+	mu        sync.Mutex
+	data      map[string]tokens.TokenSet
+	failSaves int
+	saveCalls int
+	loadCalls int
+}
+
+func newFlakyStore(failSaves int) *flakyStore {
+	return &flakyStore{data: map[string]tokens.TokenSet{}, failSaves: failSaves}
+}
+
+func (s *flakyStore) SaveTokens(profile string, t tokens.TokenSet) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.saveCalls++
+	if s.saveCalls <= s.failSaves {
+		return errors.New("keyring locked")
+	}
+	s.data[profile] = t
+	return nil
+}
+
+func (s *flakyStore) LoadTokens(profile string) (tokens.TokenSet, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.loadCalls++
+	t, ok := s.data[profile]
+	if !ok {
+		return tokens.TokenSet{}, tokenstore.ErrNotFound
+	}
+	return t, nil
+}
+
+func (s *flakyStore) DeleteTokens(profile string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.data, profile)
+	return nil
+}
+
+func (s *flakyStore) get(profile string) tokens.TokenSet {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.data[profile]
+}
+
+func (s *flakyStore) saves() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.saveCalls
+}
+
+// TestDoRefresh_PersistRetriesThenSucceeds pins that a transient keyring
+// failure is ridden out: the persist fails persistMaxAttempts-1 times then
+// succeeds, the fresh token is returned, and the store ends up holding the
+// rotated pair.
+func TestDoRefresh_PersistRetriesThenSucceeds(t *testing.T) {
+	t.Parallel()
+	store := newFlakyStore(persistMaxAttempts - 1) // fail all but the last
+	store.data[testIssuer] = tokens.TokenSet{AccessToken: expiredJWT(t), RefreshToken: "rt-1"}
+	m, _ := New(Config{Issuer: testIssuer, ClientID: testClientID, RefreshPath: "/p", Store: store})
+
+	var sleeps int
+	SetSleepForTest(t, m, func(context.Context, time.Duration) error { sleeps++; return nil })
+
+	fresh := freshJWT(t)
+	SetRefreshForTest(t, m, func(_ context.Context, _ refresh.Request) (*tokens.TokenSet, error) {
+		return &tokens.TokenSet{AccessToken: fresh, RefreshToken: "rt-2"}, nil
+	})
+
+	got, err := m.doRefresh(context.Background())
+	if err != nil {
+		t.Fatalf("doRefresh: %v", err)
+	}
+	if got != fresh {
+		t.Fatalf("returned %q, want fresh login JWT", got)
+	}
+	if saved := store.get(testIssuer); saved.AccessToken != fresh || saved.RefreshToken != "rt-2" {
+		t.Fatalf("persisted %q / %q, want fresh / rt-2", saved.AccessToken, saved.RefreshToken)
+	}
+	if store.saves() != persistMaxAttempts {
+		t.Fatalf("save attempts = %d, want %d", store.saves(), persistMaxAttempts)
+	}
+	if sleeps != persistMaxAttempts-1 {
+		t.Fatalf("backoff sleeps = %d, want %d", sleeps, persistMaxAttempts-1)
+	}
+}
+
+// TestDoRefresh_PersistExhaustedReturnsSentinel pins that when every persist
+// attempt fails, doRefresh returns ErrPersistFailed with a re-login hint and
+// no token, and that it tried exactly persistMaxAttempts times.
+func TestDoRefresh_PersistExhaustedReturnsSentinel(t *testing.T) {
+	t.Parallel()
+	store := newFlakyStore(persistMaxAttempts + 5) // always fail
+	store.data[testIssuer] = tokens.TokenSet{AccessToken: expiredJWT(t), RefreshToken: "rt-1"}
+	m, _ := New(Config{Issuer: testIssuer, ClientID: testClientID, RefreshPath: "/p", Store: store})
+	SetSleepForTest(t, m, func(context.Context, time.Duration) error { return nil })
+
+	SetRefreshForTest(t, m, func(_ context.Context, _ refresh.Request) (*tokens.TokenSet, error) {
+		return &tokens.TokenSet{AccessToken: freshJWT(t), RefreshToken: "rt-2"}, nil
+	})
+
+	tok, err := m.doRefresh(context.Background())
+	if !errors.Is(err, ErrPersistFailed) {
+		t.Fatalf("err = %v, want wrapped ErrPersistFailed", err)
+	}
+	if !strings.Contains(err.Error(), "re-login") {
+		t.Fatalf("err = %v, want the re-login hint in the message", err)
+	}
+	if tok != "" {
+		t.Fatalf("tok = %q, want empty (rotation consumed server-side, don't hand back a token)", tok)
+	}
+	if store.saves() != persistMaxAttempts {
+		t.Fatalf("save attempts = %d, want %d", store.saves(), persistMaxAttempts)
+	}
+}
+
+// TestDoRefresh_PersistCancelledMidBackoffStillMakesFinalAttempt pins the
+// cancellation wrinkle: the grant already consumed the rotation server-side,
+// so ctx cancellation during the backoff must not abandon the persist — one
+// final immediate save attempt runs, and when it succeeds the token is
+// returned and the store holds the rotated pair.
+func TestDoRefresh_PersistCancelledMidBackoffStillMakesFinalAttempt(t *testing.T) {
+	t.Parallel()
+	store := newFlakyStore(1) // first save fails; the final attempt succeeds
+	store.data[testIssuer] = tokens.TokenSet{AccessToken: expiredJWT(t), RefreshToken: "rt-1"}
+	m, _ := New(Config{Issuer: testIssuer, ClientID: testClientID, RefreshPath: "/p", Store: store})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var sleeps int
+	SetSleepForTest(t, m, func(ctx context.Context, _ time.Duration) error {
+		sleeps++
+		cancel() // caller gives up mid-backoff
+		return ctx.Err()
+	})
+
+	fresh := freshJWT(t)
+	SetRefreshForTest(t, m, func(_ context.Context, _ refresh.Request) (*tokens.TokenSet, error) {
+		return &tokens.TokenSet{AccessToken: fresh, RefreshToken: "rt-2"}, nil
+	})
+
+	got, err := m.doRefresh(ctx)
+	if err != nil {
+		t.Fatalf("doRefresh: %v", err)
+	}
+	if got != fresh {
+		t.Fatalf("returned %q, want fresh login JWT", got)
+	}
+	if saved := store.get(testIssuer); saved.AccessToken != fresh || saved.RefreshToken != "rt-2" {
+		t.Fatalf("persisted %q / %q, want fresh / rt-2", saved.AccessToken, saved.RefreshToken)
+	}
+	if store.saves() != 2 {
+		t.Fatalf("save attempts = %d, want 2 (initial failure + final immediate attempt)", store.saves())
+	}
+	if sleeps != 1 {
+		t.Fatalf("backoff sleeps = %d, want 1 (cancellation short-circuits the rest)", sleeps)
+	}
+}
+
+// TestDoRefresh_PersistCancelledMidBackoffFinalAttemptFails pins the error
+// shape when the final cancellation-path attempt also fails: the result wraps
+// ErrPersistFailed, the underlying store error, AND ctx.Err(), with no token.
+func TestDoRefresh_PersistCancelledMidBackoffFinalAttemptFails(t *testing.T) {
+	t.Parallel()
+	store := newFlakyStore(persistMaxAttempts + 5) // always fail
+	store.data[testIssuer] = tokens.TokenSet{AccessToken: expiredJWT(t), RefreshToken: "rt-1"}
+	m, _ := New(Config{Issuer: testIssuer, ClientID: testClientID, RefreshPath: "/p", Store: store})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	SetSleepForTest(t, m, func(ctx context.Context, _ time.Duration) error {
+		cancel()
+		return ctx.Err()
+	})
+
+	SetRefreshForTest(t, m, func(_ context.Context, _ refresh.Request) (*tokens.TokenSet, error) {
+		return &tokens.TokenSet{AccessToken: freshJWT(t), RefreshToken: "rt-2"}, nil
+	})
+
+	tok, err := m.doRefresh(ctx)
+	if !errors.Is(err, ErrPersistFailed) {
+		t.Fatalf("err = %v, want wrapped ErrPersistFailed", err)
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("err = %v, want ctx.Err() wrapped so callers see why the retries stopped", err)
+	}
+	if !strings.Contains(err.Error(), "keyring locked") {
+		t.Fatalf("err = %v, want underlying store error surfaced", err)
+	}
+	if tok != "" {
+		t.Fatalf("tok = %q, want empty (must not hand back a token on a doomed session)", tok)
+	}
+	if store.saves() != 2 {
+		t.Fatalf("save attempts = %d, want 2 (initial failure + final immediate attempt)", store.saves())
+	}
+}
+
+// TestDoRefresh_PersistRetriesHoldLockContinuously pins that the retry loop
+// runs while still holding refreshMu + the process lock: the lock is acquired
+// exactly once (not re-acquired per attempt), and a concurrent SaveCoreToken
+// (re-login) cannot interleave with the retries — it blocks until the refresh
+// finishes. This is what stops a peer reading the stale predecessor token
+// mid-retry.
+func TestDoRefresh_PersistRetriesHoldLockContinuously(t *testing.T) {
+	t.Parallel()
+	store := newFlakyStore(1) // fail once, then succeed on the retry
+	store.data[testIssuer] = tokens.TokenSet{AccessToken: expiredJWT(t), RefreshToken: "rt-1"}
+	m, _ := New(Config{Issuer: testIssuer, ClientID: testClientID, RefreshPath: "/p", Store: store})
+
+	lock := &recordingLock{}
+	SetProcessLockForTest(t, m, lock)
+
+	// Kick off a concurrent re-login from inside the backoff window — while
+	// the refresh still holds refreshMu + the process lock. It must block.
+	saveErr := make(chan error, 1)
+	saveStarted := make(chan struct{})
+	newUser := tokens.TokenSet{AccessToken: "new-user-jwt", RefreshToken: "rt-new"}
+	SetSleepForTest(t, m, func(context.Context, time.Duration) error {
+		go func() {
+			close(saveStarted)
+			saveErr <- m.SaveCoreToken(newUser)
+		}()
+		<-saveStarted
+		select {
+		case <-saveErr:
+			t.Error("SaveCoreToken completed during persist retry; lock not held across retries")
+		case <-time.After(50 * time.Millisecond):
+			// Expected: blocked on refreshMu until the refresh returns.
+		}
+		// Mid-retry the process lock is held continuously: acquired exactly
+		// once and not yet released (and the blocked re-login hasn't reached
+		// Acquire). Re-acquiring per attempt would show acquired>1 / released>0.
+		if a, r := lock.counts(); a != 1 || r != 0 {
+			t.Errorf("mid-retry lock acquired=%d released=%d, want 1/0 (held continuously)", a, r)
+		}
+		return nil
+	})
+
+	fresh := freshJWT(t)
+	SetRefreshForTest(t, m, func(_ context.Context, _ refresh.Request) (*tokens.TokenSet, error) {
+		return &tokens.TokenSet{AccessToken: fresh, RefreshToken: "rt-2"}, nil
+	})
+
+	got, err := m.ensureFreshLogin(context.Background())
+	if err != nil {
+		t.Fatalf("ensureFreshLogin: %v", err)
+	}
+	if got != fresh {
+		t.Fatalf("returned %q, want fresh login JWT", got)
+	}
+	// The blocked re-login now proceeds and wins (its credentials must not be
+	// clobbered by the refresh's rotated old-user token).
+	if err := <-saveErr; err != nil {
+		t.Fatalf("SaveCoreToken: %v", err)
+	}
+	if saved := store.get(testIssuer); saved.AccessToken != newUser.AccessToken || saved.RefreshToken != newUser.RefreshToken {
+		t.Fatalf("store = %+v, want new-user credentials after the queued re-login", saved)
 	}
 }
 

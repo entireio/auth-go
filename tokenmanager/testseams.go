@@ -85,6 +85,26 @@ func SetRefreshForTest(t TestingTB, m *Manager, fn func(context.Context, refresh
 	t.Cleanup(func() { m.refreshOverride.Store(prev) })
 }
 
+// SetSleepForTest replaces the persist-retry backoff sleep on m with fn for
+// the lifetime of the test, restoring the previous override on t.Cleanup.
+// Held behind atomic.Pointer for the same reason as the other seams. Lets a
+// test drive persistRefreshed's retry loop without real wall-clock sleeps and
+// observe how many times (and how long) it would have backed off. fn should
+// honour the production contract: return ctx.Err() if ctx is done, nil after
+// a completed backoff — persistRefreshed branches on that to decide between
+// continuing the loop and the final cancellation-path save attempt.
+func SetSleepForTest(t TestingTB, m *Manager, fn func(ctx context.Context, d time.Duration) error) {
+	t.Helper()
+	prev := m.sleepOverride.Load()
+	if fn == nil {
+		m.sleepOverride.Store(nil)
+	} else {
+		stored := sleepFuncType(fn)
+		m.sleepOverride.Store(&stored)
+	}
+	t.Cleanup(func() { m.sleepOverride.Store(prev) })
+}
+
 // SetProcessLockForTest replaces the cross-process lock on m with lock for
 // the lifetime of the test, restoring the previous override on t.Cleanup.
 // It lives off Config (as a test seam) so production callers can't bypass
