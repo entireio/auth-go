@@ -89,8 +89,11 @@ func SetRefreshForTest(t TestingTB, m *Manager, fn func(context.Context, refresh
 // the lifetime of the test, restoring the previous override on t.Cleanup.
 // Held behind atomic.Pointer for the same reason as the other seams. Lets a
 // test drive persistRefreshed's retry loop without real wall-clock sleeps and
-// observe how many times (and how long) it would have backed off.
-func SetSleepForTest(t TestingTB, m *Manager, fn func(time.Duration)) {
+// observe how many times (and how long) it would have backed off. fn should
+// honour the production contract: return ctx.Err() if ctx is done, nil after
+// a completed backoff — persistRefreshed branches on that to decide between
+// continuing the loop and the final cancellation-path save attempt.
+func SetSleepForTest(t TestingTB, m *Manager, fn func(ctx context.Context, d time.Duration) error) {
 	t.Helper()
 	prev := m.sleepOverride.Load()
 	if fn == nil {

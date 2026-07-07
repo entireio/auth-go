@@ -688,7 +688,7 @@ func TestDoRefresh_PersistFailureSurfaces(t *testing.T) {
 	store := &erroringStore{inner: newMemStore(), saveErr: errors.New("keyring locked")}
 	store.inner.data[testIssuer] = tokens.TokenSet{AccessToken: expiredJWT(t), RefreshToken: "rt-1"}
 	m, _ := New(Config{Issuer: testIssuer, ClientID: testClientID, RefreshPath: "/p", Store: store})
-	SetSleepForTest(t, m, func(time.Duration) {}) // don't actually back off
+	SetSleepForTest(t, m, func(context.Context, time.Duration) error { return nil }) // don't actually back off
 
 	SetRefreshForTest(t, m, func(_ context.Context, _ refresh.Request) (*tokens.TokenSet, error) {
 		return &tokens.TokenSet{AccessToken: freshJWT(t), RefreshToken: "rt-2"}, nil
@@ -773,7 +773,7 @@ func TestDoRefresh_PersistRetriesThenSucceeds(t *testing.T) {
 	m, _ := New(Config{Issuer: testIssuer, ClientID: testClientID, RefreshPath: "/p", Store: store})
 
 	var sleeps int
-	SetSleepForTest(t, m, func(time.Duration) { sleeps++ })
+	SetSleepForTest(t, m, func(context.Context, time.Duration) error { sleeps++; return nil })
 
 	fresh := freshJWT(t)
 	SetRefreshForTest(t, m, func(_ context.Context, _ refresh.Request) (*tokens.TokenSet, error) {
@@ -806,7 +806,7 @@ func TestDoRefresh_PersistExhaustedReturnsSentinel(t *testing.T) {
 	store := newFlakyStore(persistMaxAttempts + 5) // always fail
 	store.data[testIssuer] = tokens.TokenSet{AccessToken: expiredJWT(t), RefreshToken: "rt-1"}
 	m, _ := New(Config{Issuer: testIssuer, ClientID: testClientID, RefreshPath: "/p", Store: store})
-	SetSleepForTest(t, m, func(time.Duration) {})
+	SetSleepForTest(t, m, func(context.Context, time.Duration) error { return nil })
 
 	SetRefreshForTest(t, m, func(_ context.Context, _ refresh.Request) (*tokens.TokenSet, error) {
 		return &tokens.TokenSet{AccessToken: freshJWT(t), RefreshToken: "rt-2"}, nil
@@ -824,6 +824,87 @@ func TestDoRefresh_PersistExhaustedReturnsSentinel(t *testing.T) {
 	}
 	if store.saves() != persistMaxAttempts {
 		t.Fatalf("save attempts = %d, want %d", store.saves(), persistMaxAttempts)
+	}
+}
+
+// TestDoRefresh_PersistCancelledMidBackoffStillMakesFinalAttempt pins the
+// cancellation wrinkle: the grant already consumed the rotation server-side,
+// so ctx cancellation during the backoff must not abandon the persist — one
+// final immediate save attempt runs, and when it succeeds the token is
+// returned and the store holds the rotated pair.
+func TestDoRefresh_PersistCancelledMidBackoffStillMakesFinalAttempt(t *testing.T) {
+	t.Parallel()
+	store := newFlakyStore(1) // first save fails; the final attempt succeeds
+	store.data[testIssuer] = tokens.TokenSet{AccessToken: expiredJWT(t), RefreshToken: "rt-1"}
+	m, _ := New(Config{Issuer: testIssuer, ClientID: testClientID, RefreshPath: "/p", Store: store})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var sleeps int
+	SetSleepForTest(t, m, func(ctx context.Context, _ time.Duration) error {
+		sleeps++
+		cancel() // caller gives up mid-backoff
+		return ctx.Err()
+	})
+
+	fresh := freshJWT(t)
+	SetRefreshForTest(t, m, func(_ context.Context, _ refresh.Request) (*tokens.TokenSet, error) {
+		return &tokens.TokenSet{AccessToken: fresh, RefreshToken: "rt-2"}, nil
+	})
+
+	got, err := m.doRefresh(ctx)
+	if err != nil {
+		t.Fatalf("doRefresh: %v", err)
+	}
+	if got != fresh {
+		t.Fatalf("returned %q, want fresh login JWT", got)
+	}
+	if saved := store.get(testIssuer); saved.AccessToken != fresh || saved.RefreshToken != "rt-2" {
+		t.Fatalf("persisted %q / %q, want fresh / rt-2", saved.AccessToken, saved.RefreshToken)
+	}
+	if store.saves() != 2 {
+		t.Fatalf("save attempts = %d, want 2 (initial failure + final immediate attempt)", store.saves())
+	}
+	if sleeps != 1 {
+		t.Fatalf("backoff sleeps = %d, want 1 (cancellation short-circuits the rest)", sleeps)
+	}
+}
+
+// TestDoRefresh_PersistCancelledMidBackoffFinalAttemptFails pins the error
+// shape when the final cancellation-path attempt also fails: the result wraps
+// ErrPersistFailed, the underlying store error, AND ctx.Err(), with no token.
+func TestDoRefresh_PersistCancelledMidBackoffFinalAttemptFails(t *testing.T) {
+	t.Parallel()
+	store := newFlakyStore(persistMaxAttempts + 5) // always fail
+	store.data[testIssuer] = tokens.TokenSet{AccessToken: expiredJWT(t), RefreshToken: "rt-1"}
+	m, _ := New(Config{Issuer: testIssuer, ClientID: testClientID, RefreshPath: "/p", Store: store})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	SetSleepForTest(t, m, func(ctx context.Context, _ time.Duration) error {
+		cancel()
+		return ctx.Err()
+	})
+
+	SetRefreshForTest(t, m, func(_ context.Context, _ refresh.Request) (*tokens.TokenSet, error) {
+		return &tokens.TokenSet{AccessToken: freshJWT(t), RefreshToken: "rt-2"}, nil
+	})
+
+	tok, err := m.doRefresh(ctx)
+	if !errors.Is(err, ErrPersistFailed) {
+		t.Fatalf("err = %v, want wrapped ErrPersistFailed", err)
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("err = %v, want ctx.Err() wrapped so callers see why the retries stopped", err)
+	}
+	if !strings.Contains(err.Error(), "keyring locked") {
+		t.Fatalf("err = %v, want underlying store error surfaced", err)
+	}
+	if tok != "" {
+		t.Fatalf("tok = %q, want empty (must not hand back a token on a doomed session)", tok)
+	}
+	if store.saves() != 2 {
+		t.Fatalf("save attempts = %d, want 2 (initial failure + final immediate attempt)", store.saves())
 	}
 }
 
@@ -847,7 +928,7 @@ func TestDoRefresh_PersistRetriesHoldLockContinuously(t *testing.T) {
 	saveErr := make(chan error, 1)
 	saveStarted := make(chan struct{})
 	newUser := tokens.TokenSet{AccessToken: "new-user-jwt", RefreshToken: "rt-new"}
-	SetSleepForTest(t, m, func(time.Duration) {
+	SetSleepForTest(t, m, func(context.Context, time.Duration) error {
 		go func() {
 			close(saveStarted)
 			saveErr <- m.SaveCoreToken(newUser)
@@ -865,6 +946,7 @@ func TestDoRefresh_PersistRetriesHoldLockContinuously(t *testing.T) {
 		if a, r := lock.counts(); a != 1 || r != 0 {
 			t.Errorf("mid-retry lock acquired=%d released=%d, want 1/0 (held continuously)", a, r)
 		}
+		return nil
 	})
 
 	fresh := freshJWT(t)

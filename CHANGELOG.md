@@ -12,7 +12,10 @@
   predecessor and guaranteed the session would fail at the next refresh
   (observed as forced re-logins after a transient keyring hiccup). The
   refresh + process locks are held across all attempts, so no peer can read
-  the stale predecessor mid-retry.
+  the stale predecessor mid-retry. The backoff is context-aware; because
+  the rotation is already consumed server-side, cancellation mid-backoff
+  still triggers one final immediate save attempt before giving up, and
+  the resulting error then wraps `ctx.Err()` alongside the store error.
 
 ### Added
 

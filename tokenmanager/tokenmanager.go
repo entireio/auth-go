@@ -204,7 +204,7 @@ type ProcessLock interface {
 }
 
 type refreshFunc func(ctx context.Context, req refresh.Request) (*tokens.TokenSet, error)
-type sleepFuncType func(time.Duration)
+type sleepFuncType func(ctx context.Context, d time.Duration) error
 
 // Manager orchestrates core-token storage and STS exchanges. Safe for
 // concurrent use.
@@ -249,14 +249,21 @@ func (m *Manager) now() time.Time {
 	return time.Now()
 }
 
-// sleep pauses for d, using the test seam when set. Used only for the
-// persist-retry backoff.
-func (m *Manager) sleep(d time.Duration) {
+// sleep pauses for d or until ctx is done, whichever comes first, returning
+// ctx.Err() on cancellation and nil after a full sleep. Used only for the
+// persist-retry backoff; tests replace it via SetSleepForTest.
+func (m *Manager) sleep(ctx context.Context, d time.Duration) error {
 	if p := m.sleepOverride.Load(); p != nil {
-		(*p)(d)
-		return
+		return (*p)(ctx, d)
 	}
-	time.Sleep(d)
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err() //nolint:wrapcheck // callers want the bare ctx error
+	case <-t.C:
+		return nil
+	}
 }
 
 // New builds a Manager from cfg. Returns an error when required
@@ -767,7 +774,7 @@ func (m *Manager) doRefresh(ctx context.Context) (string, error) {
 
 	res, err := m.runRefresh(ctx, sent)
 	if err == nil {
-		if perr := m.persistRefreshed(set, res); perr != nil {
+		if perr := m.persistRefreshed(ctx, set, res); perr != nil {
 			return "", perr
 		}
 		return res.AccessToken, nil
@@ -792,7 +799,7 @@ func (m *Manager) doRefresh(ctx context.Context) (string, error) {
 		// A non-cooperating actor rotated the RT under us; retry once.
 		res, err = m.runRefresh(ctx, cur.RefreshToken)
 		if err == nil {
-			if perr := m.persistRefreshed(cur, res); perr != nil {
+			if perr := m.persistRefreshed(ctx, cur, res); perr != nil {
 				return "", perr
 			}
 			return res.AccessToken, nil
@@ -824,7 +831,15 @@ func (m *Manager) doRefresh(ctx context.Context) (string, error) {
 // succeed while hiding a session guaranteed to die at the next refresh.
 // Instead we return an error wrapping ErrPersistFailed so callers can detect
 // the doomed-session case and prompt an interactive re-login.
-func (m *Manager) persistRefreshed(prev tokens.TokenSet, res *tokens.TokenSet) error {
+//
+// The backoff is context-aware, with one deliberate wrinkle: if ctx is
+// cancelled mid-backoff, the grant has ALREADY succeeded — the rotation is
+// consumed server-side — so abandoning the persist outright would recreate
+// the exact lost-rotation bug this retry loop exists to fix. Cancellation
+// therefore triggers one final immediate save attempt (no sleep); only if
+// that also fails do we return, wrapping ErrPersistFailed, the store error,
+// and ctx.Err() so callers can see both what failed and why we stopped.
+func (m *Manager) persistRefreshed(ctx context.Context, prev tokens.TokenSet, res *tokens.TokenSet) error {
 	merged := *res
 	if merged.RefreshToken == "" {
 		merged.RefreshToken = prev.RefreshToken
@@ -846,10 +861,16 @@ func (m *Manager) persistRefreshed(prev tokens.TokenSet, res *tokens.TokenSet) e
 		}
 		lastErr = err
 		if attempt < persistMaxAttempts {
-			// Deliberately not context-aware: total backoff is bounded
-			// (~200ms) and we're inside the held refresh critical section,
-			// so plumbing ctx through isn't worth it.
-			m.sleep(persistRetryBackoff)
+			if ctxErr := m.sleep(ctx, persistRetryBackoff); ctxErr != nil {
+				// Cancelled mid-backoff. The rotation is already consumed
+				// server-side, so make one last immediate attempt before
+				// giving up (see the function comment).
+				err := m.saveCoreTokenLocked(merged)
+				if err == nil {
+					return nil
+				}
+				return fmt.Errorf("%w (cancelled during retry backoff: %w): %w", ErrPersistFailed, ctxErr, err)
+			}
 		}
 	}
 	return fmt.Errorf("%w (after %d attempts): %w", ErrPersistFailed, persistMaxAttempts, lastErr)
