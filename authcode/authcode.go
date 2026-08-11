@@ -255,14 +255,71 @@ type Flow struct {
 	// match the authorize request).
 	RedirectURI string
 
-	client    *Client
-	verifier  string
-	state     string
-	srv       *http.Server
-	resultCh  chan callbackResult
-	srvErrCh  chan error
+	client   *Client
+	verifier string
+	state    string
+	srv      *http.Server
+	resultCh chan callbackResult
+	srvErrCh chan error
+
+	// issuer holds the RFC 9207 `iss` parameter from the authorization
+	// callback, recorded by Wait. Written and read only on the caller's
+	// goroutine (the callback handler delivers it over resultCh), so no
+	// synchronisation is needed.
+	issuer string
+
+	// tokenBaseURL overrides Client.BaseURL for this flow's token
+	// exchange when non-empty. Set via SetTokenBaseURL.
+	tokenBaseURL string
+
 	closeOnce sync.Once
 	closeErr  error
+}
+
+// Issuer returns the RFC 9207 `iss` parameter the authorization server
+// attached to the loopback callback, or "" when it sent none. It is only
+// populated after a successful Wait.
+//
+// The value is reported verbatim and is NOT validated by this package: the
+// package knows the origin it dialled (BaseURL) but not the issuer
+// identifier the deployment expects, and for a dispatching front door those
+// two legitimately differ. RFC 9207 §2.4 makes validation the client's job.
+//
+// Callers MUST check it against their own trust policy before acting on it —
+// in particular before passing it to SetTokenBaseURL, which sends the
+// authorization code (and receives the user's tokens) at that host.
+func (f *Flow) Issuer() string { return f.issuer }
+
+// SetTokenBaseURL retargets this flow's token exchange at baseURL instead of
+// Client.BaseURL. It exists for deployments whose authorization endpoint is a
+// dispatching front door that redirects the browser to a regional
+// authorization server: the code is then only redeemable at that region's
+// token endpoint, which the front door does not serve.
+//
+// baseURL is validated as an origin (HTTPS required unless the client's
+// AllowInsecureHTTP is set and the host is loopback), but this package cannot
+// judge whether the host is trustworthy — see Issuer. Call it after Wait and
+// before Exchange; an empty baseURL clears the override.
+func (f *Flow) SetTokenBaseURL(baseURL string) error {
+	if baseURL == "" {
+		f.tokenBaseURL = ""
+		return nil
+	}
+	normalized, err := oauthhttp.ValidateOriginURL(baseURL, f.client.AllowInsecureHTTP, "token base URL")
+	if err != nil {
+		return fmt.Errorf("set token base URL: %w", err)
+	}
+	f.tokenBaseURL = normalized
+	return nil
+}
+
+// tokenBase resolves the base URL the token exchange posts to: the
+// per-flow override when set, else the client's BaseURL.
+func (f *Flow) tokenBase() string {
+	if f.tokenBaseURL != "" {
+		return f.tokenBaseURL
+	}
+	return f.client.BaseURL
 }
 
 // String redacts the PKCE verifier and CSRF state. Both are live secrets
@@ -314,7 +371,11 @@ func (f *Flow) GoString() string { return f.String() }
 // resultCh: either an authorization code or a terminal error.
 type callbackResult struct {
 	code string
-	err  error
+	// issuer is the RFC 9207 `iss` query parameter, when the server sent
+	// one. Carried alongside the code so Wait can record it on the Flow
+	// without the handler goroutine writing Flow fields.
+	issuer string
+	err    error
 }
 
 // Start computes PKCE + state, binds a loopback listener, starts serving
@@ -446,7 +507,10 @@ func (f *Flow) handleCallback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	f.signal(callbackResult{code: code})
+	// RFC 9207: the authorization server MAY identify itself with an `iss`
+	// parameter. Recorded verbatim for the caller to validate (see
+	// Flow.Issuer); this package draws no conclusions from it.
+	f.signal(callbackResult{code: code, issuer: q.Get("iss")})
 	writeBrowserPage(w, http.StatusOK, "Signed in", "You're signed in. You can close this tab and return to your terminal.")
 }
 
@@ -515,12 +579,12 @@ func (f *Flow) Wait(ctx context.Context) (code string, err error) {
 
 	select {
 	case res := <-f.resultCh:
-		return res.code, res.err
+		return f.record(res)
 	case serr := <-f.srvErrCh:
 		// A genuine callback may have raced the failure signal; select offers
 		// no priority, so prefer an already-buffered result over the error.
 		if res, ok := f.tryResult(); ok {
-			return res.code, res.err
+			return f.record(res)
 		}
 		if errors.Is(serr, http.ErrServerClosed) {
 			return "", ErrListenerClosed
@@ -528,10 +592,18 @@ func (f *Flow) Wait(ctx context.Context) (code string, err error) {
 		return "", fmt.Errorf("loopback listener: %w", serr)
 	case <-ctx.Done():
 		if res, ok := f.tryResult(); ok {
-			return res.code, res.err
+			return f.record(res)
 		}
 		return "", fmt.Errorf("wait for browser sign-in: %w", ctx.Err())
 	}
+}
+
+// record stores the callback's issuer on the Flow and unpacks the result
+// into Wait's return values. Called only from Wait, on the caller's
+// goroutine.
+func (f *Flow) record(res callbackResult) (string, error) {
+	f.issuer = res.issuer
+	return res.code, res.err
 }
 
 // Close shuts down the loopback listener. Safe to call multiple times and
@@ -575,7 +647,7 @@ func (f *Flow) Exchange(ctx context.Context, code string) (*tokens.TokenSet, err
 	body.Set("code_verifier", f.verifier)
 	body.Set("client_id", c.ClientID)
 
-	resp, err := c.postForm(ctx, c.TokenPath, body)
+	resp, err := c.postForm(ctx, f.tokenBase(), c.TokenPath, body)
 	if err != nil {
 		return nil, fmt.Errorf("exchange authorization code: %w", err)
 	}
@@ -612,11 +684,12 @@ func (f *Flow) Exchange(ctx context.Context, code string) (*tokens.TokenSet, err
 }
 
 // postForm POSTs body as application/x-www-form-urlencoded to a path
-// resolved against the client's BaseURL. The caller applies any per-request
-// timeout via context.WithTimeout — the timeout must cover the body-read
-// that happens after postForm returns.
-func (c *Client) postForm(ctx context.Context, path string, body url.Values) (*http.Response, error) {
-	endpoint, err := resolveURL(c.BaseURL, path, c.AllowInsecureHTTP)
+// resolved against baseURL (Client.BaseURL, or a per-flow override — see
+// Flow.SetTokenBaseURL). The caller applies any per-request timeout via
+// context.WithTimeout — the timeout must cover the body-read that happens
+// after postForm returns.
+func (c *Client) postForm(ctx context.Context, baseURL, path string, body url.Values) (*http.Response, error) {
+	endpoint, err := resolveURL(baseURL, path, c.AllowInsecureHTTP)
 	if err != nil {
 		return nil, fmt.Errorf("resolve URL %s: %w", path, err)
 	}

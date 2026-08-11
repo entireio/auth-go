@@ -47,6 +47,21 @@ type DeviceCode struct {
 	VerificationURIComplete string `json:"verification_uri_complete"`
 	ExpiresIn               int    `json:"expires_in"`
 	Interval                int    `json:"interval"`
+
+	// ResponseOrigin is the origin that actually served this response,
+	// after any HTTP redirects the client followed. It is filled in by
+	// StartDeviceAuth, never decoded from the response body (the body is
+	// parsed strictly, so a server-sent field of this name would be a
+	// breaking change).
+	//
+	// It normally equals Client.BaseURL. It differs when the configured
+	// BaseURL is a dispatching front door that redirects
+	// /device_authorization to a regional authorization server; the device
+	// code is then only redeemable at that region's token endpoint. Callers
+	// that support such a deployment should validate ResponseOrigin against
+	// their own trust policy and, if it is acceptable, point Client.TokenBaseURL
+	// at it before polling. This package draws no conclusions from the value.
+	ResponseOrigin string `json:"-"`
 }
 
 // String redacts DeviceCode (the device-flow secret that a hostile
@@ -57,13 +72,14 @@ type DeviceCode struct {
 // `fmt.Printf("%+v", dc)` in caller code would log the device code.
 func (d DeviceCode) String() string {
 	return fmt.Sprintf(
-		"DeviceCode{DeviceCode:%s UserCode:%q VerificationURI:%q VerificationURIComplete:%s ExpiresIn:%d Interval:%d}",
+		"DeviceCode{DeviceCode:%s UserCode:%q VerificationURI:%q VerificationURIComplete:%s ExpiresIn:%d Interval:%d ResponseOrigin:%q}",
 		tokens.ElideSecret(d.DeviceCode),
 		d.UserCode,
 		d.VerificationURI,
 		tokens.ElideSecret(d.VerificationURIComplete),
 		d.ExpiresIn,
 		d.Interval,
+		d.ResponseOrigin,
 	)
 }
 
@@ -102,6 +118,22 @@ type Client struct {
 	UserAgent      string
 	DeviceCodePath string
 	TokenPath      string
+
+	// TokenBaseURL overrides BaseURL for the token endpoint only
+	// (PollDeviceAuth / PollUntil). Empty — the default — means "use
+	// BaseURL".
+	//
+	// It exists for deployments whose device-authorization endpoint is a
+	// dispatching front door that redirects to a regional authorization
+	// server: that region mints the tokens and is the only host that will
+	// redeem the device code, while the front door serves no token
+	// endpoint. See DeviceCode.ResponseOrigin for learning the region, and
+	// validate it before assigning it here — polling sends the device code
+	// to this host and receives the user's tokens from it.
+	//
+	// Set it between StartDeviceAuth and the first poll. It is read on
+	// every poll, so mutating it while a PollUntil is in flight races.
+	TokenBaseURL string
 
 	// RequestTimeout is the per-request deadline applied via
 	// context.WithTimeout on top of the caller's context. Zero falls
@@ -251,7 +283,7 @@ func (c *Client) StartDeviceAuth(ctx context.Context) (*DeviceCode, error) {
 		body.Set("scope", c.Scope)
 	}
 
-	resp, err := c.postForm(ctx, c.DeviceCodePath, body)
+	resp, err := c.postForm(ctx, c.BaseURL, c.DeviceCodePath, body)
 	if err != nil {
 		return nil, fmt.Errorf("start device auth: %w", err)
 	}
@@ -265,6 +297,7 @@ func (c *Client) StartDeviceAuth(ctx context.Context) (*DeviceCode, error) {
 	if err := oauthhttp.ReadAndDecodeJSON(resp.Body, &result, true); err != nil {
 		return nil, fmt.Errorf("start device auth: %w", err)
 	}
+	result.ResponseOrigin = responseOrigin(resp, c.BaseURL)
 	if err := validateVerificationURI(result.VerificationURI, c.AllowInsecureHTTP); err != nil {
 		return nil, fmt.Errorf("start device auth: verification_uri: %w", err)
 	}
@@ -274,6 +307,19 @@ func (c *Client) StartDeviceAuth(ctx context.Context) (*DeviceCode, error) {
 		}
 	}
 	return &result, nil
+}
+
+// responseOrigin reports the scheme://host that served resp, after any
+// redirects net/http followed (resp.Request is the final request in the
+// chain). Falls back to the normalised configured base URL when the
+// response carries no usable request URL, so the field is never empty on
+// a successful call.
+func responseOrigin(resp *http.Response, baseURL string) string {
+	if resp.Request == nil || resp.Request.URL == nil || resp.Request.URL.Host == "" {
+		return oauthhttp.NormalizeOriginURL(baseURL)
+	}
+	u := resp.Request.URL
+	return oauthhttp.NormalizeOriginURL(u.Scheme + "://" + u.Host)
 }
 
 // ErrUnsafeVerificationURI is returned when the authorization server
@@ -389,7 +435,7 @@ func (c *Client) PollDeviceAuth(ctx context.Context, deviceCode string) (*tokens
 	body.Set("client_id", c.ClientID)
 	body.Set("device_code", deviceCode)
 
-	resp, err := c.postForm(ctx, c.TokenPath, body)
+	resp, err := c.postForm(ctx, c.tokenBase(), c.TokenPath, body)
 	if err != nil {
 		return nil, fmt.Errorf("poll device auth: %w", err)
 	}
@@ -426,13 +472,23 @@ func (c *Client) PollDeviceAuth(ctx context.Context, deviceCode string) (*tokens
 	return t, nil
 }
 
+// tokenBase resolves the base URL token-endpoint requests post to: the
+// TokenBaseURL override when set, else BaseURL.
+func (c *Client) tokenBase() string {
+	if c.TokenBaseURL != "" {
+		return c.TokenBaseURL
+	}
+	return c.BaseURL
+}
+
 // postForm POSTs body as application/x-www-form-urlencoded to a path
-// resolved against the client's BaseURL. The caller is responsible
-// for applying any per-request timeout via context.WithTimeout — the
-// timeout must cover the body-read that happens after postForm
-// returns, so cancel-on-return here would interrupt that read.
-func (c *Client) postForm(ctx context.Context, path string, body url.Values) (*http.Response, error) {
-	endpoint, err := resolveURL(c.BaseURL, path, c.AllowInsecureHTTP)
+// resolved against baseURL (BaseURL, or TokenBaseURL for the token
+// endpoint). The caller is responsible for applying any per-request
+// timeout via context.WithTimeout — the timeout must cover the body-read
+// that happens after postForm returns, so cancel-on-return here would
+// interrupt that read.
+func (c *Client) postForm(ctx context.Context, baseURL, path string, body url.Values) (*http.Response, error) {
+	endpoint, err := resolveURL(baseURL, path, c.AllowInsecureHTTP)
 	if err != nil {
 		return nil, fmt.Errorf("resolve URL %s: %w", path, err)
 	}
