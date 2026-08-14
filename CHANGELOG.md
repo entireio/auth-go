@@ -31,6 +31,14 @@ learn the region at runtime and send the token request there.
   endpoint only (`PollDeviceAuth` / `PollUntil`). Empty means "use BaseURL".
   Set it between `StartDeviceAuth` and the first poll.
 
+### Changed
+
+- Bumped the Go toolchain (and the `go.mod` minimum) to 1.26.6, picking up
+  the standard-library security fixes GO-2026-6218 (`net/url`), GO-2026-6090
+  and GO-2026-5856 (`crypto/tls`), GO-2026-6089 and GO-2026-5026
+  (`net/http`), and GO-2026-5972 (`encoding/asn1`). Consumers now require
+  Go ≥ 1.26.6.
+
 ## v0.5.2 — 2026-07-07
 
 ### Added
