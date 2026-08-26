@@ -2,6 +2,43 @@
 
 ## Unreleased
 
+### Added
+
+Support for authorization servers that are a *dispatching front door*: the
+apex serves `/authorize` and `/device_authorization` but redirects each to a
+regional authorization server, which is the only host that mints tokens and
+the only host that will redeem the resulting code. The client must therefore
+learn the region at runtime and send the token request there.
+
+- `authcode.Flow.Issuer()` — the RFC 9207 `iss` parameter from the loopback
+  callback, or `""` when the server sent none. Reported verbatim and
+  deliberately **not** validated: the package knows the origin it dialled but
+  not the issuer identifier the deployment expects, and for a dispatching
+  front door those legitimately differ (RFC 9207 §2.4 makes validation the
+  client's job). Callers MUST check it against their own trust policy.
+- `authcode.Flow.SetTokenBaseURL(baseURL)` — retargets this flow's token
+  exchange at `baseURL` instead of `Client.BaseURL`. Call it between `Wait`
+  and `Exchange`; `""` clears the override. `baseURL` is validated as an
+  origin (HTTPS unless `AllowInsecureHTTP` and loopback), but the package
+  cannot judge whether the host is trustworthy — the authorization code and
+  the user's tokens travel to it.
+- `deviceflow.DeviceCode.ResponseOrigin` — the origin that actually served
+  the device-authorization response, after any redirects the client followed.
+  Filled in by `StartDeviceAuth`, never decoded from the response body (that
+  body is parsed strictly, so a server-sent field of the same name would be a
+  breaking change). Equals `Client.BaseURL` when no redirect occurred.
+- `deviceflow.Client.TokenBaseURL` — overrides `BaseURL` for the token
+  endpoint only (`PollDeviceAuth` / `PollUntil`). Empty means "use BaseURL".
+  Set it between `StartDeviceAuth` and the first poll.
+
+### Changed
+
+- Bumped the Go toolchain (and the `go.mod` minimum) to 1.26.6, picking up
+  the standard-library security fixes GO-2026-6218 (`net/url`), GO-2026-6090
+  and GO-2026-5856 (`crypto/tls`), GO-2026-6089 and GO-2026-5026
+  (`net/http`), and GO-2026-5972 (`encoding/asn1`). Consumers now require
+  Go ≥ 1.26.6.
+
 ## v0.5.2 — 2026-07-07
 
 ### Added
