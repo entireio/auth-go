@@ -38,6 +38,12 @@ var ErrInvalidGrant = errors.New("invalid_grant")
 var (
 	ErrInsecureBaseURL = oauthhttp.ErrInsecureBaseURL
 	ErrAbsolutePath    = oauthhttp.ErrAbsolutePath
+
+	// ErrUnexpectedRedirect is returned when the token endpoint
+	// redirects the refresh grant to a different origin. The request
+	// body carries the refresh token, and net/http replays the body on
+	// a 307/308 — so the redirect is refused before it is followed.
+	ErrUnexpectedRedirect = oauthhttp.ErrUnexpectedRedirect
 )
 
 // DefaultRequestTimeout caps a single refresh round-trip. Set
@@ -86,7 +92,11 @@ func (c *Client) now() time.Time {
 	return time.Now()
 }
 
-func (c *Client) httpClient() *http.Client { return oauthhttp.HTTPClient(c.Transport) }
+// httpClient builds the *http.Client used for one Refresh call. The
+// grant POSTs the refresh token in the request body, so the client
+// refuses redirects that would carry that body off the configured
+// origin — see oauthhttp.CredentialHTTPClient.
+func (c *Client) httpClient() *http.Client { return oauthhttp.CredentialHTTPClient(c.Transport) }
 
 // New validates a Client's required fields at construction time rather than
 // at the first Refresh call. Returns an error if BaseURL or Path is empty —

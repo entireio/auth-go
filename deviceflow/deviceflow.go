@@ -167,11 +167,28 @@ func (c *Client) now() time.Time {
 	return time.Now()
 }
 
-// httpClient builds the *http.Client used for one request. See
-// oauthhttp.HTTPClient for the construction policy (fresh per call,
-// shared underlying Transport, no Client.Timeout).
+// httpClient builds the *http.Client used for the device-authorization
+// request. See oauthhttp.HTTPClient for the construction policy (fresh
+// per call, shared underlying Transport, no Client.Timeout).
+//
+// This one follows redirects. The device-authorization request carries
+// no credential — only client_id and scope — and a deployment whose
+// BaseURL is a dispatching front door legitimately redirects it to a
+// regional authorization server. DeviceCode.ResponseOrigin reports where
+// it landed so the caller can apply its own trust policy.
 func (c *Client) httpClient() *http.Client {
 	return oauthhttp.HTTPClient(c.Transport)
+}
+
+// credentialHTTPClient builds the *http.Client used for the token
+// endpoint. Polling POSTs the device code in the request body and
+// net/http replays the body on a 307/308, so this client refuses
+// redirects that would carry it off the configured origin — see
+// oauthhttp.CredentialHTTPClient. Deployments that redeem the device
+// code at another host set TokenBaseURL explicitly, after validating
+// ResponseOrigin.
+func (c *Client) credentialHTTPClient() *http.Client {
+	return oauthhttp.CredentialHTTPClient(c.Transport)
 }
 
 // New validates a Client's required fields at construction time
@@ -283,7 +300,7 @@ func (c *Client) StartDeviceAuth(ctx context.Context) (*DeviceCode, error) {
 		body.Set("scope", c.Scope)
 	}
 
-	resp, err := c.postForm(ctx, c.BaseURL, c.DeviceCodePath, body)
+	resp, err := c.postForm(ctx, c.httpClient(), c.BaseURL, c.DeviceCodePath, body)
 	if err != nil {
 		return nil, fmt.Errorf("start device auth: %w", err)
 	}
@@ -435,7 +452,7 @@ func (c *Client) PollDeviceAuth(ctx context.Context, deviceCode string) (*tokens
 	body.Set("client_id", c.ClientID)
 	body.Set("device_code", deviceCode)
 
-	resp, err := c.postForm(ctx, c.tokenBase(), c.TokenPath, body)
+	resp, err := c.postForm(ctx, c.credentialHTTPClient(), c.tokenBase(), c.TokenPath, body)
 	if err != nil {
 		return nil, fmt.Errorf("poll device auth: %w", err)
 	}
@@ -487,7 +504,12 @@ func (c *Client) tokenBase() string {
 // timeout via context.WithTimeout — the timeout must cover the body-read
 // that happens after postForm returns, so cancel-on-return here would
 // interrupt that read.
-func (c *Client) postForm(ctx context.Context, baseURL, path string, body url.Values) (*http.Response, error) {
+//
+// hc is passed in rather than built here because the two endpoints have
+// different redirect policies: the device-authorization request may be
+// dispatched onward by a front door, the token request must not be
+// (it carries the device code in its body).
+func (c *Client) postForm(ctx context.Context, hc *http.Client, baseURL, path string, body url.Values) (*http.Response, error) {
 	endpoint, err := resolveURL(baseURL, path, c.AllowInsecureHTTP)
 	if err != nil {
 		return nil, fmt.Errorf("resolve URL %s: %w", path, err)
@@ -504,7 +526,7 @@ func (c *Client) postForm(ctx context.Context, baseURL, path string, body url.Va
 		req.Header.Set("User-Agent", c.UserAgent)
 	}
 
-	resp, err := c.httpClient().Do(req)
+	resp, err := hc.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("request %s: %w", path, err)
 	}
@@ -528,6 +550,14 @@ var ErrInsecureBaseURL = oauthhttp.ErrInsecureBaseURL
 // an attacker — and in the token-endpoint case, capture the user's
 // access token. Re-exported from internal/oauthhttp.
 var ErrAbsolutePath = oauthhttp.ErrAbsolutePath
+
+// ErrUnexpectedRedirect is returned when the token endpoint redirects
+// a poll to a different origin. The request body carries the device
+// code and net/http replays the body on a 307/308, so the redirect is
+// refused before it is followed. StartDeviceAuth is deliberately not
+// subject to this — see Client.httpClient. Re-exported from
+// internal/oauthhttp.
+var ErrUnexpectedRedirect = oauthhttp.ErrUnexpectedRedirect
 
 func resolveURL(baseURL, path string, allowInsecureHTTP bool) (string, error) {
 	return oauthhttp.ResolveURL(baseURL, path, allowInsecureHTTP) //nolint:wrapcheck // pass through with sentinel-preserving semantics

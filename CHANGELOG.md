@@ -31,6 +31,28 @@ learn the region at runtime and send the token request there.
   endpoint only (`PollDeviceAuth` / `PollUntil`). Empty means "use BaseURL".
   Set it between `StartDeviceAuth` and the first poll.
 
+### Security
+
+- The four grants that POST a credential in the request body — `sts.Exchange`,
+  `refresh.Refresh`, `deviceflow.PollDeviceAuth`, and `authcode.Flow.Exchange`
+  — no longer follow a redirect that leaves the origin the request was aimed
+  at. `net/http` replays a POST body verbatim on a 307/308 and its
+  cross-origin protections cover only sensitive *headers*, so under the
+  default redirect policy a server response could move `subject_token`,
+  `refresh_token`, `device_code`, or `code` + `code_verifier` to another
+  origin — plaintext `http://` included, which also routed around
+  `AllowInsecureHTTP` (that check only ever applied to the configured base
+  URL). Cross-origin redirects on those four calls now fail with the new
+  `ErrUnexpectedRedirect` sentinel, re-exported from each flow package,
+  before the redirected request is issued. Same-origin redirects (path
+  rewrites, trailing-slash normalisation) are still followed.
+- `deviceflow.StartDeviceAuth` is deliberately unchanged: it carries no
+  credential, and the dispatching-front-door deployments added above rely on
+  it being redirected. `DeviceCode.ResponseOrigin` continues to report where
+  it landed. Cross-origin token endpoints remain reachable through the
+  explicit, caller-validated `deviceflow.Client.TokenBaseURL` and
+  `authcode.Flow.SetTokenBaseURL`.
+
 ### Changed
 
 - Bumped the Go toolchain (and the `go.mod` minimum) to 1.26.6, picking up

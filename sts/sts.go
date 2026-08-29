@@ -326,9 +326,12 @@ func buildForm(req ExchangeRequest) url.Values {
 }
 
 // httpClient builds the *http.Client used for one Exchange call. See
-// oauthhttp.HTTPClient for the construction policy.
+// oauthhttp.CredentialHTTPClient for the construction policy: the
+// exchange POSTs the subject token in the request body, so the client
+// refuses redirects that would carry that body off the configured
+// origin.
 func (c *Client) httpClient() *http.Client {
-	return oauthhttp.HTTPClient(c.Transport)
+	return oauthhttp.CredentialHTTPClient(c.Transport)
 }
 
 // New validates a Client's required fields at construction time
@@ -386,6 +389,13 @@ var ErrInsecureBaseURL = oauthhttp.ErrInsecureBaseURL
 // oauthhttp.ErrAbsolutePath for the rationale; re-exported here so
 // callers can errors.Is on either package's sentinel.
 var ErrAbsolutePath = oauthhttp.ErrAbsolutePath
+
+// ErrUnexpectedRedirect is returned when the token endpoint redirects
+// the exchange to a different origin. The request body carries the
+// subject token, and net/http replays the body on a 307/308 — so the
+// redirect is refused before it is followed. Re-exported from
+// internal/oauthhttp.
+var ErrUnexpectedRedirect = oauthhttp.ErrUnexpectedRedirect
 
 func resolveURL(baseURL, path string, allowInsecureHTTP bool) (string, error) {
 	return oauthhttp.ResolveURL(baseURL, path, allowInsecureHTTP) //nolint:wrapcheck // pass through with sentinel-preserving semantics
