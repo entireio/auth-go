@@ -31,6 +31,25 @@ learn the region at runtime and send the token request there.
   endpoint only (`PollDeviceAuth` / `PollUntil`). Empty means "use BaseURL".
   Set it between `StartDeviceAuth` and the first poll.
 
+### Security
+
+- The strings this library renders back to the user from server-supplied
+  data — the OAuth `error_description` via `SanitizeDescription`, and the
+  device-flow `verification_uri` — now also reject the Unicode formatting
+  characters that reorder or hide rendered text: bidirectional embeddings,
+  overrides and isolates (U+202A–U+202E, U+2066–U+2069), the implicit marks
+  LRM/RLM/ALM (U+200E, U+200F, U+061C), zero-width space (U+200B), BOM
+  (U+FEFF), and LINE/PARAGRAPH SEPARATOR (U+2028, U+2029). Filtering only
+  the legacy C0/DEL/C1 codes left a server able to change what the user
+  reads without changing what they got — the "Trojan Source" class — which
+  is precisely what those two checks exist to prevent, the second of them
+  on a URL the user is asked to inspect and open. ZWNJ and ZWJ (U+200C,
+  U+200D) are deliberately still accepted: they carry meaning in Indic,
+  Perso-Arabic, and emoji text and reorder nothing.
+- The rule now has one definition, `oauthhttp.IsDisplayUnsafeRune`, used by
+  both call sites; the duplicated inline range check in
+  `deviceflow.validateVerificationURI` is gone.
+
 ### Changed
 
 - Bumped the Go toolchain (and the `go.mod` minimum) to 1.26.6, picking up

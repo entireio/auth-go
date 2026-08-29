@@ -347,8 +347,14 @@ const maxVerificationURILen = 2048
 //   - Scheme must be https (or http only when allowInsecureHTTP is
 //     set AND the host is loopback — production never qualifies).
 //   - Must not embed userinfo (user:password@host tricks the eye).
-//   - Must not contain control characters (CR/LF/etc.) that could
-//     break terminal output or sneak past glance-checks.
+//   - Must not contain characters that break terminal output or sneak
+//     past a glance-check: the legacy control codes (CR/LF/ESC/etc.)
+//     and the Unicode formatting characters that reorder or hide
+//     rendered text (bidi overrides and isolates, zero-width space,
+//     BOM, line/paragraph separators). See
+//     oauthhttp.IsDisplayUnsafeRune. Visual inspection is the whole
+//     defence here, so a character that changes what the user sees
+//     without changing what they get defeats it directly.
 //
 // This is the bottom-floor check; the embedding CLI is still expected
 // to show the URL to the user for visual inspection, and the user is
@@ -361,10 +367,7 @@ func validateVerificationURI(raw string, allowInsecureHTTP bool) error {
 		return fmt.Errorf("%w: too long (%d bytes, max %d)", ErrUnsafeVerificationURI, len(raw), maxVerificationURILen)
 	}
 	for _, r := range raw {
-		// C0 (<0x20), DEL (0x7f), and C1 (0x80–0x9f). C1 in particular
-		// includes CSI (U+009B), which 8-bit-aware terminals interpret
-		// as ESC[ — bypassing any naive "low byte" filter.
-		if r < 0x20 || r == 0x7f || (r >= 0x80 && r <= 0x9f) {
+		if oauthhttp.IsDisplayUnsafeRune(r) {
 			return fmt.Errorf("%w: contains control character", ErrUnsafeVerificationURI)
 		}
 	}
