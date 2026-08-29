@@ -126,6 +126,14 @@ var ErrInsecureBaseURL = oauthhttp.ErrInsecureBaseURL
 // configuration redirect the user's bearer to an attacker.
 var ErrAbsolutePath = oauthhttp.ErrAbsolutePath
 
+// ErrUnexpectedRedirect is re-exported from internal/oauthhttp. The
+// token exchange POSTs the authorization code and the PKCE verifier in
+// the request body and net/http replays the body on a 307/308, so a
+// redirect to another origin is refused before it is followed. Use
+// Flow.SetTokenBaseURL for deployments that legitimately redeem the code
+// at a different host — that path is validated by the caller.
+var ErrUnexpectedRedirect = oauthhttp.ErrUnexpectedRedirect
+
 // Client performs the RFC 8252 loopback authorization-code flow.
 //
 // All configuration is explicit; the package has no global state and no
@@ -182,9 +190,12 @@ func (c *Client) now() time.Time {
 }
 
 // httpClient builds the *http.Client used for the token-exchange request.
-// See oauthhttp.HTTPClient for the construction policy.
+// See oauthhttp.CredentialHTTPClient for the construction policy: the
+// exchange POSTs the authorization code and the PKCE verifier in the
+// request body, so the client refuses redirects that would carry that
+// body off the configured origin.
 func (c *Client) httpClient() *http.Client {
-	return oauthhttp.HTTPClient(c.Transport)
+	return oauthhttp.CredentialHTTPClient(c.Transport)
 }
 
 // New validates a Client's required fields at construction time rather
