@@ -1,0 +1,28 @@
+{
+  "cli_version": "0.10.4-nightly.202608300623.60773bd4b",
+  "checkpoint_id": "9bc08e4ba252",
+  "strategy": "manual-commit",
+  "branch": "paul/cor-1441-crossjuris",
+  "checkpoints_count": 1,
+  "files_touched": [
+    "CHANGELOG.md",
+    "crossjuris/crossjuris.go",
+    "crossjuris/crossjuris_test.go"
+  ],
+  "sessions": [
+    {
+      "metadata": "/9b/c08e4ba252/0/metadata.json",
+      "transcript": "/9b/c08e4ba252/0/full.jsonl",
+      "compact_transcript": "/9b/c08e4ba252/0/transcript.jsonl",
+      "content_hash": "/9b/c08e4ba252/0/content_hash.txt",
+      "prompt": "/9b/c08e4ba252/0/prompt.txt"
+    }
+  ],
+  "token_usage": {
+    "input_tokens": 694,
+    "cache_creation_tokens": 17168,
+    "cache_read_tokens": 1653242,
+    "output_tokens": 8199,
+    "api_call_count": 8
+  }
+}
