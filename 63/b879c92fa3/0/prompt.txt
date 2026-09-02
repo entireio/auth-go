@@ -1,0 +1,1 @@
+start the work for auth-go mentioned here: https://linear.app/entirehq/issue/COR-1441/share-the-cross-jurisdiction-421-follower-via-auth-go-delete-the-three once that's merged i'll get you to update the client projects.  create the PR from start to finish. go.
