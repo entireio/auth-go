@@ -4,6 +4,27 @@
 
 ### Added
 
+- New `crossjuris` package: an `http.RoundTripper` that follows
+  entire-core's cross-jurisdiction `421 Misdirected Request` to the
+  `home_core_url` in its body, once, replaying the buffered request body.
+  Before following, the target must be HTTPS (loopback HTTP only with
+  `Config.AllowInsecureHTTP`) and its host must appear in the responding
+  core's `/.well-known/entire-federation` manifest, which is fetched
+  lazily and cached per origin for the life of the transport (failed or
+  empty lookups are cached as "trust nobody"). With `Config.ClientID` set
+  the transport also handles the two 401 shapes a home core can return for
+  a foreign-region login JWT — the structured `cross_juris_token_required`
+  hint and the bare 401 that follows a 421 — by running an RFC 8693
+  exchange of the *original* bearer at the same-origin `/oauth/token` (via
+  `sts`), caching the result per origin, and retrying once. Leave
+  `ClientID` empty for follow-only mode, in which every 401 passes through.
+  Trace lines go through `Config.Logf` (nil is silent) rather than an
+  environment variable; consumers gate it on `ENTIRE_DEBUG` themselves.
+  This replaces the per-repo copies in the CLI (`internal/coreapi`),
+  entiredb (`internal/cliauth`), and entire-ci (COR-1441). The exchange
+  branch is isolated in `exchange.go` for removal once every region
+  accepts sibling-region login JWTs directly.
+
 Support for authorization servers that are a *dispatching front door*: the
 apex serves `/authorize` and `/device_authorization` but redirects each to a
 regional authorization server, which is the only host that mints tokens and
