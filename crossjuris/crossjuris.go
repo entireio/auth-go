@@ -136,11 +136,14 @@ func (t *Transport) debugf(format string, args ...any) {
 // bounded per origin so a 421-then-401 chain does not starve the home
 // core of its one attempt. afterRedirect records that the current hop
 // was reached by following a 421 — the trigger for the bare-401
-// exchange, see exchange.go.
+// exchange, see exchange.go. retryAuth is the Authorization the next
+// hop must present regardless of the cache: the token an exchange just
+// minted, which may be too short-lived to cache at all.
 type hop struct {
 	redirects     int
 	triedExchange map[string]bool
 	afterRedirect bool
+	retryAuth     string
 }
 
 // RoundTrip implements http.RoundTripper.
@@ -165,6 +168,9 @@ func (t *Transport) send(req *http.Request, body []byte, originalAuth string, bu
 	// one origin and must not leak to another.
 	origin := requestOrigin(req)
 	switch cached, ok := t.lookupToken(origin); {
+	case budget.retryAuth != "":
+		req.Header.Set("Authorization", budget.retryAuth)
+		budget.retryAuth = "" // one hop only
 	case ok:
 		req.Header.Set("Authorization", "Bearer "+cached)
 	case originalAuth != "":

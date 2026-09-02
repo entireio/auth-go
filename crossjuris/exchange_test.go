@@ -297,6 +297,49 @@ func TestExchangeAfter401Then421UsesOriginalSubject(t *testing.T) {
 	}
 }
 
+// An exchanged token too short-lived to cache must still be presented
+// on the retry; only later requests go without it.
+func TestShortLivedExchangedTokenStillRetries(t *testing.T) {
+	t.Parallel()
+	exchangeHits := atomic.Int32{}
+	var apiAuths recorder
+	var api *httptest.Server
+	api = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == TokenPath {
+			exchangeHits.Add(1)
+			writeBody(t, w, `{"access_token":"home-exchanged-jwt","token_type":"Bearer","expires_in":30}`)
+			return
+		}
+		apiAuths.add(r.Header.Get("Authorization"))
+		if r.Header.Get("Authorization") == bearerExchanged {
+			writeBody(t, w, `{"ok":true}`)
+			return
+		}
+		w.WriteHeader(http.StatusUnauthorized)
+		writeBody(t, w, hintFor(api.URL))
+	}))
+	t.Cleanup(api.Close)
+
+	rt := newTestTransport(t, Config{ClientID: testClientID})
+	client := &http.Client{Transport: rt}
+	for i := range 2 {
+		resp := do(t, client, http.MethodGet, api.URL+"/api/v1/me", "")
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("request %d: got %d, want 200 via the exchanged token", i, resp.StatusCode)
+		}
+	}
+	if _, cached := rt.lookupToken(api.URL); cached {
+		t.Error("a 30s token must not be cached")
+	}
+	if exchangeHits.Load() != 2 {
+		t.Fatalf("exchanges=%d, want one per request with nothing cached", exchangeHits.Load())
+	}
+	want := []string{bearerUser, bearerExchanged, bearerUser, bearerExchanged}
+	if got := apiAuths.snapshot(); strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Fatalf("api auths = %v, want %v", got, want)
+	}
+}
+
 func TestValidateExchangeURL(t *testing.T) {
 	t.Parallel()
 	parse := func(raw string) *url.URL {

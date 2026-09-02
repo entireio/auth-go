@@ -99,8 +99,11 @@ func (t *Transport) recoverUnauthorized(req *http.Request, resp *http.Response, 
 		return resp, nil
 	}
 	t.debugf("401 from %s: exchanged login JWT, retrying", origin)
+	// The retry presents the new token directly; the cache only serves
+	// later requests, and declines tokens too short-lived to be worth it.
 	t.storeToken(origin, exchanged, ttl)
 	budget.triedExchange[origin] = true
+	budget.retryAuth = "Bearer " + exchanged
 	_ = resp.Body.Close()
 	return t.send(req, body, originalAuth, budget)
 }
@@ -177,7 +180,7 @@ func (t *Transport) exchange(ctx context.Context, hint unauthorizedHint, subject
 // cacheTTL derives how long an exchanged token may live in the cache
 // from its remaining lifetime: minus tokenExpiryBuffer, capped at
 // cachedTokenTTL. A lifetime under the buffer yields <= 0 and is not
-// cached (the triggering request still succeeds via the live retry).
+// cached; the triggering request still retries with it via hop.retryAuth.
 func cacheTTL(remaining time.Duration) time.Duration {
 	return min(remaining-tokenExpiryBuffer, cachedTokenTTL)
 }
