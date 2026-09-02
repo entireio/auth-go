@@ -184,6 +184,9 @@ func (t *Transport) send(req *http.Request, body []byte, originalAuth string, bu
 		// in a *url.Error that already names the method and URL.
 		return nil, err //nolint:wrapcheck // see above
 	}
+	if resp.Request == nil {
+		resp.Request = req // FollowedHop relies on it; http.Transport sets it, others may not
+	}
 
 	switch resp.StatusCode {
 	case http.StatusMisdirectedRequest:
@@ -213,7 +216,32 @@ func (t *Transport) send(req *http.Request, body []byte, originalAuth string, bu
 
 // misdirectedBody is entire-core's 421 envelope.
 type misdirectedBody struct {
-	HomeCoreURL string `json:"home_core_url"`
+	HomeCoreURL  string `json:"home_core_url"`
+	Jurisdiction string `json:"jurisdiction"`
+}
+
+// Hop describes one followed 421.
+type Hop struct {
+	// From is the origin (scheme://host) that answered 421.
+	From string
+	// To is the home core origin the request was replayed at.
+	To string
+	// Jurisdiction is the 421 body's jurisdiction name, possibly "".
+	Jurisdiction string
+}
+
+type hopKey struct{}
+
+// FollowedHop reports the 421 hop that produced resp, if any. Callers use
+// it to name the core that actually answered — in an error hint, or to
+// rewrite a relative Location header against the right host. It reads
+// resp.Request, which the Transport guarantees is the replayed request.
+func FollowedHop(resp *http.Response) (Hop, bool) {
+	if resp == nil || resp.Request == nil {
+		return Hop{}, false
+	}
+	h, ok := resp.Request.Context().Value(hopKey{}).(Hop)
+	return h, ok
 }
 
 // followMisdirected reads the 421 envelope and builds a fresh request
@@ -252,7 +280,12 @@ func (t *Transport) followMisdirected(orig *http.Request, resp *http.Response, r
 	target.Path = orig.URL.Path
 	target.RawPath = orig.URL.RawPath
 	target.RawQuery = orig.URL.RawQuery
-	next, err := http.NewRequestWithContext(orig.Context(), orig.Method, target.String(), nil)
+	ctx := context.WithValue(orig.Context(), hopKey{}, Hop{
+		From:         responseOrigin,
+		To:           home.Scheme + "://" + home.Host,
+		Jurisdiction: env.Jurisdiction,
+	})
+	next, err := http.NewRequestWithContext(ctx, orig.Method, target.String(), nil)
 	if err != nil {
 		return nil, fmt.Errorf("build redirected request: %w", err)
 	}

@@ -20,6 +20,9 @@
   `ClientID` empty for follow-only mode, in which every 401 passes through.
   Trace lines go through `Config.Logf` (nil is silent) rather than an
   environment variable; consumers gate it on `ENTIRE_DEBUG` themselves.
+  `crossjuris.FollowedHop(resp)` reports the 421 a response's request
+  followed (`From`, `To`, `Jurisdiction`) so callers can name the core
+  that actually answered or rewrite a relative `Location` against it.
   This replaces the per-repo copies in the CLI (`internal/coreapi`),
   entiredb (`internal/cliauth`), and entire-ci (COR-1441). The exchange
   branch is isolated in `exchange.go` for removal once every region

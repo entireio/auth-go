@@ -91,7 +91,7 @@ func writeBody(t *testing.T, w io.Writer, body string) {
 func misdirectTo(t *testing.T, w http.ResponseWriter, homeCoreURL string) {
 	t.Helper()
 	w.WriteHeader(http.StatusMisdirectedRequest)
-	writeBody(t, w, `{"error":"misdirected","home_core_url":"`+homeCoreURL+`"}`)
+	writeBody(t, w, `{"error":"misdirected","home_core_url":"`+homeCoreURL+`","jurisdiction":"eu"}`)
 }
 
 // newTestTransport builds the Transport under test over a connection
@@ -215,6 +215,25 @@ func TestFollows421ToHomeCore(t *testing.T) {
 	}
 	if got := resp.Request.URL.Host; got != strings.TrimPrefix(home.URL(), "http://") {
 		t.Fatalf("resp.Request.URL.Host = %q, want the home core", got)
+	}
+	hop, ok := FollowedHop(resp)
+	if !ok || hop.From != wrong.URL() || hop.To != home.URL() || hop.Jurisdiction != "eu" {
+		t.Fatalf("FollowedHop = %+v, %v; want from %s to %s (eu)", hop, ok, wrong.URL(), home.URL())
+	}
+}
+
+func TestFollowedHopAbsentWithoutRedirect(t *testing.T) {
+	t.Parallel()
+	srv := newCore(t, func(c *core, w http.ResponseWriter, r *http.Request) {
+		c.record(r)
+		w.WriteHeader(http.StatusOK)
+	})
+	resp := do(t, followOnlyClient(t), http.MethodGet, srv.URL()+"/api/v1/me", "")
+	if _, ok := FollowedHop(resp); ok {
+		t.Fatal("FollowedHop must be false when no 421 was followed")
+	}
+	if _, ok := FollowedHop(nil); ok {
+		t.Fatal("FollowedHop(nil) must be false")
 	}
 }
 
