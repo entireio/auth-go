@@ -12,10 +12,16 @@
 //   - tokenstore   — pluggable persistence interface with reference impls
 //   - tokenmanager — orchestrates core-token storage + STS exchanges,
 //     with caching and a JWT-audience shortcut
+//   - crossjuris   — http.RoundTripper that follows entire-core's
+//     cross-jurisdiction 421 redirects behind a federation trust gate
 //
-// The library is designed to talk RFC 8628, RFC 8252, and RFC 8693 to any
-// compliant OAuth 2.0 server. It contains no provider-specific behaviour; endpoint
-// paths, client IDs, and token-type URIs are caller-supplied. Anything a
-// caller learns about the server beyond what the server tells it in a
-// public HTTP response is out of scope for this package.
+// The OAuth packages are designed to talk RFC 8628, RFC 8252, and RFC 8693
+// to any compliant OAuth 2.0 server. They contain no provider-specific
+// behaviour; endpoint paths, client IDs, and token-type URIs are
+// caller-supplied. Anything a caller learns about the server beyond what
+// the server tells it in a public HTTP response is out of scope.
+//
+// crossjuris is the one exception: it implements entire-core's
+// cross-jurisdiction redirect protocol (the 421 envelope and the
+// /.well-known/entire-federation manifest), which has no RFC.
 package auth
