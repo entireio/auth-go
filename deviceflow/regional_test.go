@@ -4,6 +4,9 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"slices"
+	"sort"
+	"sync/atomic"
 	"testing"
 )
 
@@ -110,5 +113,77 @@ func TestPollDeviceAuth_FallsBackToBaseURL(t *testing.T) {
 	}
 	if ts.AccessToken != "at-base" {
 		t.Fatalf("AccessToken = %q, want at-base", ts.AccessToken)
+	}
+}
+
+// TestPollDeviceAuth_RefusesCrossHostRedirect is the other half of the split
+// TestStartDeviceAuth_ResponseOriginFollowsRedirect pins: device auth may
+// follow a cross-host redirect (no credential in its body), the poll may not
+// (device_code redeems for the user's tokens). One permissive client shared by
+// both is the bug this guards against.
+func TestPollDeviceAuth_RefusesCrossHostRedirect(t *testing.T) {
+	t.Parallel()
+
+	const deviceCode = "dev-1"
+
+	var attackerSawDeviceCode atomic.Bool
+	attacker := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := r.ParseForm(); err == nil && r.PostForm.Get("device_code") == deviceCode {
+			attackerSawDeviceCode.Store(true)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		writeBody(t, w, `{"access_token":"attacker-minted","token_type":"Bearer","expires_in":900}`)
+	}))
+	t.Cleanup(attacker.Close)
+
+	c := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, attacker.URL+testTokenPath, http.StatusTemporaryRedirect)
+	})
+
+	ts, err := c.PollDeviceAuth(context.Background(), deviceCode)
+
+	if attackerSawDeviceCode.Load() {
+		t.Errorf("device_code reached %s, a host the caller never targeted", attacker.URL)
+	}
+	if err == nil {
+		t.Fatalf("want a refused cross-host redirect, got token set %v", ts)
+	}
+	if ts != nil {
+		t.Errorf("want no token set on a refused redirect, got %v", ts)
+	}
+}
+
+// TestStartDeviceAuth_BodyCarriesNoCredential is the tripwire under
+// deviceAuthHTTPClient's redirect exemption, which is only acceptable while
+// this body stays secret-free. It holds structurally today — a closed set the
+// library builds, with no caller extension point — but sts.ExchangeRequest.Extra
+// is exactly such an extension point on the sibling flow, so adding one here
+// for parity would quietly widen the exemption. Pinning the key set makes that
+// arrive as a failing test instead.
+func TestStartDeviceAuth_BodyCarriesNoCredential(t *testing.T) {
+	t.Parallel()
+
+	var gotKeys []string
+	c := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		mustReadForm(t, r)
+		for k := range r.PostForm {
+			gotKeys = append(gotKeys, k)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		writeBody(t, w, testDeviceCodeJSON)
+	})
+	c.Scope = "openid"
+
+	if _, err := c.StartDeviceAuth(context.Background()); err != nil {
+		t.Fatalf("StartDeviceAuth() error = %v", err)
+	}
+
+	sort.Strings(gotKeys)
+	want := []string{"client_id", "scope"}
+	if !slices.Equal(gotKeys, want) {
+		t.Errorf("device-authorization body carries %v, want exactly %v.\n"+
+			"A new field here invalidates the cross-host redirect exemption in "+
+			"deviceAuthHTTPClient: re-check that it carries no credential, or "+
+			"move this request onto the guarded oauthhttp.HTTPClient.", gotKeys, want)
 	}
 }
