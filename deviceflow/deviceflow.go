@@ -167,11 +167,19 @@ func (c *Client) now() time.Time {
 	return time.Now()
 }
 
-// httpClient builds the *http.Client used for one request. See
+// httpClient builds the *http.Client used for a credential-bearing
+// request — the token poll, whose body carries the device code. See
 // oauthhttp.HTTPClient for the construction policy (fresh per call,
 // shared underlying Transport, no Client.Timeout).
 func (c *Client) httpClient() *http.Client {
 	return oauthhttp.HTTPClient(c.Transport)
+}
+
+// deviceAuthHTTPClient builds the *http.Client for the
+// device-authorization request, the one call that must follow a
+// cross-host redirect. See oauthhttp.HTTPClientFollowingCrossHostRedirects.
+func (c *Client) deviceAuthHTTPClient() *http.Client {
+	return oauthhttp.HTTPClientFollowingCrossHostRedirects(c.Transport)
 }
 
 // New validates a Client's required fields at construction time
@@ -283,7 +291,7 @@ func (c *Client) StartDeviceAuth(ctx context.Context) (*DeviceCode, error) {
 		body.Set("scope", c.Scope)
 	}
 
-	resp, err := c.postForm(ctx, c.BaseURL, c.DeviceCodePath, body)
+	resp, err := c.postForm(ctx, c.deviceAuthHTTPClient(), c.BaseURL, c.DeviceCodePath, body)
 	if err != nil {
 		return nil, fmt.Errorf("start device auth: %w", err)
 	}
@@ -435,7 +443,7 @@ func (c *Client) PollDeviceAuth(ctx context.Context, deviceCode string) (*tokens
 	body.Set("client_id", c.ClientID)
 	body.Set("device_code", deviceCode)
 
-	resp, err := c.postForm(ctx, c.tokenBase(), c.TokenPath, body)
+	resp, err := c.postForm(ctx, c.httpClient(), c.tokenBase(), c.TokenPath, body)
 	if err != nil {
 		return nil, fmt.Errorf("poll device auth: %w", err)
 	}
@@ -487,7 +495,12 @@ func (c *Client) tokenBase() string {
 // timeout via context.WithTimeout — the timeout must cover the body-read
 // that happens after postForm returns, so cancel-on-return here would
 // interrupt that read.
-func (c *Client) postForm(ctx context.Context, baseURL, path string, body url.Values) (*http.Response, error) {
+//
+// client is passed in rather than built here so each call site states
+// its redirect policy: httpClient for a credential-bearing body,
+// deviceAuthHTTPClient for the one request that must follow a
+// cross-host redirect.
+func (c *Client) postForm(ctx context.Context, client *http.Client, baseURL, path string, body url.Values) (*http.Response, error) {
 	endpoint, err := resolveURL(baseURL, path, c.AllowInsecureHTTP)
 	if err != nil {
 		return nil, fmt.Errorf("resolve URL %s: %w", path, err)
@@ -504,7 +517,7 @@ func (c *Client) postForm(ctx context.Context, baseURL, path string, body url.Va
 		req.Header.Set("User-Agent", c.UserAgent)
 	}
 
-	resp, err := c.httpClient().Do(req)
+	resp, err := client.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("request %s: %w", path, err)
 	}
