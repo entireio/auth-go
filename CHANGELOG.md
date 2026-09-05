@@ -57,6 +57,23 @@ learn the region at runtime and send the token request there.
 
 ### Changed
 
+- `tokenmanager.Config.LockDir` now documents its default fully: it is the
+  only implicit filesystem path in the package; `os.UserCacheDir()` reports
+  the *platform's* cache location, so on macOS it is `~/Library/Caches` and
+  `XDG_CACHE_HOME` is ignored — a caller with its own cache-dir override
+  will find that override does not redirect these files; and the lock file
+  is permanent, one per `(ClientID, Issuer)`, removed neither on release
+  (unlinking a file a peer still holds open would break the mutual
+  exclusion) nor on logout. Callers whose Issuer varies should set LockDir
+  to a directory they own and can reap. No behaviour change for callers
+  that already set it.
+- When `os.UserCacheDir()` is unavailable (no HOME), the lock directory
+  falls back to `os.TempDir()/auth-go-<uid>` instead of
+  `os.TempDir()/auth-go`. On Linux `os.TempDir()` is the shared `/tmp`,
+  where the unsuffixed name is a path every account on the host derives
+  identically. The suffix is omitted on Windows, where `os.TempDir()` is
+  already per-user.
+
 - Bumped the Go toolchain (and the `go.mod` minimum) to 1.26.6, picking up
   the standard-library security fixes GO-2026-6218 (`net/url`), GO-2026-6090
   and GO-2026-5856 (`crypto/tls`), GO-2026-6089 and GO-2026-5026

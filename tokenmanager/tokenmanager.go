@@ -23,6 +23,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -122,9 +123,31 @@ type Config struct {
 	RefreshPath string
 
 	// LockDir is the directory holding the cross-process advisory lock
-	// file. Empty → os.UserCacheDir()/auth-go (falling back to the system
-	// temp dir if the user cache dir is unavailable). The lock file holds
-	// no credentials.
+	// file. The lock file holds no credentials — it exists only as a
+	// flock(2) / LockFileEx handle.
+	//
+	// Empty selects a default, and callers with an opinion about where
+	// this library writes should set it rather than accept that default,
+	// for two reasons.
+	//
+	// It is the only implicit filesystem path in this package, and it
+	// does not follow the caller's own conventions. The default is
+	// os.UserCacheDir()/auth-go, and os.UserCacheDir reports the
+	// *platform's* cache location: $XDG_CACHE_HOME (or ~/.cache) on
+	// Linux, but ~/Library/Caches on macOS, where XDG_CACHE_HOME is
+	// ignored by design. A CLI that honours XDG_CACHE_HOME (or its own
+	// cache-dir env var) on every platform will find that its override
+	// silently does not redirect these files. Only LockDir does.
+	//
+	// The lock file is also permanent. There is one per
+	// (ClientID, Issuer) pair, it is not removed on release — an
+	// advisory lock is released by closing the descriptor, and unlinking
+	// a file another process still holds open would break the mutual
+	// exclusion — and it is not removed on logout. A caller whose Issuer
+	// varies (per region, per environment, per test with an ephemeral
+	// port) accumulates one file per distinct value, in a directory it
+	// never chose. Pointing LockDir at a directory the caller owns makes
+	// that visible and reapable.
 	LockDir string
 
 	// Store persists the core token. Required. Use any tokenstore.Store
@@ -756,17 +779,39 @@ func (m *Manager) processLock() ProcessLock {
 	m.lockOnce.Do(func() {
 		dir := m.cfg.LockDir
 		if dir == "" {
-			if cache, err := os.UserCacheDir(); err == nil {
-				dir = filepath.Join(cache, "auth-go")
-			} else {
-				dir = filepath.Join(os.TempDir(), "auth-go")
-			}
+			dir = defaultLockDir()
 		}
 		sum := sha256.Sum256([]byte(m.cfg.ClientID + "\x00" + m.cfg.Issuer))
 		path := filepath.Join(dir, hex.EncodeToString(sum[:])+".lock")
 		m.defaultLock = &fileLockPath{path: path, lock: proclock.New(path)}
 	})
 	return m.defaultLock
+}
+
+// defaultLockDir picks the lock directory when Config.LockDir is empty.
+// See that field's documentation for why a caller with an opinion should
+// not rely on this.
+//
+// os.UserCacheDir fails only when the platform's cache location is unset
+// — no HOME on unix — which leaves os.TempDir(). On Linux that is the
+// shared, sticky /tmp, so a fixed "auth-go" name there is a directory
+// every account on the host derives identically. The uid suffix keeps
+// separate users off each other's path. It is omitted on Windows, where
+// os.Getuid reports -1 and os.TempDir is already per-user.
+//
+// This narrows the shared-directory exposure but does not remove it: on
+// a multi-user host an unprivileged peer can still pre-create the
+// uid-suffixed directory under /tmp, since the sticky bit prevents
+// deletion but not creation. Callers on such hosts should set LockDir.
+func defaultLockDir() string {
+	if cache, err := os.UserCacheDir(); err == nil {
+		return filepath.Join(cache, "auth-go")
+	}
+	name := "auth-go"
+	if uid := os.Getuid(); uid >= 0 {
+		name = "auth-go-" + strconv.Itoa(uid)
+	}
+	return filepath.Join(os.TempDir(), name)
 }
 
 // runRefresh dispatches to the test override (if set) else a freshly built
