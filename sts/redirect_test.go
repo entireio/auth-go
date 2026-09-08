@@ -2,8 +2,11 @@ package sts
 
 import (
 	"context"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 )
@@ -61,5 +64,82 @@ func TestExchangeRefusesCrossHostRedirect(t *testing.T) {
 	// authorization server had issued it.
 	if ts != nil {
 		t.Errorf("want no token set on a refused redirect, got %v", ts)
+	}
+}
+
+// downgradeRT answers an https request with a redirect to the SAME host over
+// http, and records every request it is asked to send.
+//
+// A recording RoundTripper rather than two httptest servers, deliberately: two
+// listeners have different ports, so the host restriction would refuse the hop
+// and the test would pass without exercising the TLS floor at all. Here only
+// the scheme changes.
+type downgradeRT struct {
+	mu     sync.Mutex
+	sent   []string
+	status int
+}
+
+func (d *downgradeRT) RoundTrip(req *http.Request) (*http.Response, error) {
+	d.mu.Lock()
+	d.sent = append(d.sent, req.URL.Scheme+"://"+req.URL.Host+req.URL.Path)
+	d.mu.Unlock()
+
+	h := http.Header{}
+	if req.URL.Scheme == "https" {
+		h.Set("Location", "http://"+req.URL.Host+req.URL.Path)
+		return &http.Response{StatusCode: d.status, Header: h, Body: http.NoBody, Request: req}, nil
+	}
+	// Reached only if the downgrade was followed; answer as a working endpoint
+	// so a regression shows up as a leak rather than a transport error.
+	h.Set("Content-Type", "application/json")
+	return &http.Response{
+		StatusCode: http.StatusOK, Header: h, Request: req,
+		Body: io.NopCloser(strings.NewReader(`{"access_token":"leaked","token_type":"Bearer","expires_in":900}`)),
+	}, nil
+}
+
+func (d *downgradeRT) requests() []string {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return append([]string(nil), d.sent...)
+}
+
+// TestExchangeRefusesTLSDowngrade: an https token endpoint answering 307/308
+// with an http Location must not get the form body replayed in clear. The
+// subject_token is a login JWT, and net/http replays a 307/308 body verbatim.
+func TestExchangeRefusesTLSDowngrade(t *testing.T) {
+	t.Parallel()
+	for _, status := range []int{http.StatusTemporaryRedirect, http.StatusPermanentRedirect} {
+		t.Run(http.StatusText(status), func(t *testing.T) {
+			t.Parallel()
+			rt := &downgradeRT{status: status}
+			// AllowInsecureHTTP stays false: the base URL is https, and the
+			// downgrade must be refused on the redirect, not on the initial URL.
+			c := &Client{Transport: rt, BaseURL: "https://issuer.example", Path: testTokenPath}
+			ts, err := c.Exchange(context.Background(), ExchangeRequest{
+				SubjectToken:       "the-users-real-login-jwt",
+				SubjectTokenType:   SubjectTokenTypeJWT,
+				RequestedTokenType: SubjectTokenTypeAccessToken,
+				Audience:           "https://issuer.example",
+				ClientID:           "test-client",
+			})
+
+			sent := rt.requests()
+			if len(sent) != 1 {
+				t.Errorf("transport saw %d requests (%v), want only the https one", len(sent), sent)
+			}
+			for _, s := range sent {
+				if strings.HasPrefix(s, "http://") {
+					t.Errorf("the plaintext destination received a request: %s", s)
+				}
+			}
+			if err == nil {
+				t.Fatalf("want a refused downgrade, got token set %v", ts)
+			}
+			if ts != nil {
+				t.Errorf("want no token set on a refused downgrade, got %v", ts)
+			}
+		})
 	}
 }

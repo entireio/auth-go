@@ -4,34 +4,45 @@
 
 ### Security
 
-- Every OAuth request this library makes now refuses a cross-host redirect.
-  `internal/oauthhttp.HTTPClient` — the single construction point behind
-  `sts`, `refresh`, `authcode` and `deviceflow` — installs a `CheckRedirect`
-  policy pinned to the host the caller targeted. `net/http` strips sensitive
-  *headers* on a cross-host redirect but replays the request *body*
-  unconditionally on 307/308, and the body is where every OAuth credential
-  lives: `subject_token` (a login JWT), `refresh_token`, an authorization
-  code plus its PKCE verifier, a `device_code`. An open redirect or a
-  misconfigured proxy in front of an otherwise legitimate token endpoint was
-  therefore enough to hand those credentials to a third host, and to have
-  that host's own `access_token` returned as if the real authorization server
-  had issued it. Same-host hops (path normalisation, an http→https upgrade)
-  still follow, up to `net/http`'s usual 10-redirect cap; a change of port is
-  treated as a different endpoint and refused. Not configurable.
+- Every OAuth request this library makes now refuses a cross-host redirect
+  **and a TLS downgrade**. `internal/oauthhttp.HTTPClient` — the single
+  construction point behind `sts`, `refresh`, `authcode` and `deviceflow` —
+  installs a `CheckRedirect` policy pinned to the host the caller targeted,
+  over a mandatory floor that refuses any hop leaving `https` once a chain has
+  reached it. The scheme check anchors on the previous hop, not the first
+  request, so an `http`→`https`→`http` chain is refused at the last hop; and
+  `AllowInsecureHTTP`, which permits an initial plaintext request on loopback
+  for local development, does not license a downgrade after HTTPS.
+
+  `net/http` drops sensitive *headers* on a redirect to a host that is neither
+  the original nor a subdomain of it, but it replays the request *body*
+  unconditionally on 307/308 and permits a scheme change — and the body is
+  where every OAuth credential lives: `subject_token` (a login JWT),
+  `refresh_token`, an authorization code plus its PKCE verifier, a
+  `device_code`. An open redirect or a misconfigured proxy in front of an
+  otherwise legitimate token endpoint was therefore enough to hand those
+  credentials to a third host or to put them on the wire in clear, and to have
+  the redirect target's own `access_token` returned as if the real
+  authorization server had issued it. Same-host hops (path normalisation, an
+  `http`→`https` upgrade) still follow, up to `net/http`'s usual 10-redirect
+  cap; a change of port is treated as a different endpoint and refused.
+  Not configurable.
 - One deliberate exception, via the explicitly-named
   `internal/oauthhttp.HTTPClientFollowingCrossHostRedirects`: RFC 8628's
   device-authorization POST, which an apex front door 307s at the regional
   core and whose response origin is how the client learns which region to
-  poll. Its body is `client_id` plus `scope` — neither a secret — and a
-  confidential client's secret rides in Basic auth, which `net/http` already
-  strips on a host change. The device-code *poll* is credential-bearing and
-  is guarded like everything else. Note the exception is not free: the
-  redirect target picks the `verification_uri` shown to the user and the
-  origin later polled, so validate `DeviceCode.ResponseOrigin` before
-  assigning it to `TokenBaseURL`. The exemption's premise — that this one
-  body carries nothing secret — is now pinned by a test on the form's key
-  set, so a field added there fails loudly instead of silently widening the
-  exception.
+  poll. It is exempt from the **host** restriction only — the TLS floor and
+  the hop cap still apply, because its *response* carries a redeemable
+  `device_code` even though the request body is public (`client_id` plus
+  `scope`; `deviceflow.Client` has no `ClientSecret` field and sets no Basic
+  auth, so this request carries no client credential at all). The device-code
+  *poll* is credential-bearing and keeps the host restriction too. The
+  exception is not free: the redirect target picks the `verification_uri`
+  shown to the user and the origin later polled, so validate
+  `DeviceCode.ResponseOrigin` before assigning it to `TokenBaseURL`. The
+  exemption's premise — that this one body carries nothing secret — is pinned
+  by a test on the form's key set, so a field added there fails loudly instead
+  of silently widening the exception.
 
 ### Added
 

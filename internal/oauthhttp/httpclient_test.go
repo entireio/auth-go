@@ -3,6 +3,7 @@ package oauthhttp
 import (
 	"net/http"
 	"net/url"
+	"strings"
 	"testing"
 )
 
@@ -27,16 +28,98 @@ func TestHTTPClientSetsRedirectPolicy(t *testing.T) {
 	}
 }
 
-// TestHTTPClientFollowingCrossHostRedirectsOptsOut pins the opt-out
-// constructor as the exact inverse: same client, guard removed. Built by
-// subtraction from HTTPClient, so this also catches the two drifting apart.
-func TestHTTPClientFollowingCrossHostRedirectsOptsOut(t *testing.T) {
+// TestHTTPClientFollowingCrossHostRedirectsKeepsTLS pins what the
+// device-authorization client opts out of and what it does not. It is exempt
+// from the HOST restriction, because its cross-host 307 is how regional
+// routing works. It is not exempt from TLS: its response carries a redeemable
+// device_code, so a plaintext hop exposes a credential even though the
+// library-built request body is public.
+func TestHTTPClientFollowingCrossHostRedirectsKeepsTLS(t *testing.T) {
 	t.Parallel()
-	if HTTPClientFollowingCrossHostRedirects(nil).CheckRedirect != nil {
-		t.Error("the opt-out constructor must not install a redirect policy")
+	c := HTTPClientFollowingCrossHostRedirects(nil)
+	if c.CheckRedirect == nil {
+		t.Fatal("the device-authorization client must still enforce the TLS floor")
 	}
-	if HTTPClientFollowingCrossHostRedirects(nil).Transport != HTTPClient(nil).Transport {
-		t.Error("the opt-out constructor must differ from HTTPClient only in CheckRedirect")
+	if c.Transport != HTTPClient(nil).Transport {
+		t.Error("it must differ from HTTPClient only in its redirect policy")
+	}
+}
+
+// TestRedirectPolicyMatrix runs both constructors' policies over the full
+// compatibility matrix, so the host exemption and the TLS floor cannot drift
+// apart. "ordinary" is every credential-bearing flow; "deviceAuth" is the one
+// exemption.
+func TestRedirectPolicyMatrix(t *testing.T) {
+	t.Parallel()
+
+	ordinary := HTTPClient(nil).CheckRedirect
+	deviceAuth := HTTPClientFollowingCrossHostRedirects(nil).CheckRedirect
+
+	tenHops := make([]*http.Request, 10)
+	for i := range tenHops {
+		tenHops[i] = &http.Request{URL: mustParseURL(t, "https://core.example/oauth/token")}
+	}
+
+	cases := []struct {
+		name          string
+		next          string
+		via           []string
+		wantOrdinary  bool // true = refuse
+		wantDeviceRef bool
+	}{
+		{name: "https to https, same host and port", next: "https://core.example:8443/t", via: []string{"https://core.example:8443/t"}},
+		{name: "https to https, different host", next: "https://other.example/t", via: []string{"https://core.example/t"}, wantOrdinary: true},
+		{name: "https to https, changed port", next: "https://core.example:8443/t", via: []string{"https://core.example/t"}, wantOrdinary: true},
+		{name: "https to http, same host", next: "http://core.example/t", via: []string{"https://core.example/t"}, wantOrdinary: true, wantDeviceRef: true},
+		{name: "https to http, different host", next: "http://other.example/t", via: []string{"https://core.example/t"}, wantOrdinary: true, wantDeviceRef: true},
+		{name: "http to https, unchanged host", next: "https://core.example/t", via: []string{"http://core.example/t"}},
+		{name: "loopback http to http", next: "http://127.0.0.1:8080/t", via: []string{"http://127.0.0.1:8080/t"}},
+		{name: "http then https then http refuses the last hop", next: "http://core.example/t", via: []string{"http://core.example/t", "https://core.example/t"}, wantOrdinary: true, wantDeviceRef: true},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			via := make([]*http.Request, 0, len(tc.via))
+			for _, v := range tc.via {
+				via = append(via, &http.Request{URL: mustParseURL(t, v)})
+			}
+			next := &http.Request{URL: mustParseURL(t, tc.next)}
+
+			if got := ordinary(next, via) != nil; got != tc.wantOrdinary {
+				t.Errorf("ordinary refused=%v, want %v", got, tc.wantOrdinary)
+			}
+			if got := deviceAuth(next, via) != nil; got != tc.wantDeviceRef {
+				t.Errorf("deviceAuth refused=%v, want %v", got, tc.wantDeviceRef)
+			}
+		})
+	}
+
+	t.Run("hop cap applies to both", func(t *testing.T) {
+		t.Parallel()
+		next := &http.Request{URL: mustParseURL(t, "https://core.example/oauth/token")}
+		if ordinary(next, tenHops) == nil {
+			t.Error("ordinary must refuse at the hop cap")
+		}
+		if deviceAuth(next, tenHops) == nil {
+			t.Error("deviceAuth must refuse at the hop cap")
+		}
+	})
+}
+
+// TestRedirectErrorTextCarriesNoURL pins that the TLS refusal names the scheme
+// it refused and nothing more: a full URL can carry a token in its query, and
+// this message reaches logs and user-facing errors.
+func TestRedirectErrorTextCarriesNoURL(t *testing.T) {
+	t.Parallel()
+	next := &http.Request{URL: mustParseURL(t, "http://core.example/oauth/token?code=SECRET-VALUE")}
+	via := []*http.Request{{URL: mustParseURL(t, "https://core.example/oauth/token?code=SECRET-VALUE")}}
+	err := HTTPClient(nil).CheckRedirect(next, via)
+	if err == nil {
+		t.Fatal("want a refusal")
+	}
+	if strings.Contains(err.Error(), "SECRET-VALUE") {
+		t.Errorf("refusal text must not carry URL components: %q", err)
 	}
 }
 

@@ -175,9 +175,10 @@ func (c *Client) httpClient() *http.Client {
 	return oauthhttp.HTTPClient(c.Transport)
 }
 
-// deviceAuthHTTPClient builds the *http.Client for the
-// device-authorization request, the one call that must follow a
-// cross-host redirect. See oauthhttp.HTTPClientFollowingCrossHostRedirects.
+// deviceAuthHTTPClient builds the *http.Client for the device-authorization
+// request, the one call that must follow a cross-host redirect. Exempt from
+// the host restriction only — it still refuses a TLS downgrade and the hop
+// cap. See oauthhttp.HTTPClientFollowingCrossHostRedirects.
 func (c *Client) deviceAuthHTTPClient() *http.Client {
 	return oauthhttp.HTTPClientFollowingCrossHostRedirects(c.Transport)
 }

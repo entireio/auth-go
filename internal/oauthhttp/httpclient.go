@@ -38,26 +38,53 @@ func HTTPClient(transport http.RoundTripper) *http.Client {
 	}
 }
 
-// HTTPClientFollowingCrossHostRedirects builds a client WITHOUT the
-// cross-host redirect guard, for a request whose body carries no
-// credential and whose cross-host redirect is load-bearing.
+// HTTPClientFollowingCrossHostRedirects builds a client that opts out of the
+// HOST restriction — and only that. mandatoryRedirectPolicy still applies, so
+// a plaintext hop is refused here too: the device-authorization RESPONSE
+// carries a redeemable device_code even though its request body is public, and
+// an observer who captures one can attempt redemption once the user authorizes.
 //
 // Exactly one request qualifies: RFC 8628's device-authorization POST, whose
 // cross-host 307 is how regional routing works, and whose body is client_id
-// plus scope — no secret (a confidential client's secret rides in Basic auth,
-// which net/http strips on a host change). TestStartDeviceAuth_BodyCarriesNoCredential
-// pins that key set, since the exemption rests on it.
+// plus scope. deviceflow.Client has no ClientSecret field and sets no Basic
+// auth, so it carries no client credential at all;
+// TestStartDeviceAuth_BodyCarriesNoCredential pins that key set.
 //
 // Do NOT reach for this anywhere else: check what the body carries first.
-// What following a redirect still costs is documented where a caller can act
-// on it, on DeviceCode.ResponseOrigin and Client.TokenBaseURL.
-//
-// Built by subtraction so this stays "HTTPClient minus the guard" — anything
-// the guarded constructor grows later is inherited, not silently missed.
+// What following a cross-host redirect still costs is documented where a
+// caller can act on it, on DeviceCode.ResponseOrigin and Client.TokenBaseURL.
 func HTTPClientFollowingCrossHostRedirects(transport http.RoundTripper) *http.Client {
 	c := HTTPClient(transport)
-	c.CheckRedirect = nil
+	c.CheckRedirect = mandatoryRedirectPolicy
 	return c
+}
+
+// mandatoryRedirectPolicy is the floor under every OAuth redirect decision in
+// this library: the hop cap, and a refusal to leave HTTPS once a chain has
+// reached it. RejectCrossHostRedirect layers the host restriction on top; the
+// device-authorization client uses this alone.
+//
+// SECURITY: net/http permits a scheme change across a redirect, so an https
+// endpoint answering 307/308 with an http Location would put the replayed body
+// — every OAuth credential lives there — on the wire in clear. Initial-URL
+// validation and AllowInsecureHTTP say nothing about later hops, and enabling
+// that option for local development must not license a downgrade.
+//
+// Anchored on the PREVIOUS hop, not via[0]: an http→https→http chain starts
+// insecure, so anchoring on the first request would take http as the baseline
+// and permit the final downgrade. The message names only the scheme, since a
+// redirect URL can carry a code in its query and this text reaches logs.
+func mandatoryRedirectPolicy(req *http.Request, via []*http.Request) error {
+	if len(via) >= maxOAuthRedirects {
+		return fmt.Errorf("stopped after %d redirects", maxOAuthRedirects)
+	}
+	if len(via) == 0 {
+		return nil
+	}
+	if prev := via[len(via)-1]; prev.URL.Scheme == "https" && req.URL.Scheme != "https" {
+		return fmt.Errorf("refusing redirect from https to %s: an OAuth request carries credentials and must not cross a plaintext hop", req.URL.Scheme)
+	}
+	return nil
 }
 
 // RejectCrossHostRedirect is the CheckRedirect policy for every OAuth
@@ -72,14 +99,16 @@ func HTTPClientFollowingCrossHostRedirects(transport http.RoundTripper) *http.Cl
 // legitimate token endpoint would hand those credentials to a third host,
 // whose own access_token would then be returned as if genuine.
 //
-// Compared against via[0], the host the caller chose, not the previous hop:
-// otherwise a chain could walk away one host at a time. Host only, so a
-// same-host http→https upgrade still follows; a port change is a different
-// endpoint and is refused. Not configurable — that option would be set by
+// The HOST is compared against via[0], the host the caller chose, not the
+// previous hop: otherwise a chain could walk away one host at a time. Host
+// only, so a same-host http→https upgrade still follows; a port change is a
+// different endpoint and is refused. The SCHEME rule is
+// mandatoryRedirectPolicy's, which anchors on the previous hop instead — see
+// there for why the two differ. Not configurable — that option would be set by
 // whoever benefits from it, and no token endpoint needs one.
 func RejectCrossHostRedirect(req *http.Request, via []*http.Request) error {
-	if len(via) >= maxOAuthRedirects {
-		return fmt.Errorf("stopped after %d redirects", maxOAuthRedirects)
+	if err := mandatoryRedirectPolicy(req, via); err != nil {
+		return err
 	}
 	if len(via) > 0 && !strings.EqualFold(req.URL.Host, via[0].URL.Host) {
 		return fmt.Errorf("refusing redirect to a different host (%s -> %s): an OAuth request body carries credentials and must not leave its origin",

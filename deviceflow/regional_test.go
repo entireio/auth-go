@@ -2,10 +2,13 @@ package deviceflow
 
 import (
 	"context"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"slices"
 	"sort"
+	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 )
@@ -185,5 +188,105 @@ func TestStartDeviceAuth_BodyCarriesNoCredential(t *testing.T) {
 			"A new field here invalidates the cross-host redirect exemption in "+
 			"deviceAuthHTTPClient: re-check that it carries no credential, or "+
 			"move this request onto the guarded oauthhttp.HTTPClient.", gotKeys, want)
+	}
+}
+
+// tlsDowngradeRT answers an https request with a redirect to the SAME host over
+// http. A recording RoundTripper rather than two httptest servers because two
+// listeners differ in port, and for the device-authorization client — which is
+// exempt from the host restriction — a port change would be followed, so the
+// fixture has to change nothing but the scheme.
+type tlsDowngradeRT struct {
+	mu     sync.Mutex
+	sent   []string
+	status int
+	body   string
+}
+
+func (d *tlsDowngradeRT) RoundTrip(req *http.Request) (*http.Response, error) {
+	d.mu.Lock()
+	d.sent = append(d.sent, req.URL.Scheme+"://"+req.URL.Host+req.URL.Path)
+	d.mu.Unlock()
+
+	h := http.Header{}
+	if req.URL.Scheme == "https" {
+		h.Set("Location", "http://"+req.URL.Host+req.URL.Path)
+		return &http.Response{StatusCode: d.status, Header: h, Body: http.NoBody, Request: req}, nil
+	}
+	// Reached only on a regression, so answer as a working endpoint: the
+	// failure then reads as a leak rather than a transport error.
+	h.Set("Content-Type", "application/json")
+	return &http.Response{
+		StatusCode: http.StatusOK, Header: h, Request: req,
+		Body: io.NopCloser(strings.NewReader(d.body)),
+	}, nil
+}
+
+func (d *tlsDowngradeRT) plaintextHits() []string {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	var out []string
+	for _, s := range d.sent {
+		if strings.HasPrefix(s, "http://") {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
+// TestStartDeviceAuth_RefusesTLSDowngrade: the device-authorization client is
+// exempt from the host restriction, not from TLS. Its response carries a
+// redeemable device_code, so a plaintext hop hands an observer a credential it
+// can try to redeem once the user authorizes.
+func TestStartDeviceAuth_RefusesTLSDowngrade(t *testing.T) {
+	t.Parallel()
+	for _, status := range []int{http.StatusTemporaryRedirect, http.StatusPermanentRedirect} {
+		t.Run(http.StatusText(status), func(t *testing.T) {
+			t.Parallel()
+			rt := &tlsDowngradeRT{status: status, body: testDeviceCodeJSON}
+			c := &Client{
+				Transport: rt, ClientID: testClientID,
+				BaseURL: "https://apex.example", DeviceCodePath: testDeviceCodePath, TokenPath: testTokenPath,
+			}
+			dc, err := c.StartDeviceAuth(context.Background())
+
+			if hits := rt.plaintextHits(); len(hits) > 0 {
+				t.Errorf("the plaintext destination received a request: %v", hits)
+			}
+			if err == nil {
+				t.Fatalf("want a refused downgrade, got device code %v", dc)
+			}
+			if dc != nil {
+				t.Errorf("want no DeviceCode on a refused downgrade, got %v", dc)
+			}
+		})
+	}
+}
+
+// TestPollDeviceAuth_RefusesTLSDowngrade: the poll body carries the device
+// code itself, so this is the credential-bearing half of the same flow.
+func TestPollDeviceAuth_RefusesTLSDowngrade(t *testing.T) {
+	t.Parallel()
+	for _, status := range []int{http.StatusTemporaryRedirect, http.StatusPermanentRedirect} {
+		t.Run(http.StatusText(status), func(t *testing.T) {
+			t.Parallel()
+			rt := &tlsDowngradeRT{status: status, body: `{"access_token":"leaked","token_type":"Bearer","expires_in":900}`}
+			c := &Client{
+				Transport: rt, ClientID: testClientID,
+				BaseURL: "https://apex.example", DeviceCodePath: testDeviceCodePath, TokenPath: testTokenPath,
+				TokenBaseURL: "https://region.example",
+			}
+			ts, err := c.PollDeviceAuth(context.Background(), "dev-1")
+
+			if hits := rt.plaintextHits(); len(hits) > 0 {
+				t.Errorf("the plaintext destination received a request: %v", hits)
+			}
+			if err == nil {
+				t.Fatalf("want a refused downgrade, got token set %v", ts)
+			}
+			if ts != nil {
+				t.Errorf("want no token set on a refused downgrade, got %v", ts)
+			}
+		})
 	}
 }
