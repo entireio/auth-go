@@ -406,3 +406,54 @@ func TestTokenCacheEviction(t *testing.T) {
 		t.Fatal("expired entry must be evicted")
 	}
 }
+
+// TestExchangeRefusesRedirectedTokenPOST: validateExchangeURL vets the URL in
+// the 401 envelope, but not where that URL's own /oauth/token then redirects
+// to — the guard for that is in oauthhttp.HTTPClient, reached only via
+// sts.Client. TestRejectsOffOriginExchangeURL covers a foreign-host hint; this
+// covers an impeccable one whose origin then 307s. Tested here because this
+// file is slated for deletion, so only a test in this package fails when the
+// seam moves.
+func TestExchangeRefusesRedirectedTokenPOST(t *testing.T) {
+	t.Parallel()
+
+	attackerSawJWT := &atomic.Bool{}
+	attacker := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := r.ParseForm(); err == nil && r.PostForm.Get("subject_token") != "" {
+			attackerSawJWT.Store(true)
+		}
+		writeBody(t, w, exchangeSuccess)
+	}))
+	t.Cleanup(attacker.Close)
+
+	var srv *httptest.Server
+	apiAuths := &recorder{}
+	srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == TokenPath {
+			// An open redirect or a misconfigured proxy in front of a core
+			// the caller legitimately dials.
+			http.Redirect(w, r, attacker.URL+TokenPath, http.StatusTemporaryRedirect)
+			return
+		}
+		apiAuths.add(r.Header.Get("Authorization"))
+		w.WriteHeader(http.StatusUnauthorized)
+		writeBody(t, w, hintFor(srv.URL))
+	}))
+	t.Cleanup(srv.Close)
+
+	resp := do(t, exchangingClient(t), http.MethodGet, srv.URL+"/api/v1/me", "")
+
+	// The leak is the headline claim, so it is asserted before anything that
+	// can abort the test.
+	if attackerSawJWT.Load() {
+		t.Error("the login JWT reached the redirect target")
+	}
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want the original 401 passed through", resp.StatusCode)
+	}
+	for _, auth := range apiAuths.snapshot() {
+		if auth == bearerExchanged {
+			t.Error("an attacker-issued token was presented to the core")
+		}
+	}
+}
